@@ -1,0 +1,24 @@
+schema_version: 1
+case_id: case10
+bump_type: x16
+dies: 61
+nets: 5280
+interposer_width_mm: 47.0
+interposer_height_mm: 47.0
+whitespace: 0.5
+target_total_chiplet_area_mm2: 1104.5
+actual_total_chiplet_area_mm2: 1104.5
+actual_whitespace: 0.5
+area_scaling_policy: type-aware priors globally scaled to match target whitespace
+ucie:
+  cols: 12
+  lanes: 16
+  bump_pitch_um: 100
+  pitch_x_um: 180
+  pitch_y_um: 90
+generation_constraints:
+  min_spacing_mm: 0.1
+  placement: random packing with shelf fallback
+  seed: 0
+notes: Synthetic benchmark family for ChipTherm research; not a commercial product
+  replica.

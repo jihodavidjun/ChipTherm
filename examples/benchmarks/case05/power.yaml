@@ -1,0 +1,58 @@
+schema_version: 1
+units:
+  power: W
+mode: fixed
+active_workload: nominal
+workloads:
+  idle:
+    GPU1: 93.0941
+    GPU2: 59.8306
+    CPU1: 45.9345
+    CPU0: 32.0653
+    HBM0: 1.4393
+    HBM1: 1.9355
+    GPU0: 28.1079
+    IO2: 6.6678
+    CPU2: 16.4935
+    DRAM0: 2.9786
+    IO0: 1.3165
+    IO1: 2.1231
+  nominal:
+    GPU1: 372.3765
+    GPU2: 239.3225
+    CPU1: 183.7381
+    CPU0: 128.2611
+    HBM0: 5.7573
+    HBM1: 7.7421
+    GPU0: 112.4315
+    IO2: 26.6711
+    CPU2: 65.974
+    DRAM0: 11.9145
+    IO0: 5.2661
+    IO1: 8.4925
+  peak:
+    GPU1: 465.4706
+    GPU2: 299.1531
+    CPU1: 229.6727
+    CPU0: 160.3263
+    HBM0: 7.1967
+    HBM1: 9.6777
+    GPU0: 140.5393
+    IO2: 33.3389
+    CPU2: 82.4674
+    DRAM0: 14.8931
+    IO0: 6.5827
+    IO1: 10.6156
+chiplets:
+  GPU1: 372.3765
+  GPU2: 239.3225
+  CPU1: 183.7381
+  CPU0: 128.2611
+  HBM0: 5.7573
+  HBM1: 7.7421
+  GPU0: 112.4315
+  IO2: 26.6711
+  CPU2: 65.974
+  DRAM0: 11.9145
+  IO0: 5.2661
+  IO1: 8.4925

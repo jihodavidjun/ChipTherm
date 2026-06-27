@@ -1,0 +1,11 @@
+schema_version: 1
+model_type: grid
+grid:
+  rows: 64
+  cols: 64
+  map_mode: avg
+sampling_interval_s: 0.01
+base_processor_frequency_Hz: 3000000000
+leakage_used: false
+detailed_package: false
+secondary_path: false

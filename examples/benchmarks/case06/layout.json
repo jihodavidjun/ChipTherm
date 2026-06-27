@@ -1,0 +1,256 @@
+{
+  "schema_version": 1,
+  "units": {
+    "length": "mm"
+  },
+  "package": {
+    "name": "case06",
+    "substrate": "silicon_interposer",
+    "size": {
+      "width": 49.0,
+      "height": 53.0
+    }
+  },
+  "chiplets": [
+    {
+      "name": "GPU1",
+      "type": "GPU",
+      "position": {
+        "x": 21.959248,
+        "y": 17.818726
+      },
+      "size": {
+        "width": 16.71552,
+        "height": 13.521983
+      }
+    },
+    {
+      "name": "GPU0",
+      "type": "GPU",
+      "position": {
+        "x": 28.928138,
+        "y": 40.787678
+      },
+      "size": {
+        "width": 8.96811,
+        "height": 10.736212
+      }
+    },
+    {
+      "name": "NPU0",
+      "type": "NPU",
+      "position": {
+        "x": 0.706714,
+        "y": 23.800373
+      },
+      "size": {
+        "width": 10.883571,
+        "height": 8.756643
+      }
+    },
+    {
+      "name": "CPU0",
+      "type": "CPU",
+      "position": {
+        "x": 9.804242,
+        "y": 35.312354
+      },
+      "size": {
+        "width": 9.96067,
+        "height": 8.957446
+      }
+    },
+    {
+      "name": "CPU1",
+      "type": "CPU",
+      "position": {
+        "x": 36.801373,
+        "y": 8.194575
+      },
+      "size": {
+        "width": 10.850263,
+        "height": 8.117457
+      }
+    },
+    {
+      "name": "IO3",
+      "type": "IO",
+      "position": {
+        "x": 41.471866,
+        "y": 22.076743
+      },
+      "size": {
+        "width": 6.793926,
+        "height": 8.619348
+      }
+    },
+    {
+      "name": "CPU2",
+      "type": "CPU",
+      "position": {
+        "x": 6.394462,
+        "y": 12.361013
+      },
+      "size": {
+        "width": 7.581956,
+        "height": 7.091496
+      }
+    },
+    {
+      "name": "NPU1",
+      "type": "NPU",
+      "position": {
+        "x": 0.609485,
+        "y": 37.562384
+      },
+      "size": {
+        "width": 7.884252,
+        "height": 6.408955
+      }
+    },
+    {
+      "name": "IO0",
+      "type": "IO",
+      "position": {
+        "x": 14.873097,
+        "y": 45.931041
+      },
+      "size": {
+        "width": 8.901436,
+        "height": 5.252774
+      }
+    },
+    {
+      "name": "HBM0",
+      "type": "HBM",
+      "position": {
+        "x": 28.008581,
+        "y": 11.525426
+      },
+      "size": {
+        "width": 7.86603,
+        "height": 5.640436
+      }
+    },
+    {
+      "name": "CPU3",
+      "type": "CPU",
+      "position": {
+        "x": 13.415438,
+        "y": 1.765513
+      },
+      "size": {
+        "width": 6.856246,
+        "height": 6.14496
+      }
+    },
+    {
+      "name": "ANALOG0",
+      "type": "ANALOG",
+      "position": {
+        "x": 26.835863,
+        "y": 34.463335
+      },
+      "size": {
+        "width": 8.836054,
+        "height": 4.727656
+      }
+    },
+    {
+      "name": "DRAM0",
+      "type": "DRAM",
+      "position": {
+        "x": 15.827809,
+        "y": 16.663827
+      },
+      "size": {
+        "width": 5.450384,
+        "height": 6.729823
+      }
+    },
+    {
+      "name": "DRAM1",
+      "type": "DRAM",
+      "position": {
+        "x": 1.373619,
+        "y": 44.942091
+      },
+      "size": {
+        "width": 6.025433,
+        "height": 5.786711
+      }
+    },
+    {
+      "name": "IO2",
+      "type": "IO",
+      "position": {
+        "x": 26.382231,
+        "y": 6.219413
+      },
+      "size": {
+        "width": 7.739295,
+        "height": 4.43033
+      }
+    },
+    {
+      "name": "ANALOG1",
+      "type": "ANALOG",
+      "position": {
+        "x": 3.239661,
+        "y": 0.573372
+      },
+      "size": {
+        "width": 5.382899,
+        "height": 6.20619
+      }
+    },
+    {
+      "name": "ANALOG2",
+      "type": "ANALOG",
+      "position": {
+        "x": 40.487084,
+        "y": 34.063886
+      },
+      "size": {
+        "width": 6.74052,
+        "height": 4.472706
+      }
+    },
+    {
+      "name": "MEMS0",
+      "type": "MEMS",
+      "position": {
+        "x": 42.226051,
+        "y": 41.773968
+      },
+      "size": {
+        "width": 5.41228,
+        "height": 5.059577
+      }
+    },
+    {
+      "name": "MEMS1",
+      "type": "MEMS",
+      "position": {
+        "x": 14.570178,
+        "y": 25.287836
+      },
+      "size": {
+        "width": 4.978291,
+        "height": 4.126586
+      }
+    },
+    {
+      "name": "IO1",
+      "type": "IO",
+      "position": {
+        "x": 41.676075,
+        "y": 17.185202
+      },
+      "size": {
+        "width": 6.08783,
+        "height": 3.044192
+      }
+    }
+  ]
+}

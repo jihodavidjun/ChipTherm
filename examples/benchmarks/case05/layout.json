@@ -1,0 +1,160 @@
+{
+  "schema_version": 1,
+  "units": {
+    "length": "mm"
+  },
+  "package": {
+    "name": "case05",
+    "substrate": "silicon_interposer",
+    "size": {
+      "width": 37.0,
+      "height": 37.0
+    }
+  },
+  "chiplets": [
+    {
+      "name": "GPU1",
+      "type": "GPU",
+      "position": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "size": {
+        "width": 17.610115,
+        "height": 11.995161
+      }
+    },
+    {
+      "name": "GPU2",
+      "type": "GPU",
+      "position": {
+        "x": 17.710115,
+        "y": 0.0
+      },
+      "size": {
+        "width": 14.984646,
+        "height": 11.834896
+      }
+    },
+    {
+      "name": "CPU1",
+      "type": "CPU",
+      "position": {
+        "x": 0.0,
+        "y": 12.095161
+      },
+      "size": {
+        "width": 8.87631,
+        "height": 9.835098
+      }
+    },
+    {
+      "name": "CPU0",
+      "type": "CPU",
+      "position": {
+        "x": 8.97631,
+        "y": 12.095161
+      },
+      "size": {
+        "width": 8.480644,
+        "height": 8.385179
+      }
+    },
+    {
+      "name": "HBM0",
+      "type": "HBM",
+      "position": {
+        "x": 17.556954,
+        "y": 12.095161
+      },
+      "size": {
+        "width": 6.456224,
+        "height": 8.036635
+      }
+    },
+    {
+      "name": "HBM1",
+      "type": "HBM",
+      "position": {
+        "x": 24.113178,
+        "y": 12.095161
+      },
+      "size": {
+        "width": 5.60314,
+        "height": 8.009562
+      }
+    },
+    {
+      "name": "GPU0",
+      "type": "GPU",
+      "position": {
+        "x": 0.0,
+        "y": 22.030259
+      },
+      "size": {
+        "width": 9.452237,
+        "height": 6.765497
+      }
+    },
+    {
+      "name": "IO2",
+      "type": "IO",
+      "position": {
+        "x": 9.552237,
+        "y": 22.030259
+      },
+      "size": {
+        "width": 10.67475,
+        "height": 5.799564
+      }
+    },
+    {
+      "name": "CPU2",
+      "type": "CPU",
+      "position": {
+        "x": 20.326987,
+        "y": 22.030259
+      },
+      "size": {
+        "width": 5.732358,
+        "height": 5.787719
+      }
+    },
+    {
+      "name": "DRAM0",
+      "type": "DRAM",
+      "position": {
+        "x": 26.159345,
+        "y": 22.030259
+      },
+      "size": {
+        "width": 8.191334,
+        "height": 5.402024
+      }
+    },
+    {
+      "name": "IO0",
+      "type": "IO",
+      "position": {
+        "x": 0.0,
+        "y": 28.895756
+      },
+      "size": {
+        "width": 5.945226,
+        "height": 3.506017
+      }
+    },
+    {
+      "name": "IO1",
+      "type": "IO",
+      "position": {
+        "x": 6.045226,
+        "y": 28.895756
+      },
+      "size": {
+        "width": 6.549634,
+        "height": 3.353911
+      }
+    }
+  ]
+}

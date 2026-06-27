@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.env
+data/
+outputs/
+*.steady
+*.ttrace
+*.grid.steady
+*.grid.ttrace

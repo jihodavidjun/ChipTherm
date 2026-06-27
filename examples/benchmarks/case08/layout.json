@@ -1,0 +1,448 @@
+{
+  "schema_version": 1,
+  "units": {
+    "length": "mm"
+  },
+  "package": {
+    "name": "case08",
+    "substrate": "silicon_interposer",
+    "size": {
+      "width": 26.0,
+      "height": 23.0
+    }
+  },
+  "chiplets": [
+    {
+      "name": "GPU3",
+      "type": "GPU",
+      "position": {
+        "x": 0.135534,
+        "y": 11.736951
+      },
+      "size": {
+        "width": 5.726282,
+        "height": 3.858532
+      }
+    },
+    {
+      "name": "GPU4",
+      "type": "GPU",
+      "position": {
+        "x": 19.28722,
+        "y": 13.864471
+      },
+      "size": {
+        "width": 4.778463,
+        "height": 4.347157
+      }
+    },
+    {
+      "name": "NPU0",
+      "type": "NPU",
+      "position": {
+        "x": 4.999444,
+        "y": 5.484707
+      },
+      "size": {
+        "width": 3.647942,
+        "height": 4.4968
+      }
+    },
+    {
+      "name": "GPU2",
+      "type": "GPU",
+      "position": {
+        "x": 12.479143,
+        "y": 18.438482
+      },
+      "size": {
+        "width": 3.200322,
+        "height": 4.123652
+      }
+    },
+    {
+      "name": "NPU2",
+      "type": "NPU",
+      "position": {
+        "x": 8.099998,
+        "y": 18.653207
+      },
+      "size": {
+        "width": 4.063872,
+        "height": 3.186158
+      }
+    },
+    {
+      "name": "GPU0",
+      "type": "GPU",
+      "position": {
+        "x": 19.202042,
+        "y": 9.992111
+      },
+      "size": {
+        "width": 3.42218,
+        "height": 3.645726
+      }
+    },
+    {
+      "name": "NPU1",
+      "type": "NPU",
+      "position": {
+        "x": 18.231199,
+        "y": 5.749286
+      },
+      "size": {
+        "width": 2.724348,
+        "height": 3.56538
+      }
+    },
+    {
+      "name": "GPU1",
+      "type": "GPU",
+      "position": {
+        "x": 6.515206,
+        "y": 12.462086
+      },
+      "size": {
+        "width": 3.572076,
+        "height": 2.671442
+      }
+    },
+    {
+      "name": "DRAM1",
+      "type": "DRAM",
+      "position": {
+        "x": 11.091208,
+        "y": 10.847143
+      },
+      "size": {
+        "width": 3.362214,
+        "height": 2.492436
+      }
+    },
+    {
+      "name": "CPU0",
+      "type": "CPU",
+      "position": {
+        "x": 2.757611,
+        "y": 16.661677
+      },
+      "size": {
+        "width": 2.439234,
+        "height": 2.909553
+      }
+    },
+    {
+      "name": "IO3",
+      "type": "IO",
+      "position": {
+        "x": 9.936582,
+        "y": 7.081602
+      },
+      "size": {
+        "width": 1.870538,
+        "height": 3.402945
+      }
+    },
+    {
+      "name": "HBM1",
+      "type": "HBM",
+      "position": {
+        "x": 18.528666,
+        "y": 20.143364
+      },
+      "size": {
+        "width": 2.252611,
+        "height": 2.716332
+      }
+    },
+    {
+      "name": "HBM5",
+      "type": "HBM",
+      "position": {
+        "x": 16.252751,
+        "y": 1.768752
+      },
+      "size": {
+        "width": 2.274717,
+        "height": 2.679986
+      }
+    },
+    {
+      "name": "CPU1",
+      "type": "CPU",
+      "position": {
+        "x": 20.984567,
+        "y": 19.325919
+      },
+      "size": {
+        "width": 2.823615,
+        "height": 2.114224
+      }
+    },
+    {
+      "name": "IO5",
+      "type": "IO",
+      "position": {
+        "x": 7.4965,
+        "y": 0.808006
+      },
+      "size": {
+        "width": 2.567544,
+        "height": 2.127304
+      }
+    },
+    {
+      "name": "HBM2",
+      "type": "HBM",
+      "position": {
+        "x": 15.216636,
+        "y": 7.705356
+      },
+      "size": {
+        "width": 2.720236,
+        "height": 1.96147
+      }
+    },
+    {
+      "name": "HBM3",
+      "type": "HBM",
+      "position": {
+        "x": 12.567333,
+        "y": 2.291245
+      },
+      "size": {
+        "width": 1.834564,
+        "height": 2.900322
+      }
+    },
+    {
+      "name": "HBM0",
+      "type": "HBM",
+      "position": {
+        "x": 18.853719,
+        "y": 2.018712
+      },
+      "size": {
+        "width": 1.896644,
+        "height": 2.767585
+      }
+    },
+    {
+      "name": "DRAM0",
+      "type": "DRAM",
+      "position": {
+        "x": 2.615526,
+        "y": 1.037626
+      },
+      "size": {
+        "width": 2.006534,
+        "height": 2.605357
+      }
+    },
+    {
+      "name": "CPU2",
+      "type": "CPU",
+      "position": {
+        "x": 13.075206,
+        "y": 15.457109
+      },
+      "size": {
+        "width": 2.477233,
+        "height": 2.003371
+      }
+    },
+    {
+      "name": "CPU3",
+      "type": "CPU",
+      "position": {
+        "x": 9.561266,
+        "y": 3.563628
+      },
+      "size": {
+        "width": 2.555298,
+        "height": 1.908604
+      }
+    },
+    {
+      "name": "HBM4",
+      "type": "HBM",
+      "position": {
+        "x": 23.43698,
+        "y": 10.909163
+      },
+      "size": {
+        "width": 1.877151,
+        "height": 2.557892
+      }
+    },
+    {
+      "name": "ANALOG0",
+      "type": "ANALOG",
+      "position": {
+        "x": 22.137452,
+        "y": 6.070926
+      },
+      "size": {
+        "width": 2.370165,
+        "height": 2.003513
+      }
+    },
+    {
+      "name": "ANALOG1",
+      "type": "ANALOG",
+      "position": {
+        "x": 2.988754,
+        "y": 20.516521
+      },
+      "size": {
+        "width": 2.54104,
+        "height": 1.727532
+      }
+    },
+    {
+      "name": "IO4",
+      "type": "IO",
+      "position": {
+        "x": 22.910799,
+        "y": 2.282973
+      },
+      "size": {
+        "width": 2.261383,
+        "height": 1.869249
+      }
+    },
+    {
+      "name": "MEMS3",
+      "type": "MEMS",
+      "position": {
+        "x": 0.757398,
+        "y": 5.002134
+      },
+      "size": {
+        "width": 2.660456,
+        "height": 1.496182
+      }
+    },
+    {
+      "name": "MEMS1",
+      "type": "MEMS",
+      "position": {
+        "x": 13.726281,
+        "y": 5.633375
+      },
+      "size": {
+        "width": 2.498348,
+        "height": 1.399569
+      }
+    },
+    {
+      "name": "IO2",
+      "type": "IO",
+      "position": {
+        "x": 14.73964,
+        "y": 10.822688
+      },
+      "size": {
+        "width": 2.574127,
+        "height": 1.321798
+      }
+    },
+    {
+      "name": "IO0",
+      "type": "IO",
+      "position": {
+        "x": 0.267966,
+        "y": 17.119895
+      },
+      "size": {
+        "width": 1.738188,
+        "height": 1.930755
+      }
+    },
+    {
+      "name": "MEMS0",
+      "type": "MEMS",
+      "position": {
+        "x": 0.01074,
+        "y": 21.308139
+      },
+      "size": {
+        "width": 2.436706,
+        "height": 1.265822
+      }
+    },
+    {
+      "name": "IO6",
+      "type": "IO",
+      "position": {
+        "x": 4.948557,
+        "y": 0.575615
+      },
+      "size": {
+        "width": 1.150043,
+        "height": 2.268766
+      }
+    },
+    {
+      "name": "MEMS6",
+      "type": "MEMS",
+      "position": {
+        "x": 2.016849,
+        "y": 7.426925
+      },
+      "size": {
+        "width": 1.507413,
+        "height": 1.528563
+      }
+    },
+    {
+      "name": "IO1",
+      "type": "IO",
+      "position": {
+        "x": 14.769185,
+        "y": 13.510604
+      },
+      "size": {
+        "width": 2.085539,
+        "height": 1.094948
+      }
+    },
+    {
+      "name": "MEMS4",
+      "type": "MEMS",
+      "position": {
+        "x": 5.426616,
+        "y": 16.093345
+      },
+      "size": {
+        "width": 1.429313,
+        "height": 0.73118
+      }
+    },
+    {
+      "name": "MEMS2",
+      "type": "MEMS",
+      "position": {
+        "x": 14.89619,
+        "y": 4.426786
+      },
+      "size": {
+        "width": 1.064376,
+        "height": 0.972569
+      }
+    },
+    {
+      "name": "MEMS5",
+      "type": "MEMS",
+      "position": {
+        "x": 17.319225,
+        "y": 12.385003
+      },
+      "size": {
+        "width": 0.812256,
+        "height": 1.014446
+      }
+    }
+  ]
+}

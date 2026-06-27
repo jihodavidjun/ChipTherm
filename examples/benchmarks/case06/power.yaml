@@ -1,0 +1,90 @@
+schema_version: 1
+units:
+  power: W
+mode: fixed
+active_workload: nominal
+workloads:
+  idle:
+    GPU1: 42.1312
+    GPU0: 28.9884
+    NPU0: 30.4713
+    CPU0: 34.3909
+    CPU1: 26.9055
+    IO3: 4.8389
+    CPU2: 24.0063
+    NPU1: 11.651
+    IO0: 1.4798
+    HBM0: 1.9165
+    CPU3: 12.5208
+    ANALOG0: 2.5991
+    DRAM0: 3.1649
+    DRAM1: 1.7072
+    IO2: 2.3273
+    ANALOG1: 2.4986
+    ANALOG2: 2.4764
+    MEMS0: 0.5867
+    MEMS1: 0.492
+    IO1: 0.427
+  nominal:
+    GPU1: 168.5248
+    GPU0: 115.9534
+    NPU0: 121.8851
+    CPU0: 137.5634
+    CPU1: 107.6221
+    IO3: 19.3556
+    CPU2: 96.0251
+    NPU1: 46.604
+    IO0: 5.9193
+    HBM0: 7.6659
+    CPU3: 50.0834
+    ANALOG0: 10.3966
+    DRAM0: 12.6596
+    DRAM1: 6.829
+    IO2: 9.3091
+    ANALOG1: 9.9943
+    ANALOG2: 9.9056
+    MEMS0: 2.3467
+    MEMS1: 1.9679
+    IO1: 1.7079
+  peak:
+    GPU1: 210.656
+    GPU0: 144.9418
+    NPU0: 152.3564
+    CPU0: 171.9543
+    CPU1: 134.5276
+    IO3: 24.1945
+    CPU2: 120.0313
+    NPU1: 58.255
+    IO0: 7.3991
+    HBM0: 9.5824
+    CPU3: 62.6042
+    ANALOG0: 12.9957
+    DRAM0: 15.8245
+    DRAM1: 8.5362
+    IO2: 11.6364
+    ANALOG1: 12.4929
+    ANALOG2: 12.382
+    MEMS0: 2.9334
+    MEMS1: 2.4599
+    IO1: 2.1349
+chiplets:
+  GPU1: 168.5248
+  GPU0: 115.9534
+  NPU0: 121.8851
+  CPU0: 137.5634
+  CPU1: 107.6221
+  IO3: 19.3556
+  CPU2: 96.0251
+  NPU1: 46.604
+  IO0: 5.9193
+  HBM0: 7.6659
+  CPU3: 50.0834
+  ANALOG0: 10.3966
+  DRAM0: 12.6596
+  DRAM1: 6.829
+  IO2: 9.3091
+  ANALOG1: 9.9943
+  ANALOG2: 9.9056
+  MEMS0: 2.3467
+  MEMS1: 1.9679
+  IO1: 1.7079

@@ -1,0 +1,23 @@
+schema_version: 1
+ambient_K: 318.15
+initial_temperature_K: 318.15
+chip:
+  thickness_m: 0.00015
+  thermal_conductivity_W_per_mK: 130.0
+  volumetric_heat_capacity_J_per_m3K: 1630300
+interface:
+  thickness_m: 2.0e-05
+  thermal_conductivity_W_per_mK: 4.0
+  volumetric_heat_capacity_J_per_m3K: 4000000
+spreader:
+  side_m: 0.059
+  thickness_m: 0.001
+  thermal_conductivity_W_per_mK: 400.0
+  volumetric_heat_capacity_J_per_m3K: 3550000
+sink:
+  side_m: 0.065
+  thickness_m: 0.0069
+  thermal_conductivity_W_per_mK: 400.0
+  volumetric_heat_capacity_J_per_m3K: 3550000
+  convection_resistance_K_per_W: 0.12
+  convection_capacitance_J_per_K: 140.4

@@ -1,0 +1,352 @@
+{
+  "schema_version": 1,
+  "units": {
+    "length": "mm"
+  },
+  "package": {
+    "name": "case07",
+    "substrate": "silicon_interposer",
+    "size": {
+      "width": 30.0,
+      "height": 25.0
+    }
+  },
+  "chiplets": [
+    {
+      "name": "GPU2",
+      "type": "GPU",
+      "position": {
+        "x": 11.311232,
+        "y": 7.595874
+      },
+      "size": {
+        "width": 6.509459,
+        "height": 6.031305
+      }
+    },
+    {
+      "name": "GPU1",
+      "type": "GPU",
+      "position": {
+        "x": 4.526852,
+        "y": 19.303579
+      },
+      "size": {
+        "width": 6.250656,
+        "height": 5.395842
+      }
+    },
+    {
+      "name": "GPU5",
+      "type": "GPU",
+      "position": {
+        "x": 10.179922,
+        "y": 2.239103
+      },
+      "size": {
+        "width": 6.896729,
+        "height": 4.631246
+      }
+    },
+    {
+      "name": "GPU4",
+      "type": "GPU",
+      "position": {
+        "x": 23.120417,
+        "y": 12.18451
+      },
+      "size": {
+        "width": 5.635758,
+        "height": 5.147026
+      }
+    },
+    {
+      "name": "GPU6",
+      "type": "GPU",
+      "position": {
+        "x": 1.773624,
+        "y": 4.220552
+      },
+      "size": {
+        "width": 4.776226,
+        "height": 4.70427
+      }
+    },
+    {
+      "name": "GPU3",
+      "type": "GPU",
+      "position": {
+        "x": 12.50641,
+        "y": 20.203552
+      },
+      "size": {
+        "width": 4.375685,
+        "height": 4.338232
+      }
+    },
+    {
+      "name": "NPU1",
+      "type": "NPU",
+      "position": {
+        "x": 9.195153,
+        "y": 14.988172
+      },
+      "size": {
+        "width": 4.581645,
+        "height": 3.280139
+      }
+    },
+    {
+      "name": "CPU3",
+      "type": "CPU",
+      "position": {
+        "x": 5.304254,
+        "y": 10.198397
+      },
+      "size": {
+        "width": 3.467848,
+        "height": 4.304439
+      }
+    },
+    {
+      "name": "CPU0",
+      "type": "CPU",
+      "position": {
+        "x": 18.911942,
+        "y": 21.36503
+      },
+      "size": {
+        "width": 4.128812,
+        "height": 3.410517
+      }
+    },
+    {
+      "name": "GPU0",
+      "type": "GPU",
+      "position": {
+        "x": 19.189703,
+        "y": 7.450648
+      },
+      "size": {
+        "width": 3.462922,
+        "height": 3.683179
+      }
+    },
+    {
+      "name": "NPU0",
+      "type": "NPU",
+      "position": {
+        "x": 25.338082,
+        "y": 1.772274
+      },
+      "size": {
+        "width": 3.999289,
+        "height": 2.994593
+      }
+    },
+    {
+      "name": "CPU5",
+      "type": "CPU",
+      "position": {
+        "x": 0.050857,
+        "y": 19.99225
+      },
+      "size": {
+        "width": 3.349556,
+        "height": 3.011145
+      }
+    },
+    {
+      "name": "IO0",
+      "type": "IO",
+      "position": {
+        "x": 19.322302,
+        "y": 1.926192
+      },
+      "size": {
+        "width": 4.006549,
+        "height": 2.317371
+      }
+    },
+    {
+      "name": "HBM1",
+      "type": "HBM",
+      "position": {
+        "x": 0.7338,
+        "y": 13.273955
+      },
+      "size": {
+        "width": 3.363691,
+        "height": 2.532704
+      }
+    },
+    {
+      "name": "HBM0",
+      "type": "HBM",
+      "position": {
+        "x": 1.612284,
+        "y": 16.847075
+      },
+      "size": {
+        "width": 3.527682,
+        "height": 2.231284
+      }
+    },
+    {
+      "name": "CPU1",
+      "type": "CPU",
+      "position": {
+        "x": 3.305744,
+        "y": 1.377622
+      },
+      "size": {
+        "width": 2.529195,
+        "height": 2.69224
+      }
+    },
+    {
+      "name": "CPU4",
+      "type": "CPU",
+      "position": {
+        "x": 18.571296,
+        "y": 11.996117
+      },
+      "size": {
+        "width": 2.782585,
+        "height": 2.396794
+      }
+    },
+    {
+      "name": "HBM2",
+      "type": "HBM",
+      "position": {
+        "x": 25.161334,
+        "y": 21.07203
+      },
+      "size": {
+        "width": 2.880921,
+        "height": 2.164726
+      }
+    },
+    {
+      "name": "CPU2",
+      "type": "CPU",
+      "position": {
+        "x": 18.288625,
+        "y": 5.101638
+      },
+      "size": {
+        "width": 2.614972,
+        "height": 2.195528
+      }
+    },
+    {
+      "name": "ANALOG1",
+      "type": "ANALOG",
+      "position": {
+        "x": 21.303229,
+        "y": 18.057428
+      },
+      "size": {
+        "width": 1.812795,
+        "height": 2.972763
+      }
+    },
+    {
+      "name": "MEMS1",
+      "type": "MEMS",
+      "position": {
+        "x": 26.646489,
+        "y": 9.076805
+      },
+      "size": {
+        "width": 1.83251,
+        "height": 2.640465
+      }
+    },
+    {
+      "name": "MEMS5",
+      "type": "MEMS",
+      "position": {
+        "x": 7.431125,
+        "y": 0.3895
+      },
+      "size": {
+        "width": 2.367135,
+        "height": 1.859147
+      }
+    },
+    {
+      "name": "ANALOG0",
+      "type": "ANALOG",
+      "position": {
+        "x": 7.175243,
+        "y": 2.856863
+      },
+      "size": {
+        "width": 2.867402,
+        "height": 1.521037
+      }
+    },
+    {
+      "name": "MEMS4",
+      "type": "MEMS",
+      "position": {
+        "x": 27.172354,
+        "y": 6.021268
+      },
+      "size": {
+        "width": 1.964512,
+        "height": 2.008873
+      }
+    },
+    {
+      "name": "ANALOG2",
+      "type": "ANALOG",
+      "position": {
+        "x": 1.053828,
+        "y": 0.4229
+      },
+      "size": {
+        "width": 1.479117,
+        "height": 2.058576
+      }
+    },
+    {
+      "name": "MEMS2",
+      "type": "MEMS",
+      "position": {
+        "x": 18.026078,
+        "y": 15.617284
+      },
+      "size": {
+        "width": 2.272093,
+        "height": 1.211638
+      }
+    },
+    {
+      "name": "MEMS0",
+      "type": "MEMS",
+      "position": {
+        "x": 17.585127,
+        "y": 3.396069
+      },
+      "size": {
+        "width": 1.577626,
+        "height": 1.538745
+      }
+    },
+    {
+      "name": "MEMS3",
+      "type": "MEMS",
+      "position": {
+        "x": 26.327834,
+        "y": 18.13875
+      },
+      "size": {
+        "width": 1.064742,
+        "height": 0.907104
+      }
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+schema_version: 1
+name: realistic_chiplet
+description: Fixed-power five-chiplet package for the first ChipTherm HotSpot pipeline.
+files:
+  layout: layout.json
+  power: power.yaml
+  package: package.yaml
+  hotspot: hotspot.yaml

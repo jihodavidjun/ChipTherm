@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "units": {
+    "length": "mm"
+  },
+  "package": {
+    "name": "case02",
+    "substrate": "silicon_interposer",
+    "size": {
+      "width": 55.0,
+      "height": 52.0
+    }
+  },
+  "chiplets": [
+    {
+      "name": "GPU0",
+      "type": "GPU",
+      "position": {
+        "x": 6.192177,
+        "y": 6.001424
+      },
+      "size": {
+        "width": 17.35494,
+        "height": 18.17705
+      }
+    },
+    {
+      "name": "CPU3",
+      "type": "CPU",
+      "position": {
+        "x": 22.088475,
+        "y": 39.934843
+      },
+      "size": {
+        "width": 15.548568,
+        "height": 11.871645
+      }
+    },
+    {
+      "name": "CPU1",
+      "type": "CPU",
+      "position": {
+        "x": 15.021673,
+        "y": 24.392905
+      },
+      "size": {
+        "width": 13.760617,
+        "height": 10.898907
+      }
+    },
+    {
+      "name": "CPU0",
+      "type": "CPU",
+      "position": {
+        "x": 28.981921,
+        "y": 9.682838
+      },
+      "size": {
+        "width": 10.746778,
+        "height": 13.253425
+      }
+    },
+    {
+      "name": "CPU2",
+      "type": "CPU",
+      "position": {
+        "x": 40.638484,
+        "y": 32.862657
+      },
+      "size": {
+        "width": 11.794987,
+        "height": 11.662064
+      }
+    },
+    {
+      "name": "IO0",
+      "type": "IO",
+      "position": {
+        "x": 2.13318,
+        "y": 27.07916
+      },
+      "size": {
+        "width": 11.385729,
+        "height": 6.235008
+      }
+    }
+  ]
+}
