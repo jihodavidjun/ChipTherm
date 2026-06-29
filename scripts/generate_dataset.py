@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+"""For realistic_chiplet dataset generation"""
 from __future__ import annotations
 
 import argparse
