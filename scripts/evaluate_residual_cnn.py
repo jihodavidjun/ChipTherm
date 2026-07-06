@@ -1,0 +1,330 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import sys
+import time
+from collections import defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+from torch import nn
+from torch.utils.data import DataLoader
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SRC_ROOT = REPO_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
+from chiptherm.ml.dataset import ChipThermDataset
+from chiptherm.ml.models import build_model
+from chiptherm.ml.normalization import NormalizationStats, build_model_input, unnormalize_residual
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Evaluate a trained ChipTherm residual CNN.")
+    parser.add_argument("--checkpoint", required=True, type=Path)
+    parser.add_argument("--index", default=REPO_ROOT / "data/runs/benchmarks/dataset_v1/test_index.csv", type=Path)
+    parser.add_argument("--out-dir", default=REPO_ROOT / "outputs/residual_cnn_v1/test_eval", type=Path)
+    parser.add_argument("--batch-size", default=32, type=int)
+    parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
+    parser.add_argument("--num-workers", default=0, type=int)
+    parser.add_argument("--save-predictions", action="store_true")
+    args = parser.parse_args()
+
+    device = select_device(args.device)
+    out_dir = args.out_dir.resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    checkpoint = load_checkpoint(args.checkpoint, device)
+    stats = NormalizationStats(**checkpoint["normalization"])
+    model = build_model(checkpoint["model_config"]).to(device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+
+    dataset = ChipThermDataset(args.index, target="residual", return_metadata=True)
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=device.type == "cuda",
+    )
+
+    metrics, by_case, runtime_s, hotspot_runtime_s = evaluate(
+        model,
+        loader,
+        stats,
+        device,
+        save_predictions=args.save_predictions,
+        out_dir=out_dir,
+    )
+    runtime_per_sample = runtime_s / max(metrics["num_samples"], 1)
+    speedup = hotspot_runtime_s / runtime_per_sample if hotspot_runtime_s and runtime_per_sample else None
+    physics_mae = metrics["physics_baseline"]["mae_K"]
+    final_mae = metrics["cnn_final_temperature"]["mae_K"]
+    physics_rmse = metrics["physics_baseline"]["rmse_K"]
+    final_rmse = metrics["cnn_final_temperature"]["rmse_K"]
+    improvement = {
+        "mae_percent": percent_improvement(physics_mae, final_mae),
+        "rmse_percent": percent_improvement(physics_rmse, final_rmse),
+    }
+
+    payload = {
+        "schema_version": 1,
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "checkpoint": str(args.checkpoint.resolve()),
+        "index": str(args.index.resolve()),
+        "num_samples": metrics["num_samples"],
+        "inference_runtime_total_s": runtime_s,
+        "inference_runtime_per_sample_s": runtime_per_sample,
+        "hotspot_runtime_reference_s": hotspot_runtime_s,
+        "estimated_speedup_vs_hotspot": speedup,
+        "physics_baseline": metrics["physics_baseline"],
+        "cnn_final_temperature": metrics["cnn_final_temperature"],
+        "cnn_residual": metrics["cnn_residual"],
+        "improvement_vs_physics_baseline": improvement,
+    }
+    (out_dir / "metrics.json").write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    write_case_metrics(out_dir / "metrics_by_case.csv", by_case)
+
+    print("Residual CNN evaluation complete")
+    print(f"Samples: {metrics['num_samples']}")
+    print(f"Inference runtime/sample: {runtime_per_sample:.6f} s")
+    print(f"HotSpot runtime reference: {hotspot_runtime_s:.6f} s" if hotspot_runtime_s else "HotSpot runtime reference: n/a")
+    print(f"Estimated speedup: {speedup:.1f}x" if speedup else "Estimated speedup: n/a")
+    print(f"Physics MAE/RMSE: {physics_mae:.3f} / {physics_rmse:.3f} K")
+    print(f"CNN final MAE/RMSE: {final_mae:.3f} / {final_rmse:.3f} K")
+    print(f"Improvement: MAE {improvement['mae_percent']:.2f}% / RMSE {improvement['rmse_percent']:.2f}%")
+    print(f"Output: {out_dir}")
+    return 0
+
+
+@torch.no_grad()
+def evaluate(
+    model: nn.Module,
+    loader: DataLoader[dict[str, Any]],
+    stats: NormalizationStats,
+    device: torch.device,
+    *,
+    save_predictions: bool,
+    out_dir: Path,
+) -> tuple[dict[str, Any], dict[str, dict[str, dict[str, float]]], float, float | None]:
+    residual_acc = MetricAccumulator()
+    final_acc = MetricAccumulator()
+    physics_acc = MetricAccumulator()
+    by_case: dict[str, dict[str, MetricAccumulator]] = defaultdict(
+        lambda: {
+            "cnn_residual": MetricAccumulator(),
+            "cnn_final_temperature": MetricAccumulator(),
+            "physics_baseline": MetricAccumulator(),
+        }
+    )
+    hotspot_runtimes: list[float] = []
+    inference_runtime_s = 0.0
+    num_samples = 0
+
+    for batch in loader:
+        x = batch["x"].to(device, non_blocking=True)
+        physics = batch["physics"].to(device, non_blocking=True)
+        residual = batch["residual"].to(device, non_blocking=True)
+        temperature = batch["temperature"].to(device, non_blocking=True)
+
+        synchronize(device)
+        start = time.perf_counter()
+        model_input = build_model_input(x, physics, stats)
+        pred_norm = model(model_input)
+        pred_residual = unnormalize_residual(pred_norm.squeeze(1), stats)
+        pred_temperature = physics + pred_residual
+        synchronize(device)
+        inference_runtime_s += time.perf_counter() - start
+
+        batch_size = int(x.shape[0])
+        num_samples += batch_size
+        case_ids = metadata_values(batch["metadata"], "case_id", batch_size)
+        sample_uids = metadata_values(batch["metadata"], "sample_uid", batch_size)
+        hotspot_runtimes.extend(float(value) for value in metadata_values(batch["metadata"], "hotspot_runtime_s", batch_size))
+
+        residual_acc.update(pred_residual, residual)
+        final_acc.update(pred_temperature, temperature)
+        physics_acc.update(physics, temperature)
+        for index, case_id in enumerate(case_ids):
+            case_metrics = by_case[str(case_id)]
+            case_metrics["cnn_residual"].update(pred_residual[index : index + 1], residual[index : index + 1])
+            case_metrics["cnn_final_temperature"].update(pred_temperature[index : index + 1], temperature[index : index + 1])
+            case_metrics["physics_baseline"].update(physics[index : index + 1], temperature[index : index + 1])
+
+        if save_predictions:
+            save_batch_predictions(out_dir, sample_uids, case_ids, pred_temperature, pred_residual)
+
+    metrics = {
+        "num_samples": num_samples,
+        "cnn_residual": residual_acc.compute(),
+        "cnn_final_temperature": final_acc.compute(),
+        "physics_baseline": physics_acc.compute(),
+    }
+    case_payload = {
+        case_id: {
+            name: accumulator.compute()
+            for name, accumulator in sorted(accs.items())
+        }
+        for case_id, accs in sorted(by_case.items())
+    }
+    hotspot_runtime_s = float(sum(hotspot_runtimes) / len(hotspot_runtimes)) if hotspot_runtimes else None
+    return metrics, case_payload, inference_runtime_s, hotspot_runtime_s
+
+
+class MetricAccumulator:
+    def __init__(self) -> None:
+        self.num_samples = 0
+        self.num_cells = 0
+        self.sum_abs = 0.0
+        self.sum_sq = 0.0
+        self.sum_signed = 0.0
+        self.max_abs = 0.0
+        self.hotspot_temp_error_sum = 0.0
+        self.hotspot_location_error_sum = 0.0
+
+    def update(self, pred: torch.Tensor, target: torch.Tensor) -> None:
+        pred_cpu = pred.detach().float().cpu()
+        target_cpu = target.detach().float().cpu()
+        error = pred_cpu - target_cpu
+        abs_error = error.abs()
+        self.num_samples += int(pred_cpu.shape[0])
+        self.num_cells += int(error.numel())
+        self.sum_abs += float(abs_error.sum().item())
+        self.sum_sq += float((error * error).sum().item())
+        self.sum_signed += float(error.sum().item())
+        self.max_abs = max(self.max_abs, float(abs_error.max().item()))
+        for pred_item, target_item in zip(pred_cpu, target_cpu):
+            pred_flat = pred_item.reshape(-1)
+            target_flat = target_item.reshape(-1)
+            pred_idx = int(torch.argmax(pred_flat).item())
+            target_idx = int(torch.argmax(target_flat).item())
+            pred_row, pred_col = divmod(pred_idx, pred_item.shape[-1])
+            target_row, target_col = divmod(target_idx, target_item.shape[-1])
+            self.hotspot_temp_error_sum += float(pred_flat[pred_idx].item() - target_flat[target_idx].item())
+            self.hotspot_location_error_sum += float(((pred_row - target_row) ** 2 + (pred_col - target_col) ** 2) ** 0.5)
+
+    def compute(self) -> dict[str, float]:
+        if self.num_cells == 0:
+            return {}
+        return {
+            "num_samples": float(self.num_samples),
+            "mae_K": self.sum_abs / self.num_cells,
+            "rmse_K": (self.sum_sq / self.num_cells) ** 0.5,
+            "max_abs_error_K": self.max_abs,
+            "mean_signed_error_K": self.sum_signed / self.num_cells,
+            "hotspot_temp_error_K": self.hotspot_temp_error_sum / max(self.num_samples, 1),
+            "hotspot_location_error_cells": self.hotspot_location_error_sum / max(self.num_samples, 1),
+        }
+
+
+def save_batch_predictions(
+    out_dir: Path,
+    sample_uids: list[Any],
+    case_ids: list[Any],
+    pred_temperature: torch.Tensor,
+    pred_residual: torch.Tensor,
+) -> None:
+    pred_temperature_cpu = pred_temperature.detach().float().cpu().numpy().astype(np.float32, copy=False)
+    pred_residual_cpu = pred_residual.detach().float().cpu().numpy().astype(np.float32, copy=False)
+    for index, sample_uid in enumerate(sample_uids):
+        case_id = str(case_ids[index])
+        case_dir = out_dir / "predictions" / case_id
+        residual_dir = out_dir / "predicted_residuals" / case_id
+        case_dir.mkdir(parents=True, exist_ok=True)
+        residual_dir.mkdir(parents=True, exist_ok=True)
+        np.save(case_dir / f"{sample_uid}_tpred.npy", pred_temperature_cpu[index])
+        np.save(residual_dir / f"{sample_uid}_residual_pred.npy", pred_residual_cpu[index])
+
+
+def write_case_metrics(path: Path, case_metrics: dict[str, dict[str, dict[str, float]]]) -> None:
+    columns = [
+        "case_id",
+        "physics_mae_K",
+        "physics_rmse_K",
+        "cnn_final_mae_K",
+        "cnn_final_rmse_K",
+        "cnn_final_max_abs_error_K",
+        "cnn_final_mean_signed_error_K",
+        "cnn_hotspot_temp_error_K",
+        "cnn_hotspot_location_error_cells",
+        "mae_improvement_percent",
+        "rmse_improvement_percent",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as fp:
+        writer = csv.DictWriter(fp, fieldnames=columns)
+        writer.writeheader()
+        for case_id, metrics in sorted(case_metrics.items()):
+            physics = metrics["physics_baseline"]
+            final = metrics["cnn_final_temperature"]
+            writer.writerow(
+                {
+                    "case_id": case_id,
+                    "physics_mae_K": physics["mae_K"],
+                    "physics_rmse_K": physics["rmse_K"],
+                    "cnn_final_mae_K": final["mae_K"],
+                    "cnn_final_rmse_K": final["rmse_K"],
+                    "cnn_final_max_abs_error_K": final["max_abs_error_K"],
+                    "cnn_final_mean_signed_error_K": final["mean_signed_error_K"],
+                    "cnn_hotspot_temp_error_K": final["hotspot_temp_error_K"],
+                    "cnn_hotspot_location_error_cells": final["hotspot_location_error_cells"],
+                    "mae_improvement_percent": percent_improvement(physics["mae_K"], final["mae_K"]),
+                    "rmse_improvement_percent": percent_improvement(physics["rmse_K"], final["rmse_K"]),
+                }
+            )
+
+
+def metadata_values(metadata: dict[str, Any], key: str, batch_size: int) -> list[Any]:
+    value = metadata[key]
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    if torch.is_tensor(value):
+        return value.detach().cpu().tolist()
+    return [value for _ in range(batch_size)]
+
+
+def percent_improvement(baseline: float, candidate: float) -> float:
+    if baseline == 0.0:
+        return 0.0
+    return float((baseline - candidate) / baseline * 100.0)
+
+
+def select_device(requested: str) -> torch.device:
+    if requested == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+    device = torch.device(requested)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise SystemExit("CUDA requested but is not available")
+    if device.type == "mps" and not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+        raise SystemExit("MPS requested but is not available")
+    return device
+
+
+def synchronize(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    elif device.type == "mps" and hasattr(torch, "mps"):
+        torch.mps.synchronize()
+
+
+def load_checkpoint(path: Path, device: torch.device) -> dict[str, Any]:
+    try:
+        return torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=device)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
