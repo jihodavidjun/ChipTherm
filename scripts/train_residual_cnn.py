@@ -50,7 +50,15 @@ def main() -> int:
     parser.add_argument("--seed", default=0, type=int)
     parser.add_argument("--scheduler", default="none", choices=["none", "plateau", "cosine"])
     parser.add_argument("--temp-loss-weight", default=0.0, type=float)
+    parser.add_argument("--hotspot-loss-weight", default=0.0, type=float)
+    parser.add_argument("--hotspot-top-frac", default=0.05, type=float)
     args = parser.parse_args()
+    if args.temp_loss_weight < 0.0:
+        raise SystemExit("--temp-loss-weight must be non-negative")
+    if args.hotspot_loss_weight < 0.0:
+        raise SystemExit("--hotspot-loss-weight must be non-negative")
+    if not 0.0 < args.hotspot_top_frac <= 1.0:
+        raise SystemExit("--hotspot-top-frac must be in the interval (0, 1]")
 
     set_seed(args.seed)
     device = select_device(args.device)
@@ -80,6 +88,9 @@ def main() -> int:
         "scheduler": args.scheduler,
         "temp_loss_weight": args.temp_loss_weight,
         "temp_loss_scaling": "temperature L1 loss in Kelvin divided by train residual_std before weighting",
+        "hotspot_loss_weight": args.hotspot_loss_weight,
+        "hotspot_top_frac": args.hotspot_top_frac,
+        "hotspot_loss_scaling": "hotspot L1 loss in Kelvin over top ground-truth HotSpot cells divided by train residual_std before weighting",
         "model": {
             "name": "MiniUNet",
             "input_channels": 9,
@@ -87,7 +98,10 @@ def main() -> int:
             "base_channels": args.base_channels,
             "depth": args.depth,
         },
-        "loss": "SmoothL1Loss on normalized residual plus optional temp_loss_weight * L1(T_pred, HotSpot) / residual_std",
+        "loss": (
+            "SmoothL1Loss on normalized residual plus optional temp_loss_weight * L1(T_pred, HotSpot) / residual_std "
+            "plus optional hotspot_loss_weight * L1(T_pred, HotSpot on top HotSpot cells) / residual_std"
+        ),
         "target": "residual = HotSpot - PhysicsBaseline",
     }
     (out_dir / "config.json").write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -117,6 +131,8 @@ def main() -> int:
             stats,
             device,
             temp_loss_weight=args.temp_loss_weight,
+            hotspot_loss_weight=args.hotspot_loss_weight,
+            hotspot_top_frac=args.hotspot_top_frac,
         )
         val_metrics, val_by_case = evaluate_model(model, val_loader, criterion, stats, device)
         epoch_runtime_s = time.perf_counter() - epoch_start
@@ -160,12 +176,16 @@ def train_one_epoch(
     device: torch.device,
     *,
     temp_loss_weight: float,
+    hotspot_loss_weight: float,
+    hotspot_top_frac: float,
 ) -> dict[str, float]:
     model.train()
     total_loss = 0.0
     residual_loss_total = 0.0
     temp_loss_scaled_total = 0.0
     temp_loss_K_total = 0.0
+    hotspot_loss_scaled_total = 0.0
+    hotspot_loss_K_total = 0.0
     total_samples = 0
     for batch in loader:
         x = batch["x"].to(device, non_blocking=True)
@@ -178,16 +198,26 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
         pred = model(model_input)
         residual_loss = criterion(pred, target)
-        if temp_loss_weight > 0.0:
+        if temp_loss_weight > 0.0 or hotspot_loss_weight > 0.0:
             pred_residual_K = unnormalize_residual(pred.squeeze(1), stats)
             pred_temperature = physics + pred_residual_K
+        if temp_loss_weight > 0.0:
             temp_loss_K = temp_criterion(pred_temperature, temperature)
             temp_loss_scaled = temp_loss_K / max(float(stats.residual_std), 1.0e-8)
-            loss = residual_loss + float(temp_loss_weight) * temp_loss_scaled
         else:
             temp_loss_K = pred.new_tensor(0.0)
             temp_loss_scaled = pred.new_tensor(0.0)
-            loss = residual_loss
+        if hotspot_loss_weight > 0.0:
+            hotspot_loss_K = hotspot_l1_loss(pred_temperature, temperature, hotspot_top_frac)
+            hotspot_loss_scaled = hotspot_loss_K / max(float(stats.residual_std), 1.0e-8)
+        else:
+            hotspot_loss_K = pred.new_tensor(0.0)
+            hotspot_loss_scaled = pred.new_tensor(0.0)
+        loss = (
+            residual_loss
+            + float(temp_loss_weight) * temp_loss_scaled
+            + float(hotspot_loss_weight) * hotspot_loss_scaled
+        )
         loss.backward()
         optimizer.step()
 
@@ -196,6 +226,8 @@ def train_one_epoch(
         residual_loss_total += float(residual_loss.item()) * batch_size
         temp_loss_scaled_total += float(temp_loss_scaled.item()) * batch_size
         temp_loss_K_total += float(temp_loss_K.item()) * batch_size
+        hotspot_loss_scaled_total += float(hotspot_loss_scaled.item()) * batch_size
+        hotspot_loss_K_total += float(hotspot_loss_K.item()) * batch_size
         total_samples += batch_size
     denominator = max(total_samples, 1)
     return {
@@ -203,6 +235,8 @@ def train_one_epoch(
         "residual_loss": residual_loss_total / denominator,
         "temp_loss_scaled": temp_loss_scaled_total / denominator,
         "temp_loss_K": temp_loss_K_total / denominator,
+        "hotspot_loss_scaled": hotspot_loss_scaled_total / denominator,
+        "hotspot_loss_K": hotspot_loss_K_total / denominator,
     }
 
 
@@ -256,6 +290,19 @@ def evaluate_model(
         for case_id, accs in sorted(by_case.items())
     }
     return metrics, case_metrics
+
+
+def hotspot_l1_loss(pred_temperature: torch.Tensor, temperature: torch.Tensor, top_frac: float) -> torch.Tensor:
+    if pred_temperature.shape != temperature.shape:
+        raise ValueError(f"pred_temperature shape {pred_temperature.shape} does not match temperature shape {temperature.shape}")
+    batch_size = int(temperature.shape[0])
+    flat_temperature = temperature.reshape(batch_size, -1)
+    flat_error = torch.abs(pred_temperature - temperature).reshape(batch_size, -1)
+    num_cells = int(flat_temperature.shape[1])
+    k = max(1, int(np.ceil(num_cells * float(top_frac))))
+    top_indices = torch.topk(flat_temperature, k=k, dim=1, largest=True, sorted=False).indices
+    hotspot_error = torch.gather(flat_error, dim=1, index=top_indices)
+    return hotspot_error.mean()
 
 
 class MetricAccumulator:
@@ -368,6 +415,8 @@ def init_train_log(path: Path) -> None:
                 "train_residual_loss",
                 "train_temp_loss_scaled",
                 "train_temp_loss_K",
+                "train_hotspot_loss_scaled",
+                "train_hotspot_loss_K",
                 "val_loss",
                 "val_residual_mae_K",
                 "val_residual_rmse_K",
@@ -400,6 +449,8 @@ def append_train_log(
                 train_losses["residual_loss"],
                 train_losses["temp_loss_scaled"],
                 train_losses["temp_loss_K"],
+                train_losses["hotspot_loss_scaled"],
+                train_losses["hotspot_loss_K"],
                 val_metrics["normalized_residual_loss"],
                 val_metrics["residual"]["mae_K"],
                 val_metrics["residual"]["rmse_K"],
