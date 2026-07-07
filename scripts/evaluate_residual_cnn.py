@@ -36,6 +36,7 @@ def main() -> int:
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
     parser.add_argument("--num-workers", default=0, type=int)
     parser.add_argument("--save-predictions", action="store_true")
+    parser.add_argument("--measure-end-to-end", action="store_true")
     args = parser.parse_args()
 
     device = select_device(args.device)
@@ -57,16 +58,37 @@ def main() -> int:
         pin_memory=device.type == "cuda",
     )
 
-    metrics, by_case, runtime_s, hotspot_runtime_s = evaluate(
+    metrics, by_case, runtime_s, hotspot_runtime_s, physics_runtime_s = evaluate(
         model,
         loader,
         stats,
         device,
+        measure_end_to_end=args.measure_end_to_end,
         save_predictions=args.save_predictions,
         out_dir=out_dir,
     )
-    runtime_per_sample = runtime_s / max(metrics["num_samples"], 1)
-    speedup = hotspot_runtime_s / runtime_per_sample if hotspot_runtime_s and runtime_per_sample else None
+    cnn_runtime_per_sample = runtime_s / max(metrics["num_samples"], 1)
+    cnn_side_speedup = hotspot_runtime_s / cnn_runtime_per_sample if hotspot_runtime_s and cnn_runtime_per_sample else None
+    end_to_end_runtime_per_sample = None
+    end_to_end_speedup = None
+    timing_note = (
+        "CNN-side timing uses loaded T_phys and includes normalization/input assembly, CNN forward, "
+        "residual unnormalization, and final temperature reconstruction. Disk I/O is excluded."
+    )
+    if args.measure_end_to_end:
+        if physics_runtime_s is None:
+            timing_note += " End-to-end timing requested, but physics_runtime_s metadata was unavailable."
+        else:
+            end_to_end_runtime_per_sample = physics_runtime_s + cnn_runtime_per_sample
+            end_to_end_speedup = (
+                hotspot_runtime_s / end_to_end_runtime_per_sample
+                if hotspot_runtime_s and end_to_end_runtime_per_sample
+                else None
+            )
+            timing_note += (
+                " End-to-end timing is estimated as mean metadata physics_runtime_s plus CNN-side runtime; "
+                "physics is not recomputed in this script."
+            )
     physics_mae = metrics["physics_baseline"]["mae_K"]
     final_mae = metrics["cnn_final_temperature"]["mae_K"]
     physics_rmse = metrics["physics_baseline"]["rmse_K"]
@@ -83,9 +105,18 @@ def main() -> int:
         "index": str(args.index.resolve()),
         "num_samples": metrics["num_samples"],
         "inference_runtime_total_s": runtime_s,
-        "inference_runtime_per_sample_s": runtime_per_sample,
+        "inference_runtime_per_sample_s": cnn_runtime_per_sample,
         "hotspot_runtime_reference_s": hotspot_runtime_s,
-        "estimated_speedup_vs_hotspot": speedup,
+        "estimated_speedup_vs_hotspot": cnn_side_speedup,
+        "runtime": {
+            "hotspot_runtime_reference_s": hotspot_runtime_s,
+            "cnn_runtime_per_sample_s": cnn_runtime_per_sample,
+            "physics_runtime_per_sample_s": physics_runtime_s,
+            "end_to_end_runtime_per_sample_s": end_to_end_runtime_per_sample,
+            "cnn_side_speedup_vs_hotspot": cnn_side_speedup,
+            "end_to_end_speedup_vs_hotspot": end_to_end_speedup,
+            "timing_note": timing_note,
+        },
         "physics_baseline": metrics["physics_baseline"],
         "cnn_final_temperature": metrics["cnn_final_temperature"],
         "cnn_residual": metrics["cnn_residual"],
@@ -96,9 +127,18 @@ def main() -> int:
 
     print("Residual CNN evaluation complete")
     print(f"Samples: {metrics['num_samples']}")
-    print(f"Inference runtime/sample: {runtime_per_sample:.6f} s")
+    print(f"CNN-side inference runtime/sample: {cnn_runtime_per_sample:.6f} s")
+    if args.measure_end_to_end:
+        if physics_runtime_s is None:
+            print("Physics runtime/sample: n/a (metadata physics_runtime_s missing)")
+            print("End-to-end estimated runtime/sample: n/a")
+        else:
+            print(f"Physics runtime/sample: {physics_runtime_s:.6f} s")
+            print(f"End-to-end estimated runtime/sample: {end_to_end_runtime_per_sample:.6f} s")
     print(f"HotSpot runtime reference: {hotspot_runtime_s:.6f} s" if hotspot_runtime_s else "HotSpot runtime reference: n/a")
-    print(f"Estimated speedup: {speedup:.1f}x" if speedup else "Estimated speedup: n/a")
+    print(f"CNN-side speedup: {cnn_side_speedup:.1f}x" if cnn_side_speedup else "CNN-side speedup: n/a")
+    if args.measure_end_to_end:
+        print(f"End-to-end speedup: {end_to_end_speedup:.1f}x" if end_to_end_speedup else "End-to-end speedup: n/a")
     print(f"Physics MAE/RMSE: {physics_mae:.3f} / {physics_rmse:.3f} K")
     print(f"CNN final MAE/RMSE: {final_mae:.3f} / {final_rmse:.3f} K")
     print(f"Improvement: MAE {improvement['mae_percent']:.2f}% / RMSE {improvement['rmse_percent']:.2f}%")
@@ -113,9 +153,10 @@ def evaluate(
     stats: NormalizationStats,
     device: torch.device,
     *,
+    measure_end_to_end: bool,
     save_predictions: bool,
     out_dir: Path,
-) -> tuple[dict[str, Any], dict[str, dict[str, dict[str, float]]], float, float | None]:
+) -> tuple[dict[str, Any], dict[str, dict[str, dict[str, float]]], float, float | None, float | None]:
     residual_acc = MetricAccumulator()
     final_acc = MetricAccumulator()
     physics_acc = MetricAccumulator()
@@ -127,6 +168,7 @@ def evaluate(
         }
     )
     hotspot_runtimes: list[float] = []
+    physics_runtimes: list[float] = []
     inference_runtime_s = 0.0
     num_samples = 0
 
@@ -149,7 +191,15 @@ def evaluate(
         num_samples += batch_size
         case_ids = metadata_values(batch["metadata"], "case_id", batch_size)
         sample_uids = metadata_values(batch["metadata"], "sample_uid", batch_size)
-        hotspot_runtimes.extend(float(value) for value in metadata_values(batch["metadata"], "hotspot_runtime_s", batch_size))
+        hotspot_runtimes.extend(
+            value
+            for value in optional_float_values(metadata_values(batch["metadata"], "hotspot_runtime_s", batch_size))
+        )
+        if measure_end_to_end:
+            physics_runtimes.extend(
+                value
+                for value in optional_float_values(metadata_values(batch["metadata"], "physics_runtime_s", batch_size))
+            )
 
         residual_acc.update(pred_residual, residual)
         final_acc.update(pred_temperature, temperature)
@@ -177,7 +227,8 @@ def evaluate(
         for case_id, accs in sorted(by_case.items())
     }
     hotspot_runtime_s = float(sum(hotspot_runtimes) / len(hotspot_runtimes)) if hotspot_runtimes else None
-    return metrics, case_payload, inference_runtime_s, hotspot_runtime_s
+    physics_runtime_s = float(sum(physics_runtimes) / len(physics_runtimes)) if physics_runtimes else None
+    return metrics, case_payload, inference_runtime_s, hotspot_runtime_s, physics_runtime_s
 
 
 class MetricAccumulator:
@@ -289,6 +340,15 @@ def metadata_values(metadata: dict[str, Any], key: str, batch_size: int) -> list
     if torch.is_tensor(value):
         return value.detach().cpu().tolist()
     return [value for _ in range(batch_size)]
+
+
+def optional_float_values(values: list[Any]) -> list[float]:
+    result: list[float] = []
+    for value in values:
+        if value is None or value == "":
+            continue
+        result.append(float(value))
+    return result
 
 
 def percent_improvement(baseline: float, candidate: float) -> float:

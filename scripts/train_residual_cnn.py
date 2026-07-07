@@ -48,6 +48,8 @@ def main() -> int:
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
     parser.add_argument("--num-workers", default=0, type=int)
     parser.add_argument("--seed", default=0, type=int)
+    parser.add_argument("--scheduler", default="none", choices=["none", "plateau", "cosine"])
+    parser.add_argument("--temp-loss-weight", default=0.0, type=float)
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -75,6 +77,9 @@ def main() -> int:
         "device": str(device),
         "num_workers": args.num_workers,
         "seed": args.seed,
+        "scheduler": args.scheduler,
+        "temp_loss_weight": args.temp_loss_weight,
+        "temp_loss_scaling": "temperature L1 loss in Kelvin divided by train residual_std before weighting",
         "model": {
             "name": "MiniUNet",
             "input_channels": 9,
@@ -82,7 +87,7 @@ def main() -> int:
             "base_channels": args.base_channels,
             "depth": args.depth,
         },
-        "loss": "SmoothL1Loss on normalized residual",
+        "loss": "SmoothL1Loss on normalized residual plus optional temp_loss_weight * L1(T_pred, HotSpot) / residual_std",
         "target": "residual = HotSpot - PhysicsBaseline",
     }
     (out_dir / "config.json").write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -92,7 +97,9 @@ def main() -> int:
 
     model = MiniUNet(input_channels=9, output_channels=1, base_channels=args.base_channels, depth=args.depth).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    scheduler = make_scheduler(args.scheduler, optimizer, args.epochs)
     criterion = nn.SmoothL1Loss()
+    temp_criterion = nn.L1Loss()
 
     log_path = out_dir / "train_log.csv"
     init_train_log(log_path)
@@ -101,10 +108,21 @@ def main() -> int:
 
     for epoch in range(1, args.epochs + 1):
         epoch_start = time.perf_counter()
-        train_loss = train_one_epoch(model, train_loader, optimizer, criterion, stats, device)
+        train_losses = train_one_epoch(
+            model,
+            train_loader,
+            optimizer,
+            criterion,
+            temp_criterion,
+            stats,
+            device,
+            temp_loss_weight=args.temp_loss_weight,
+        )
         val_metrics, val_by_case = evaluate_model(model, val_loader, criterion, stats, device)
         epoch_runtime_s = time.perf_counter() - epoch_start
         val_final_mae = float(val_metrics["final_temperature"]["mae_K"])
+        step_scheduler(args.scheduler, scheduler, val_final_mae)
+        current_lr = optimizer.param_groups[0]["lr"]
         is_best = val_final_mae < best_val_mae
         if is_best:
             best_val_mae = val_final_mae
@@ -116,12 +134,12 @@ def main() -> int:
             save_checkpoint(checkpoints_dir / "best.pt", model, optimizer, epoch, config, stats, val_metrics, best=True)
 
         save_checkpoint(checkpoints_dir / "last.pt", model, optimizer, epoch, config, stats, val_metrics, best=is_best)
-        append_train_log(log_path, epoch, train_loss, val_metrics, epoch_runtime_s, is_best)
+        append_train_log(log_path, epoch, train_losses, val_metrics, epoch_runtime_s, is_best, current_lr)
         write_metrics(out_dir / "val_metrics.json", best_metrics or {"epoch": epoch, "metrics": val_metrics, "metrics_by_case": val_by_case})
         write_case_metrics(out_dir / "val_metrics_by_case.csv", (best_metrics or {"metrics_by_case": val_by_case})["metrics_by_case"])
 
         print(
-            f"epoch {epoch:03d} train_loss={train_loss:.6f} "
+            f"epoch {epoch:03d} train_loss={train_losses['total_loss']:.6f} lr={current_lr:.3e} "
             f"val_mae={val_final_mae:.3f}K val_rmse={val_metrics['final_temperature']['rmse_K']:.3f}K "
             f"{'best' if is_best else ''}"
         )
@@ -137,29 +155,55 @@ def train_one_epoch(
     loader: DataLoader[dict[str, Any]],
     optimizer: torch.optim.Optimizer,
     criterion: nn.Module,
+    temp_criterion: nn.Module,
     stats: NormalizationStats,
     device: torch.device,
-) -> float:
+    *,
+    temp_loss_weight: float,
+) -> dict[str, float]:
     model.train()
     total_loss = 0.0
+    residual_loss_total = 0.0
+    temp_loss_scaled_total = 0.0
+    temp_loss_K_total = 0.0
     total_samples = 0
     for batch in loader:
         x = batch["x"].to(device, non_blocking=True)
         physics = batch["physics"].to(device, non_blocking=True)
         residual = batch["residual"].to(device, non_blocking=True)
+        temperature = batch["temperature"].to(device, non_blocking=True)
         model_input = build_model_input(x, physics, stats)
         target = normalize_residual(residual, stats).unsqueeze(1)
 
         optimizer.zero_grad(set_to_none=True)
         pred = model(model_input)
-        loss = criterion(pred, target)
+        residual_loss = criterion(pred, target)
+        if temp_loss_weight > 0.0:
+            pred_residual_K = unnormalize_residual(pred.squeeze(1), stats)
+            pred_temperature = physics + pred_residual_K
+            temp_loss_K = temp_criterion(pred_temperature, temperature)
+            temp_loss_scaled = temp_loss_K / max(float(stats.residual_std), 1.0e-8)
+            loss = residual_loss + float(temp_loss_weight) * temp_loss_scaled
+        else:
+            temp_loss_K = pred.new_tensor(0.0)
+            temp_loss_scaled = pred.new_tensor(0.0)
+            loss = residual_loss
         loss.backward()
         optimizer.step()
 
         batch_size = int(x.shape[0])
         total_loss += float(loss.item()) * batch_size
+        residual_loss_total += float(residual_loss.item()) * batch_size
+        temp_loss_scaled_total += float(temp_loss_scaled.item()) * batch_size
+        temp_loss_K_total += float(temp_loss_K.item()) * batch_size
         total_samples += batch_size
-    return total_loss / max(total_samples, 1)
+    denominator = max(total_samples, 1)
+    return {
+        "total_loss": total_loss / denominator,
+        "residual_loss": residual_loss_total / denominator,
+        "temp_loss_scaled": temp_loss_scaled_total / denominator,
+        "temp_loss_K": temp_loss_K_total / denominator,
+    }
 
 
 @torch.no_grad()
@@ -319,7 +363,11 @@ def init_train_log(path: Path) -> None:
         writer.writerow(
             [
                 "epoch",
+                "lr",
                 "train_loss",
+                "train_residual_loss",
+                "train_temp_loss_scaled",
+                "train_temp_loss_K",
                 "val_loss",
                 "val_residual_mae_K",
                 "val_residual_rmse_K",
@@ -333,13 +381,25 @@ def init_train_log(path: Path) -> None:
         )
 
 
-def append_train_log(path: Path, epoch: int, train_loss: float, val_metrics: dict[str, Any], epoch_runtime_s: float, is_best: bool) -> None:
+def append_train_log(
+    path: Path,
+    epoch: int,
+    train_losses: dict[str, float],
+    val_metrics: dict[str, Any],
+    epoch_runtime_s: float,
+    is_best: bool,
+    current_lr: float,
+) -> None:
     with path.open("a", encoding="utf-8", newline="") as fp:
         writer = csv.writer(fp)
         writer.writerow(
             [
                 epoch,
-                train_loss,
+                current_lr,
+                train_losses["total_loss"],
+                train_losses["residual_loss"],
+                train_losses["temp_loss_scaled"],
+                train_losses["temp_loss_K"],
                 val_metrics["normalized_residual_loss"],
                 val_metrics["residual"]["mae_K"],
                 val_metrics["residual"]["rmse_K"],
@@ -351,6 +411,43 @@ def append_train_log(path: Path, epoch: int, train_loss: float, val_metrics: dic
                 int(is_best),
             ]
         )
+
+
+def make_scheduler(
+    scheduler_name: str,
+    optimizer: torch.optim.Optimizer,
+    epochs: int,
+) -> torch.optim.lr_scheduler.LRScheduler | torch.optim.lr_scheduler.ReduceLROnPlateau | None:
+    if scheduler_name == "none":
+        return None
+    if scheduler_name == "plateau":
+        return torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=0.5,
+            patience=5,
+            threshold=1.0e-4,
+        )
+    if scheduler_name == "cosine":
+        return torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(int(epochs), 1),
+            eta_min=1.0e-6,
+        )
+    raise ValueError(f"unsupported scheduler: {scheduler_name}")
+
+
+def step_scheduler(
+    scheduler_name: str,
+    scheduler: torch.optim.lr_scheduler.LRScheduler | torch.optim.lr_scheduler.ReduceLROnPlateau | None,
+    val_final_mae: float,
+) -> None:
+    if scheduler is None:
+        return
+    if scheduler_name == "plateau":
+        scheduler.step(val_final_mae)
+    else:
+        scheduler.step()
 
 
 def write_metrics(path: Path, payload: dict[str, Any]) -> None:
