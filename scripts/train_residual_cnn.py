@@ -68,6 +68,8 @@ def main() -> int:
 
     train_dataset = ChipThermDataset(args.train_index, target="residual", return_metadata=True)
     val_dataset = ChipThermDataset(args.val_index, target="residual", return_metadata=True)
+    dataset_input_channels = int(train_dataset[0]["x"].shape[0])
+    model_input_channels = dataset_input_channels + 1
     train_loader = make_loader(train_dataset, args.batch_size, shuffle=True, num_workers=args.num_workers, device=device)
     val_loader = make_loader(val_dataset, args.batch_size, shuffle=False, num_workers=args.num_workers, device=device)
 
@@ -93,7 +95,8 @@ def main() -> int:
         "hotspot_loss_scaling": "hotspot L1 loss in Kelvin over top ground-truth HotSpot cells divided by train residual_std before weighting",
         "model": {
             "name": "MiniUNet",
-            "input_channels": 9,
+            "input_channels": model_input_channels,
+            "dataset_input_channels": dataset_input_channels,
             "output_channels": 1,
             "base_channels": args.base_channels,
             "depth": args.depth,
@@ -109,7 +112,7 @@ def main() -> int:
     stats = compute_normalization_stats(train_dataset, batch_size=args.batch_size, num_workers=args.num_workers)
     save_normalization_stats(stats, out_dir / "normalization.json")
 
-    model = MiniUNet(input_channels=9, output_channels=1, base_channels=args.base_channels, depth=args.depth).to(device)
+    model = MiniUNet(input_channels=model_input_channels, output_channels=1, base_channels=args.base_channels, depth=args.depth).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     scheduler = make_scheduler(args.scheduler, optimizer, args.epochs)
     criterion = nn.SmoothL1Loss()

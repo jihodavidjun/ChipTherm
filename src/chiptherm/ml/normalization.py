@@ -23,10 +23,18 @@ class NormalizationStats:
     residual_std: float
     num_samples: int
     num_grid_cells: int
+    input_channels: int = 8
+    context_channel_indices: tuple[int, ...] = ()
+    context_channel_means: tuple[float, ...] = ()
+    context_channel_stds: tuple[float, ...] = ()
     notes: str = "Computed from train split only. Masks and normalized coordinate channels are not normalized."
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        data = asdict(self)
+        data["context_channel_indices"] = list(self.context_channel_indices)
+        data["context_channel_means"] = list(self.context_channel_means)
+        data["context_channel_stds"] = list(self.context_channel_stds)
+        return data
 
 
 def compute_normalization_stats(
@@ -39,18 +47,29 @@ def compute_normalization_stats(
     power_acc = RunningMoments()
     physics_acc = RunningMoments()
     residual_acc = RunningMoments()
+    context_accs: list[RunningMoments] | None = None
+    input_channels: int | None = None
     num_samples = 0
 
     for batch in loader:
         x = batch["x"].float()
         physics = batch["physics"].float()
         residual = batch["residual"].float()
+        if input_channels is None:
+            input_channels = int(x.shape[1])
+            context_accs = [RunningMoments() for _ in range(max(input_channels - 8, 0))]
+        elif input_channels != int(x.shape[1]):
+            raise ValueError(f"inconsistent input channel count: expected {input_channels}, got {x.shape[1]}")
         power_acc.update(x[:, 0])
+        if context_accs:
+            for offset, acc in enumerate(context_accs, start=8):
+                acc.update(x[:, offset])
         physics_acc.update(physics)
         residual_acc.update(residual)
         num_samples += int(x.shape[0])
 
     num_grid_cells = int(power_acc.count)
+    context_accs = context_accs or []
     return NormalizationStats(
         schema_version=1,
         power_density_mean=power_acc.mean,
@@ -61,6 +80,10 @@ def compute_normalization_stats(
         residual_std=residual_acc.std,
         num_samples=num_samples,
         num_grid_cells=num_grid_cells,
+        input_channels=int(input_channels or 8),
+        context_channel_indices=tuple(range(8, int(input_channels or 8))),
+        context_channel_means=tuple(acc.mean for acc in context_accs),
+        context_channel_stds=tuple(acc.std for acc in context_accs),
     )
 
 
@@ -70,12 +93,18 @@ def save_normalization_stats(stats: NormalizationStats, path: str | Path) -> Non
 
 def load_normalization_stats(path: str | Path) -> NormalizationStats:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
+    for key in ("context_channel_indices", "context_channel_means", "context_channel_stds"):
+        if key in data:
+            data[key] = tuple(data[key])
     return NormalizationStats(**data)
 
 
 def build_model_input(x: torch.Tensor, physics: torch.Tensor, stats: NormalizationStats) -> torch.Tensor:
     x_norm = x.float().clone()
     x_norm[:, 0] = normalize_tensor(x_norm[:, 0], stats.power_density_mean, stats.power_density_std)
+    for channel, mean, std in zip(stats.context_channel_indices, stats.context_channel_means, stats.context_channel_stds):
+        if int(channel) < x_norm.shape[1]:
+            x_norm[:, int(channel)] = normalize_tensor(x_norm[:, int(channel)], float(mean), float(std))
     physics_norm = normalize_tensor(physics.float(), stats.physics_mean, stats.physics_std).unsqueeze(1)
     return torch.cat([x_norm, physics_norm], dim=1)
 
