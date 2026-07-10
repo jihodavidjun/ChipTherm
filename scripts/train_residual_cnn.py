@@ -238,12 +238,34 @@ def refinement_channels_for_dataset(
     selected: list[int] = []
     selected_names: list[str] = []
     for index, name in enumerate(names):
-        if index < 8 or name.startswith("finite_source_"):
+        if is_refinement_channel(index, name):
             selected.append(index)
             selected_names.append(name)
     if not selected:
         raise SystemExit("miniunet_refine could not identify any full-resolution refinement input channels")
     return tuple(selected), tuple(selected_names)
+
+
+def is_refinement_channel(index: int, name: str) -> bool:
+    if index < 8:
+        return True
+    if name.startswith("finite_source_"):
+        return True
+    if name.startswith("enclosed_power_"):
+        return True
+    if name == "minimum_distance_to_package_edge_mm":
+        return True
+    if name in {
+        "chiplet_total_power_W",
+        "chiplet_width_mm",
+        "chiplet_height_mm",
+        "chiplet_area_mm2",
+        "chiplet_aspect_ratio",
+        "chiplet_power_density_W_per_mm2",
+        "thermal_crowding_W_per_mm",
+    }:
+        return True
+    return False
 
 
 def dataset_channel_names(dataset_input_channels: int, stats: NormalizationStats) -> list[str]:
