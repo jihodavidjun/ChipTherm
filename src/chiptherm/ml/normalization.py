@@ -25,6 +25,7 @@ class NormalizationStats:
     num_grid_cells: int
     input_channels: int = 8
     context_channel_indices: tuple[int, ...] = ()
+    context_channel_names: tuple[str, ...] = ()
     context_channel_means: tuple[float, ...] = ()
     context_channel_stds: tuple[float, ...] = ()
     notes: str = "Computed from train split only. Masks and normalized coordinate channels are not normalized."
@@ -32,6 +33,7 @@ class NormalizationStats:
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["context_channel_indices"] = list(self.context_channel_indices)
+        data["context_channel_names"] = list(self.context_channel_names)
         data["context_channel_means"] = list(self.context_channel_means)
         data["context_channel_stds"] = list(self.context_channel_stds)
         return data
@@ -70,6 +72,7 @@ def compute_normalization_stats(
 
     num_grid_cells = int(power_acc.count)
     context_accs = context_accs or []
+    context_indices = tuple(range(8, int(input_channels or 8)))
     return NormalizationStats(
         schema_version=1,
         power_density_mean=power_acc.mean,
@@ -81,7 +84,8 @@ def compute_normalization_stats(
         num_samples=num_samples,
         num_grid_cells=num_grid_cells,
         input_channels=int(input_channels or 8),
-        context_channel_indices=tuple(range(8, int(input_channels or 8))),
+        context_channel_indices=context_indices,
+        context_channel_names=context_channel_names(dataset, context_indices),
         context_channel_means=tuple(acc.mean for acc in context_accs),
         context_channel_stds=tuple(acc.std for acc in context_accs),
     )
@@ -93,10 +97,32 @@ def save_normalization_stats(stats: NormalizationStats, path: str | Path) -> Non
 
 def load_normalization_stats(path: str | Path) -> NormalizationStats:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
-    for key in ("context_channel_indices", "context_channel_means", "context_channel_stds"):
+    for key in ("context_channel_indices", "context_channel_names", "context_channel_means", "context_channel_stds"):
         if key in data:
             data[key] = tuple(data[key])
     return NormalizationStats(**data)
+
+
+def context_channel_names(dataset: Dataset[Any], indices: tuple[int, ...]) -> tuple[str, ...]:
+    index_csv = getattr(dataset, "index_csv", None)
+    if index_csv is None:
+        return tuple(f"channel_{index}" for index in indices)
+    manifest_path = Path(index_csv).parent / "feature_manifest.json"
+    if not manifest_path.exists():
+        manifest_path = Path(index_csv).parent / "context_manifest.json"
+    if not manifest_path.exists():
+        return tuple(f"channel_{index}" for index in indices)
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return tuple(f"channel_{index}" for index in indices)
+    channel_names = manifest.get("channel_names")
+    if isinstance(channel_names, list) and len(channel_names) > max(indices, default=-1):
+        return tuple(str(channel_names[index]) for index in indices)
+    context_channels = manifest.get("context_channels")
+    if isinstance(context_channels, list) and len(context_channels) >= len(indices):
+        return tuple(str(name) for name in context_channels[: len(indices)])
+    return tuple(f"channel_{index}" for index in indices)
 
 
 def build_model_input(x: torch.Tensor, physics: torch.Tensor, stats: NormalizationStats) -> torch.Tensor:
