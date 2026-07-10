@@ -52,6 +52,12 @@ def main() -> int:
     parser.add_argument("--temp-loss-weight", default=0.0, type=float)
     parser.add_argument("--hotspot-loss-weight", default=0.0, type=float)
     parser.add_argument("--hotspot-top-frac", default=0.05, type=float)
+    parser.add_argument(
+        "--train-mae-every",
+        default=5,
+        type=int,
+        help="Compute train-set final-temperature MAE every N epochs. Use 1 for every epoch, 0 to disable.",
+    )
     args = parser.parse_args()
     if args.temp_loss_weight < 0.0:
         raise SystemExit("--temp-loss-weight must be non-negative")
@@ -59,6 +65,8 @@ def main() -> int:
         raise SystemExit("--hotspot-loss-weight must be non-negative")
     if not 0.0 < args.hotspot_top_frac <= 1.0:
         raise SystemExit("--hotspot-top-frac must be in the interval (0, 1]")
+    if args.train_mae_every < 0:
+        raise SystemExit("--train-mae-every must be non-negative")
 
     set_seed(args.seed)
     device = select_device(args.device)
@@ -71,6 +79,7 @@ def main() -> int:
     dataset_input_channels = int(train_dataset[0]["x"].shape[0])
     model_input_channels = dataset_input_channels + 1
     train_loader = make_loader(train_dataset, args.batch_size, shuffle=True, num_workers=args.num_workers, device=device)
+    train_eval_loader = make_loader(train_dataset, args.batch_size, shuffle=False, num_workers=args.num_workers, device=device)
     val_loader = make_loader(val_dataset, args.batch_size, shuffle=False, num_workers=args.num_workers, device=device)
 
     config = {
@@ -93,6 +102,7 @@ def main() -> int:
         "hotspot_loss_weight": args.hotspot_loss_weight,
         "hotspot_top_frac": args.hotspot_top_frac,
         "hotspot_loss_scaling": "hotspot L1 loss in Kelvin over top ground-truth HotSpot cells divided by train residual_std before weighting",
+        "train_mae_every": args.train_mae_every,
         "model": {
             "name": "MiniUNet",
             "input_channels": model_input_channels,
@@ -138,6 +148,10 @@ def main() -> int:
             hotspot_top_frac=args.hotspot_top_frac,
         )
         val_metrics, val_by_case = evaluate_model(model, val_loader, criterion, stats, device)
+        train_final_mae_K: float | None = None
+        if should_compute_train_mae(epoch, args.epochs, args.train_mae_every):
+            train_metrics, _ = evaluate_model(model, train_eval_loader, criterion, stats, device)
+            train_final_mae_K = float(train_metrics["final_temperature"]["mae_K"])
         epoch_runtime_s = time.perf_counter() - epoch_start
         val_final_mae = float(val_metrics["final_temperature"]["mae_K"])
         step_scheduler(args.scheduler, scheduler, val_final_mae)
@@ -153,12 +167,13 @@ def main() -> int:
             save_checkpoint(checkpoints_dir / "best.pt", model, optimizer, epoch, config, stats, val_metrics, best=True)
 
         save_checkpoint(checkpoints_dir / "last.pt", model, optimizer, epoch, config, stats, val_metrics, best=is_best)
-        append_train_log(log_path, epoch, train_losses, val_metrics, epoch_runtime_s, is_best, current_lr)
+        append_train_log(log_path, epoch, train_losses, train_final_mae_K, val_metrics, epoch_runtime_s, is_best, current_lr)
         write_metrics(out_dir / "val_metrics.json", best_metrics or {"epoch": epoch, "metrics": val_metrics, "metrics_by_case": val_by_case})
         write_case_metrics(out_dir / "val_metrics_by_case.csv", (best_metrics or {"metrics_by_case": val_by_case})["metrics_by_case"])
 
         print(
             f"epoch {epoch:03d} train_loss={train_losses['total_loss']:.6f} lr={current_lr:.3e} "
+            f"train_final_mae={format_optional_mae(train_final_mae_K)} "
             f"val_mae={val_final_mae:.3f}K val_rmse={val_metrics['final_temperature']['rmse_K']:.3f}K "
             f"{'best' if is_best else ''}"
         )
@@ -241,6 +256,16 @@ def train_one_epoch(
         "hotspot_loss_scaled": hotspot_loss_scaled_total / denominator,
         "hotspot_loss_K": hotspot_loss_K_total / denominator,
     }
+
+
+def should_compute_train_mae(epoch: int, epochs: int, cadence: int) -> bool:
+    return cadence > 0 and (epoch == 1 or epoch == epochs or epoch % cadence == 0)
+
+
+def format_optional_mae(value: float | None) -> str:
+    if value is None:
+        return "skip"
+    return f"{value:.3f}K"
 
 
 @torch.no_grad()
@@ -420,6 +445,7 @@ def init_train_log(path: Path) -> None:
                 "train_temp_loss_K",
                 "train_hotspot_loss_scaled",
                 "train_hotspot_loss_K",
+                "train_final_temperature_mae_K",
                 "val_loss",
                 "val_residual_mae_K",
                 "val_residual_rmse_K",
@@ -437,6 +463,7 @@ def append_train_log(
     path: Path,
     epoch: int,
     train_losses: dict[str, float],
+    train_final_mae_K: float | None,
     val_metrics: dict[str, Any],
     epoch_runtime_s: float,
     is_best: bool,
@@ -454,6 +481,7 @@ def append_train_log(
                 train_losses["temp_loss_K"],
                 train_losses["hotspot_loss_scaled"],
                 train_losses["hotspot_loss_K"],
+                "" if train_final_mae_K is None else train_final_mae_K,
                 val_metrics["normalized_residual_loss"],
                 val_metrics["residual"]["mae_K"],
                 val_metrics["residual"]["rmse_K"],

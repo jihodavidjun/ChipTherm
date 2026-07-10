@@ -68,7 +68,15 @@ def main() -> int:
     parser.add_argument("--num-workers", default=0, type=int)
     parser.add_argument("--seed", default=0, type=int)
     parser.add_argument("--scheduler", default="none", choices=["none", "plateau", "cosine"])
+    parser.add_argument(
+        "--train-mae-every",
+        default=5,
+        type=int,
+        help="Compute train-set final-temperature MAE every N epochs. Use 1 for every epoch, 0 to disable.",
+    )
     args = parser.parse_args()
+    if args.train_mae_every < 0:
+        raise SystemExit("--train-mae-every must be non-negative")
 
     set_seed(args.seed)
     device = select_device(args.device)
@@ -80,6 +88,7 @@ def main() -> int:
     val_dataset = ChipThermDataset(args.val_index, target="temperature", return_metadata=True)
     input_channels = int(train_dataset[0]["x"].shape[0])
     train_loader = make_loader(train_dataset, args.batch_size, shuffle=True, num_workers=args.num_workers, device=device)
+    train_eval_loader = make_loader(train_dataset, args.batch_size, shuffle=False, num_workers=args.num_workers, device=device)
     val_loader = make_loader(val_dataset, args.batch_size, shuffle=False, num_workers=args.num_workers, device=device)
 
     config = {
@@ -97,6 +106,7 @@ def main() -> int:
         "num_workers": args.num_workers,
         "seed": args.seed,
         "scheduler": args.scheduler,
+        "train_mae_every": args.train_mae_every,
         "model": {
             "name": "MiniUNet",
             "input_channels": input_channels,
@@ -127,6 +137,10 @@ def main() -> int:
         epoch_start = time.perf_counter()
         train_loss = train_one_epoch(model, train_loader, optimizer, criterion, stats, device)
         val_metrics, val_by_case = evaluate_model(model, val_loader, criterion, stats, device)
+        train_mae_K: float | None = None
+        if should_compute_train_mae(epoch, args.epochs, args.train_mae_every):
+            train_metrics, _ = evaluate_model(model, train_eval_loader, criterion, stats, device)
+            train_mae_K = float(train_metrics["temperature"]["mae_K"])
         epoch_runtime_s = time.perf_counter() - epoch_start
         val_mae = float(val_metrics["temperature"]["mae_K"])
         step_scheduler(args.scheduler, scheduler, val_mae)
@@ -138,11 +152,12 @@ def main() -> int:
             save_checkpoint(checkpoints_dir / "best.pt", model, optimizer, epoch, config, stats, val_metrics, best=True)
 
         save_checkpoint(checkpoints_dir / "last.pt", model, optimizer, epoch, config, stats, val_metrics, best=is_best)
-        append_train_log(log_path, epoch, current_lr, train_loss, val_metrics, epoch_runtime_s, is_best)
+        append_train_log(log_path, epoch, current_lr, train_loss, train_mae_K, val_metrics, epoch_runtime_s, is_best)
         write_json(out_dir / "val_metrics.json", best_payload or {"epoch": epoch, "metrics": val_metrics, "metrics_by_case": val_by_case})
         write_case_metrics(out_dir / "val_metrics_by_case.csv", (best_payload or {"metrics_by_case": val_by_case})["metrics_by_case"])
         print(
             f"epoch {epoch:03d} train_loss={train_loss:.6f} lr={current_lr:.3e} "
+            f"train_mae={format_optional_mae(train_mae_K)} "
             f"val_mae={val_mae:.3f}K val_rmse={val_metrics['temperature']['rmse_K']:.3f}K "
             f"{'best' if is_best else ''}"
         )
@@ -215,6 +230,16 @@ def train_one_epoch(
         total_loss += float(loss.item()) * batch_size
         total_samples += batch_size
     return total_loss / max(total_samples, 1)
+
+
+def should_compute_train_mae(epoch: int, epochs: int, cadence: int) -> bool:
+    return cadence > 0 and (epoch == 1 or epoch == epochs or epoch % cadence == 0)
+
+
+def format_optional_mae(value: float | None) -> str:
+    if value is None:
+        return "skip"
+    return f"{value:.3f}K"
 
 
 @torch.no_grad()
@@ -381,6 +406,7 @@ def init_train_log(path: Path) -> None:
             "epoch",
             "lr",
             "train_loss",
+            "train_mae_K",
             "val_loss",
             "val_mae_K",
             "val_rmse_K",
@@ -393,7 +419,16 @@ def init_train_log(path: Path) -> None:
         ])
 
 
-def append_train_log(path: Path, epoch: int, lr: float, train_loss: float, val_metrics: dict[str, Any], epoch_runtime_s: float, is_best: bool) -> None:
+def append_train_log(
+    path: Path,
+    epoch: int,
+    lr: float,
+    train_loss: float,
+    train_mae_K: float | None,
+    val_metrics: dict[str, Any],
+    epoch_runtime_s: float,
+    is_best: bool,
+) -> None:
     metrics = val_metrics["temperature"]
     with path.open("a", encoding="utf-8", newline="") as fp:
         writer = csv.writer(fp)
@@ -401,6 +436,7 @@ def append_train_log(path: Path, epoch: int, lr: float, train_loss: float, val_m
             epoch,
             lr,
             train_loss,
+            "" if train_mae_K is None else train_mae_K,
             val_metrics["normalized_temperature_loss"],
             metrics["mae_K"],
             metrics["rmse_K"],
