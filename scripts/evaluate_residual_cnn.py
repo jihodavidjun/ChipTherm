@@ -23,7 +23,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from chiptherm.ml.dataset import ChipThermDataset
-from chiptherm.ml.models import build_model
+from chiptherm.ml.models import build_model, count_parameters
 from chiptherm.ml.normalization import NormalizationStats, build_model_input, unnormalize_residual
 
 
@@ -50,6 +50,13 @@ def main() -> int:
     model.eval()
 
     dataset = ChipThermDataset(args.index, target="residual", return_metadata=True)
+    actual_input_channels = int(dataset[0]["x"].shape[0]) + 1
+    expected_input_channels = int(checkpoint["model_config"].get("input_channels", actual_input_channels))
+    if actual_input_channels != expected_input_channels:
+        raise SystemExit(
+            f"checkpoint expects {expected_input_channels} model input channels, "
+            f"but dataset provides {actual_input_channels} channels including physics"
+        )
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -103,6 +110,10 @@ def main() -> int:
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "checkpoint": str(args.checkpoint.resolve()),
         "index": str(args.index.resolve()),
+        "model": {
+            "config": checkpoint["model_config"],
+            "parameter_count": count_parameters(model),
+        },
         "num_samples": metrics["num_samples"],
         "inference_runtime_total_s": runtime_s,
         "inference_runtime_per_sample_s": cnn_runtime_per_sample,
@@ -120,6 +131,7 @@ def main() -> int:
         "physics_baseline": metrics["physics_baseline"],
         "cnn_final_temperature": metrics["cnn_final_temperature"],
         "cnn_residual": metrics["cnn_residual"],
+        "coarse_final_temperature": metrics.get("coarse_final_temperature"),
         "improvement_vs_physics_baseline": improvement,
     }
     (out_dir / "metrics.json").write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -140,7 +152,11 @@ def main() -> int:
     if args.measure_end_to_end:
         print(f"End-to-end speedup: {end_to_end_speedup:.1f}x" if end_to_end_speedup else "End-to-end speedup: n/a")
     print(f"Physics MAE/RMSE: {physics_mae:.3f} / {physics_rmse:.3f} K")
+    if metrics.get("coarse_final_temperature"):
+        coarse = metrics["coarse_final_temperature"]
+        print(f"Coarse-only MAE/RMSE: {coarse['mae_K']:.3f} / {coarse['rmse_K']:.3f} K")
     print(f"CNN final MAE/RMSE: {final_mae:.3f} / {final_rmse:.3f} K")
+    print(f"Parameter count: {count_parameters(model)}")
     print(f"Improvement: MAE {improvement['mae_percent']:.2f}% / RMSE {improvement['rmse_percent']:.2f}%")
     print(f"Output: {out_dir}")
     return 0
@@ -160,11 +176,14 @@ def evaluate(
     residual_acc = MetricAccumulator()
     final_acc = MetricAccumulator()
     physics_acc = MetricAccumulator()
+    coarse_final_acc = MetricAccumulator()
+    has_coarse_prediction = False
     by_case: dict[str, dict[str, MetricAccumulator]] = defaultdict(
         lambda: {
             "cnn_residual": MetricAccumulator(),
             "cnn_final_temperature": MetricAccumulator(),
             "physics_baseline": MetricAccumulator(),
+            "coarse_final_temperature": MetricAccumulator(),
         }
     )
     hotspot_runtimes: list[float] = []
@@ -181,9 +200,19 @@ def evaluate(
         synchronize(device)
         start = time.perf_counter()
         model_input = build_model_input(x, physics, stats)
-        pred_norm = model(model_input)
+        coarse_norm = None
+        if hasattr(model, "forward_components"):
+            pred_norm, coarse_norm, _detail_norm = model.forward_components(model_input)
+        else:
+            pred_norm = model(model_input)
         pred_residual = unnormalize_residual(pred_norm.squeeze(1), stats)
         pred_temperature = physics + pred_residual
+        if coarse_norm is not None:
+            coarse_residual = unnormalize_residual(coarse_norm.squeeze(1), stats)
+            coarse_temperature = physics + coarse_residual
+            has_coarse_prediction = True
+        else:
+            coarse_temperature = None
         synchronize(device)
         inference_runtime_s += time.perf_counter() - start
 
@@ -204,11 +233,15 @@ def evaluate(
         residual_acc.update(pred_residual, residual)
         final_acc.update(pred_temperature, temperature)
         physics_acc.update(physics, temperature)
+        if coarse_temperature is not None:
+            coarse_final_acc.update(coarse_temperature, temperature)
         for index, case_id in enumerate(case_ids):
             case_metrics = by_case[str(case_id)]
             case_metrics["cnn_residual"].update(pred_residual[index : index + 1], residual[index : index + 1])
             case_metrics["cnn_final_temperature"].update(pred_temperature[index : index + 1], temperature[index : index + 1])
             case_metrics["physics_baseline"].update(physics[index : index + 1], temperature[index : index + 1])
+            if coarse_temperature is not None:
+                case_metrics["coarse_final_temperature"].update(coarse_temperature[index : index + 1], temperature[index : index + 1])
 
         if save_predictions:
             save_batch_predictions(out_dir, sample_uids, case_ids, pred_temperature, pred_residual)
@@ -219,6 +252,8 @@ def evaluate(
         "cnn_final_temperature": final_acc.compute(),
         "physics_baseline": physics_acc.compute(),
     }
+    if has_coarse_prediction:
+        metrics["coarse_final_temperature"] = coarse_final_acc.compute()
     case_payload = {
         case_id: {
             name: accumulator.compute()
@@ -307,6 +342,8 @@ def write_case_metrics(path: Path, case_metrics: dict[str, dict[str, dict[str, f
         "cnn_final_mean_signed_error_K",
         "cnn_hotspot_temp_error_K",
         "cnn_hotspot_location_error_cells",
+        "coarse_final_mae_K",
+        "coarse_final_rmse_K",
         "mae_improvement_percent",
         "rmse_improvement_percent",
     ]
@@ -316,6 +353,7 @@ def write_case_metrics(path: Path, case_metrics: dict[str, dict[str, dict[str, f
         for case_id, metrics in sorted(case_metrics.items()):
             physics = metrics["physics_baseline"]
             final = metrics["cnn_final_temperature"]
+            coarse = metrics.get("coarse_final_temperature", {})
             writer.writerow(
                 {
                     "case_id": case_id,
@@ -327,6 +365,8 @@ def write_case_metrics(path: Path, case_metrics: dict[str, dict[str, dict[str, f
                     "cnn_final_mean_signed_error_K": final["mean_signed_error_K"],
                     "cnn_hotspot_temp_error_K": final["hotspot_temp_error_K"],
                     "cnn_hotspot_location_error_cells": final["hotspot_location_error_cells"],
+                    "coarse_final_mae_K": coarse.get("mae_K", ""),
+                    "coarse_final_rmse_K": coarse.get("rmse_K", ""),
                     "mae_improvement_percent": percent_improvement(physics["mae_K"], final["mae_K"]),
                     "rmse_improvement_percent": percent_improvement(physics["rmse_K"], final["rmse_K"]),
                 }

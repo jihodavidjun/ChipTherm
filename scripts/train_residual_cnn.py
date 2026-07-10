@@ -24,7 +24,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from chiptherm.ml.dataset import ChipThermDataset
-from chiptherm.ml.models import MiniUNet
+from chiptherm.ml.models import build_model, count_parameters
 from chiptherm.ml.normalization import (
     NormalizationStats,
     build_model_input,
@@ -45,6 +45,9 @@ def main() -> int:
     parser.add_argument("--lr", default=1.0e-3, type=float)
     parser.add_argument("--base-channels", default=16, type=int)
     parser.add_argument("--depth", default=3, type=int)
+    parser.add_argument("--model-architecture", default="miniunet", choices=["miniunet", "miniunet_refine"])
+    parser.add_argument("--refine-channels", default=32, type=int)
+    parser.add_argument("--refine-blocks", default=4, type=int)
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
     parser.add_argument("--num-workers", default=0, type=int)
     parser.add_argument("--seed", default=0, type=int)
@@ -82,6 +85,31 @@ def main() -> int:
     train_eval_loader = make_loader(train_dataset, args.batch_size, shuffle=False, num_workers=args.num_workers, device=device)
     val_loader = make_loader(val_dataset, args.batch_size, shuffle=False, num_workers=args.num_workers, device=device)
 
+    stats = compute_normalization_stats(train_dataset, batch_size=args.batch_size, num_workers=args.num_workers)
+    refinement_channel_indices, refinement_channel_names = refinement_channels_for_dataset(
+        dataset_input_channels,
+        stats,
+        enabled=args.model_architecture == "miniunet_refine",
+    )
+    model_config: dict[str, Any] = {
+        "architecture": args.model_architecture,
+        "name": "MiniUNetWithRefinement" if args.model_architecture == "miniunet_refine" else "MiniUNet",
+        "input_channels": model_input_channels,
+        "dataset_input_channels": dataset_input_channels,
+        "output_channels": 1,
+        "base_channels": args.base_channels,
+        "depth": args.depth,
+    }
+    if args.model_architecture == "miniunet_refine":
+        model_config.update(
+            {
+                "refine_channels": args.refine_channels,
+                "refine_blocks": args.refine_blocks,
+                "refinement_channel_indices": list(refinement_channel_indices),
+                "refinement_channel_names": list(refinement_channel_names),
+            }
+        )
+
     config = {
         "schema_version": 1,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -93,6 +121,9 @@ def main() -> int:
         "lr": args.lr,
         "base_channels": args.base_channels,
         "depth": args.depth,
+        "model_architecture": args.model_architecture,
+        "refine_channels": args.refine_channels,
+        "refine_blocks": args.refine_blocks,
         "device": str(device),
         "num_workers": args.num_workers,
         "seed": args.seed,
@@ -103,30 +134,29 @@ def main() -> int:
         "hotspot_top_frac": args.hotspot_top_frac,
         "hotspot_loss_scaling": "hotspot L1 loss in Kelvin over top ground-truth HotSpot cells divided by train residual_std before weighting",
         "train_mae_every": args.train_mae_every,
-        "model": {
-            "name": "MiniUNet",
-            "input_channels": model_input_channels,
-            "dataset_input_channels": dataset_input_channels,
-            "output_channels": 1,
-            "base_channels": args.base_channels,
-            "depth": args.depth,
-        },
+        "model": model_config,
         "loss": (
             "SmoothL1Loss on normalized residual plus optional temp_loss_weight * L1(T_pred, HotSpot) / residual_std "
             "plus optional hotspot_loss_weight * L1(T_pred, HotSpot on top HotSpot cells) / residual_std"
         ),
         "target": "residual = HotSpot - PhysicsBaseline",
     }
+    model = build_model(model_config).to(device)
+    config["model"] = model.config() if hasattr(model, "config") else model_config
     (out_dir / "config.json").write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-
-    stats = compute_normalization_stats(train_dataset, batch_size=args.batch_size, num_workers=args.num_workers)
     save_normalization_stats(stats, out_dir / "normalization.json")
 
-    model = MiniUNet(input_channels=model_input_channels, output_channels=1, base_channels=args.base_channels, depth=args.depth).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     scheduler = make_scheduler(args.scheduler, optimizer, args.epochs)
     criterion = nn.SmoothL1Loss()
     temp_criterion = nn.L1Loss()
+
+    print(f"Model architecture: {args.model_architecture}")
+    print(f"Model input channels: {model_input_channels}")
+    if args.model_architecture == "miniunet_refine":
+        print(f"Refinement channels: {list(refinement_channel_indices)}")
+        print(f"Refinement channel names: {', '.join(refinement_channel_names)}")
+    print(f"Trainable parameters: {count_parameters(model)}")
 
     log_path = out_dir / "train_log.csv"
     init_train_log(log_path)
@@ -182,6 +212,50 @@ def main() -> int:
     print(f"Best validation final-temperature MAE: {best_val_mae:.3f} K")
     print(f"Output: {out_dir}")
     return 0
+
+
+BASE_CHANNEL_NAMES = (
+    "power_density_W_per_mm2",
+    "occupancy_mask",
+    "CPU_mask",
+    "GPU_or_NPU_mask",
+    "memory_mask",
+    "IO_or_ANALOG_or_MEMS_mask",
+    "normalized_x_coordinate",
+    "normalized_y_coordinate",
+)
+
+
+def refinement_channels_for_dataset(
+    dataset_input_channels: int,
+    stats: NormalizationStats,
+    *,
+    enabled: bool,
+) -> tuple[tuple[int, ...], tuple[str, ...]]:
+    if not enabled:
+        return (), ()
+    names = dataset_channel_names(dataset_input_channels, stats)
+    selected: list[int] = []
+    selected_names: list[str] = []
+    for index, name in enumerate(names):
+        if index < 8 or name.startswith("finite_source_"):
+            selected.append(index)
+            selected_names.append(name)
+    if not selected:
+        raise SystemExit("miniunet_refine could not identify any full-resolution refinement input channels")
+    return tuple(selected), tuple(selected_names)
+
+
+def dataset_channel_names(dataset_input_channels: int, stats: NormalizationStats) -> list[str]:
+    names = list(BASE_CHANNEL_NAMES[: min(8, dataset_input_channels)])
+    context_names = list(getattr(stats, "context_channel_names", ()) or ())
+    for offset in range(8, dataset_input_channels):
+        context_index = offset - 8
+        if context_index < len(context_names):
+            names.append(str(context_names[context_index]))
+        else:
+            names.append(f"channel_{offset}")
+    return names
 
 
 def train_one_epoch(
@@ -407,7 +481,7 @@ def make_loader(
 
 def save_checkpoint(
     path: Path,
-    model: MiniUNet,
+    model: nn.Module,
     optimizer: torch.optim.Optimizer,
     epoch: int,
     config: dict[str, Any],
