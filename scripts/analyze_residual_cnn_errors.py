@@ -27,7 +27,7 @@ if str(SRC_ROOT) not in sys.path:
 
 from chiptherm.ml.dataset import ChipThermDataset
 from chiptherm.ml.models import build_model
-from chiptherm.ml.normalization import NormalizationStats, build_model_input, unnormalize_residual
+from chiptherm.ml.normalization import NormalizationStats, build_metadata_input, build_model_input, unnormalize_residual
 
 
 SAMPLE_COLUMNS = [
@@ -59,6 +59,12 @@ SAMPLE_COLUMNS = [
     "hotspot_top_10pct_mae_K",
     "power_top_5pct_mae_K",
     "power_top_10pct_mae_K",
+    "mean_rise_error_K",
+    "mean_rise_abs_error_K",
+    "centered_field_mae_K",
+    "centered_field_rmse_K",
+    "mean_bias_removed_mae_K",
+    "mean_bias_removed_rmse_K",
 ]
 
 
@@ -82,6 +88,7 @@ def main() -> int:
     model = build_model(checkpoint["model_config"]).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
+    model_info = architecture_info(checkpoint["model_config"])
 
     dataset = ChipThermDataset(args.index, target="residual", return_metadata=True)
     loader = DataLoader(
@@ -92,7 +99,7 @@ def main() -> int:
         pin_memory=device.type == "cuda",
     )
 
-    records, all_cnn_errors, regional_sums = analyze(model, loader, stats, device)
+    records, all_cnn_errors, regional_sums = analyze(model, loader, stats, device, model_info)
     by_case = aggregate_by_case(records)
     selected = select_samples(records, seed=args.seed)
     summary = build_summary(args, records, by_case, regional_sums, selected)
@@ -101,7 +108,7 @@ def main() -> int:
     write_sample_metrics(out_dir / "sample_metrics.csv", records)
     write_case_metrics(out_dir / "metrics_by_case.csv", by_case)
     write_plots(out_dir, records, by_case, all_cnn_errors, regional_sums)
-    write_sample_panels(out_dir / "samples", dataset, model, stats, device, selected)
+    write_sample_panels(out_dir / "samples", dataset, model, stats, device, selected, model_info)
 
     overall = summary["overall"]
     worst_case_id = max(by_case.items(), key=lambda item: item[1]["cnn_mae_K"])[0]
@@ -130,12 +137,23 @@ def main() -> int:
     return 0
 
 
+def architecture_info(model_config: dict[str, Any]) -> dict[str, Any]:
+    architecture = str(model_config.get("architecture", "miniunet"))
+    return {
+        "architecture": architecture,
+        "conditioned": architecture in {"miniunet_refine_conditioned", "miniunet_refine_conditioned_decomposed"},
+        "decomposed": architecture in {"miniunet_refine_decomposed", "miniunet_refine_conditioned_decomposed"},
+        "metadata_dim": int(model_config.get("metadata_dim", 0) or 0),
+    }
+
+
 @torch.no_grad()
 def analyze(
     model: nn.Module,
     loader: DataLoader[dict[str, Any]],
     stats: NormalizationStats,
     device: torch.device,
+    model_info: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], np.ndarray, dict[str, RunningRegion]]:
     records: list[dict[str, Any]] = []
     all_errors: list[np.ndarray] = []
@@ -156,15 +174,20 @@ def analyze(
         x = batch["x"].to(device, non_blocking=True)
         physics = batch["physics"].to(device, non_blocking=True)
         temperature = batch["temperature"].to(device, non_blocking=True)
+        ambient = batch["ambient_K"].to(device, non_blocking=True).float()
         model_input = build_model_input(x, physics, stats)
-        pred_norm = model(model_input)
-        pred_residual = unnormalize_residual(pred_norm.squeeze(1), stats)
-        pred_temperature = physics + pred_residual
+        metadata_input = build_metadata_input(batch.get("metadata_vector"), stats)
+        if metadata_input is not None:
+            metadata_input = metadata_input.to(device, non_blocking=True)
+        prediction = predict_temperature(model, model_input, physics, ambient, metadata_input, stats, model_info)
+        pred_temperature = prediction["temperature"]
 
         x_np = x.detach().cpu().numpy()
         physics_np = physics.detach().cpu().numpy()
         temperature_np = temperature.detach().cpu().numpy()
         pred_np = pred_temperature.detach().cpu().numpy()
+        mean_rise_pred_np = to_numpy_or_none(prediction.get("mean_rise"))
+        centered_pred_np = to_numpy_or_none(prediction.get("centered_field"))
         metadata = batch["metadata"]
         batch_size = int(x_np.shape[0])
         sample_uids = metadata_values(metadata, "sample_uid", batch_size)
@@ -208,6 +231,17 @@ def analyze(
 
             physics_stats = error_stats(phys, y)
             cnn_stats = error_stats(pred, y)
+            ambient_i = float(ambient.detach().cpu().numpy()[i])
+            mean_rise_target = float((y - ambient_i).mean())
+            centered_target = y - float(y.mean())
+            if mean_rise_pred_np is not None and centered_pred_np is not None:
+                mean_rise_error = float(mean_rise_pred_np[i] - mean_rise_target)
+                centered_stats = error_stats(centered_pred_np[i], centered_target)
+                mean_bias_removed_stats = centered_stats
+            else:
+                mean_rise_error = None
+                centered_stats = {}
+                mean_bias_removed_stats = {}
             pred_hotspot = np.unravel_index(int(np.argmax(pred)), pred.shape)
             true_hotspot = np.unravel_index(int(np.argmax(y)), y.shape)
             record = {
@@ -242,11 +276,58 @@ def analyze(
                 "hotspot_top_10pct_mae_K": masked_mae(abs_error, hotspot_top_10),
                 "power_top_5pct_mae_K": masked_mae(abs_error, power_top_5),
                 "power_top_10pct_mae_K": masked_mae(abs_error, power_top_10),
+                "mean_rise_error_K": mean_rise_error,
+                "mean_rise_abs_error_K": abs(mean_rise_error) if mean_rise_error is not None else None,
+                "centered_field_mae_K": centered_stats.get("mae_K"),
+                "centered_field_rmse_K": centered_stats.get("rmse_K"),
+                "mean_bias_removed_mae_K": mean_bias_removed_stats.get("mae_K"),
+                "mean_bias_removed_rmse_K": mean_bias_removed_stats.get("rmse_K"),
             }
             records.append(record)
         dataset_offset += batch_size
 
     return records, np.concatenate(all_errors).astype(np.float64, copy=False), regional_sums
+
+
+def predict_temperature(
+    model: nn.Module,
+    model_input: torch.Tensor,
+    physics: torch.Tensor,
+    ambient: torch.Tensor,
+    metadata_input: torch.Tensor | None,
+    stats: NormalizationStats,
+    model_info: dict[str, Any],
+) -> dict[str, torch.Tensor]:
+    conditioned = bool(model_info["conditioned"])
+    decomposed = bool(model_info["decomposed"])
+    if conditioned and metadata_input is None:
+        raise ValueError("conditioned checkpoint requires metadata tensor; build metadata_features.csv first")
+    if decomposed:
+        outputs = model(model_input, metadata_input) if conditioned else model(model_input)
+        centered = outputs["centered_field"]
+        centered = centered - centered.mean(dim=(-2, -1), keepdim=True)
+        temperature = ambient[:, None, None] + outputs["mean_rise"][:, None, None] + centered
+        return {
+            "temperature": temperature,
+            "residual": temperature - physics,
+            "mean_rise": outputs["mean_rise"],
+            "centered_field": centered,
+        }
+    if hasattr(model, "forward_components"):
+        if conditioned:
+            pred_norm, _coarse_norm, _detail_norm = model.forward_components(model_input, metadata_input)
+        else:
+            pred_norm, _coarse_norm, _detail_norm = model.forward_components(model_input)
+    else:
+        pred_norm = model(model_input, metadata_input) if conditioned else model(model_input)
+    pred_residual = unnormalize_residual(pred_norm.squeeze(1), stats)
+    return {"temperature": physics + pred_residual, "residual": pred_residual}
+
+
+def to_numpy_or_none(value: torch.Tensor | None) -> np.ndarray | None:
+    if value is None:
+        return None
+    return value.detach().cpu().numpy()
 
 
 def error_stats(pred: np.ndarray, target: np.ndarray) -> dict[str, float]:
@@ -343,6 +424,11 @@ def aggregate_records(records: list[dict[str, Any]]) -> dict[str, float]:
         "hotspot_top_10pct_mae_K",
         "power_top_5pct_mae_K",
         "power_top_10pct_mae_K",
+        "mean_rise_abs_error_K",
+        "centered_field_mae_K",
+        "centered_field_rmse_K",
+        "mean_bias_removed_mae_K",
+        "mean_bias_removed_rmse_K",
     ]
     result: dict[str, float] = {"num_samples": float(len(records))}
     for key in keys_mean:
@@ -392,6 +478,8 @@ def build_summary(
                 "case_id": record["case_id"],
                 "cnn_mae_K": record["cnn_mae_K"],
                 "cnn_rmse_K": record["cnn_rmse_K"],
+                "mean_rise_abs_error_K": record.get("mean_rise_abs_error_K"),
+                "centered_field_mae_K": record.get("centered_field_mae_K"),
             }
             for record in selected
         ],
@@ -419,6 +507,17 @@ def select_samples(records: list[dict[str, Any]], *, seed: int) -> list[dict[str
     add(sorted_records[0], "best")
     add(sorted_records[len(sorted_records) // 2], "median")
     add(sorted_records[-1], "worst")
+    add(sorted_records[-1], "worst_final_temperature")
+    mean_records = [record for record in records if record.get("mean_rise_abs_error_K") is not None]
+    if mean_records:
+        add(max(mean_records, key=lambda item: float(item["mean_rise_abs_error_K"])), "worst_mean_rise")
+    centered_records = [record for record in records if record.get("centered_field_mae_K") is not None]
+    if centered_records:
+        add(max(centered_records, key=lambda item: float(item["centered_field_mae_K"])), "worst_centered_field")
+    add(max(records, key=lambda item: float(item["hotspot_top_5pct_mae_K"])), "worst_hotspot_region")
+    case02_records = [record for record in records if record["case_id"] == "case02"]
+    if case02_records:
+        add(max(case02_records, key=lambda item: float(item["cnn_mae_K"])), "worst_case02")
     rng = random.Random(seed)
     by_case: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for record in records:
@@ -462,6 +561,11 @@ def write_case_metrics(path: Path, by_case: dict[str, dict[str, float]]) -> None
         "hotspot_top_10pct_mae_K",
         "power_top_5pct_mae_K",
         "power_top_10pct_mae_K",
+        "mean_rise_abs_error_K",
+        "centered_field_mae_K",
+        "centered_field_rmse_K",
+        "mean_bias_removed_mae_K",
+        "mean_bias_removed_rmse_K",
     ]
     with path.open("w", encoding="utf-8", newline="") as fp:
         writer = csv.DictWriter(fp, fieldnames=columns)
@@ -507,15 +611,22 @@ def write_sample_panels(
     stats: NormalizationStats,
     device: torch.device,
     selected: list[dict[str, Any]],
+    model_info: dict[str, Any],
 ) -> None:
     samples_dir.mkdir(parents=True, exist_ok=True)
     for record in selected:
         sample = dataset[int(record["dataset_index"])]
         x = sample["x"].unsqueeze(0).to(device)
         physics = sample["physics"].unsqueeze(0).to(device)
+        ambient = sample["ambient_K"].view(1).to(device)
         y = sample["temperature"].cpu().numpy()
         model_input = build_model_input(x, physics, stats)
-        pred = physics + unnormalize_residual(model(model_input).squeeze(1), stats)
+        metadata_input = None
+        if "metadata_vector" in sample:
+            metadata_input = build_metadata_input(sample["metadata_vector"].unsqueeze(0), stats)
+            if metadata_input is not None:
+                metadata_input = metadata_input.to(device)
+        pred = predict_temperature(model, model_input, physics, ambient, metadata_input, stats, model_info)["temperature"]
         draw_sample_panel(
             sample,
             pred.squeeze(0).detach().cpu().numpy(),
