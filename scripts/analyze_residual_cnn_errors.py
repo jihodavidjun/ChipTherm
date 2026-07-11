@@ -139,11 +139,15 @@ def main() -> int:
 
 def architecture_info(model_config: dict[str, Any]) -> dict[str, Any]:
     architecture = str(model_config.get("architecture", "miniunet"))
+    physics_input_mode = str(model_config.get("physics_input_mode", "v1"))
+    if physics_input_mode not in {"v1", "none"}:
+        raise ValueError(f"unsupported physics_input_mode: {physics_input_mode}")
     return {
         "architecture": architecture,
         "conditioned": architecture in {"miniunet_refine_conditioned", "miniunet_refine_conditioned_decomposed"},
         "decomposed": architecture in {"miniunet_refine_decomposed", "miniunet_refine_conditioned_decomposed"},
         "metadata_dim": int(model_config.get("metadata_dim", 0) or 0),
+        "physics_input_mode": physics_input_mode,
     }
 
 
@@ -175,7 +179,7 @@ def analyze(
         physics = batch["physics"].to(device, non_blocking=True)
         temperature = batch["temperature"].to(device, non_blocking=True)
         ambient = batch["ambient_K"].to(device, non_blocking=True).float()
-        model_input = build_model_input(x, physics, stats)
+        model_input = build_model_input(x, physics, stats, physics_input_mode=str(model_info.get("physics_input_mode", "v1")))
         metadata_input = build_metadata_input(batch.get("metadata_vector"), stats)
         if metadata_input is not None:
             metadata_input = metadata_input.to(device, non_blocking=True)
@@ -620,7 +624,7 @@ def write_sample_panels(
         physics = sample["physics"].unsqueeze(0).to(device)
         ambient = sample["ambient_K"].view(1).to(device)
         y = sample["temperature"].cpu().numpy()
-        model_input = build_model_input(x, physics, stats)
+        model_input = build_model_input(x, physics, stats, physics_input_mode=str(model_info.get("physics_input_mode", "v1")))
         metadata_input = None
         if "metadata_vector" in sample:
             metadata_input = build_metadata_input(sample["metadata_vector"].unsqueeze(0), stats)

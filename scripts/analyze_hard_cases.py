@@ -256,6 +256,7 @@ def predict_split(
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
     info = architecture_info(checkpoint["model_config"])
+    physics_input_mode = str(info.get("physics_input_mode", "v1"))
     dataset = ChipThermDataset(index_path, target="residual", return_metadata=True)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=device.type == "cuda")
     result: dict[str, dict[str, Any]] = {}
@@ -265,7 +266,7 @@ def predict_split(
             physics = batch["physics"].to(device, non_blocking=True)
             temperature = batch["temperature"].to(device, non_blocking=True)
             ambient = batch["ambient_K"].to(device, non_blocking=True).float()
-            model_input = build_model_input(x, physics, stats)
+            model_input = build_model_input(x, physics, stats, physics_input_mode=physics_input_mode)
             metadata_input = build_metadata_input(batch.get("metadata_vector"), stats)
             if metadata_input is not None:
                 metadata_input = metadata_input.to(device, non_blocking=True)

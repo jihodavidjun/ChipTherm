@@ -51,14 +51,18 @@ def main() -> int:
     architecture = str(checkpoint["model_config"].get("architecture", "miniunet"))
     decomposed = architecture in {"miniunet_refine_decomposed", "miniunet_refine_conditioned_decomposed"}
     conditioned = architecture in {"miniunet_refine_conditioned", "miniunet_refine_conditioned_decomposed"}
+    physics_input_mode = str(checkpoint["model_config"].get("physics_input_mode", "v1"))
+    if physics_input_mode not in {"v1", "none"}:
+        raise SystemExit(f"unsupported checkpoint physics_input_mode: {physics_input_mode}")
 
     dataset = ChipThermDataset(args.index, target="residual", return_metadata=True)
-    actual_input_channels = int(dataset[0]["x"].shape[0]) + 1
+    dataset_input_channels = int(dataset[0]["x"].shape[0])
+    actual_input_channels = dataset_input_channels + (1 if physics_input_mode == "v1" else 0)
     expected_input_channels = int(checkpoint["model_config"].get("input_channels", actual_input_channels))
     if actual_input_channels != expected_input_channels:
         raise SystemExit(
             f"checkpoint expects {expected_input_channels} model input channels, "
-            f"but dataset provides {actual_input_channels} channels including physics"
+            f"but dataset provides {actual_input_channels} channels with physics_input_mode={physics_input_mode}"
         )
     loader = DataLoader(
         dataset,
@@ -78,6 +82,7 @@ def main() -> int:
         out_dir=out_dir,
         decomposed=decomposed,
         conditioned=conditioned,
+        physics_input_mode=physics_input_mode,
     )
     cnn_runtime_per_sample = runtime_s / max(metrics["num_samples"], 1)
     cnn_side_speedup = hotspot_runtime_s / cnn_runtime_per_sample if hotspot_runtime_s and cnn_runtime_per_sample else None
@@ -88,7 +93,19 @@ def main() -> int:
         "residual unnormalization, and final temperature reconstruction. Disk I/O is excluded."
     )
     if args.measure_end_to_end:
-        if physics_runtime_s is None:
+        if physics_input_mode == "none":
+            physics_runtime_s = 0.0
+            end_to_end_runtime_per_sample = cnn_runtime_per_sample
+            end_to_end_speedup = (
+                hotspot_runtime_s / end_to_end_runtime_per_sample
+                if hotspot_runtime_s and end_to_end_runtime_per_sample
+                else None
+            )
+            timing_note += (
+                " End-to-end timing equals CNN-side timing because checkpoint physics_input_mode=none; "
+                "physics_v1 is loaded only for reference metrics."
+            )
+        elif physics_runtime_s is None:
             timing_note += " End-to-end timing requested, but physics_runtime_s metadata was unavailable."
         else:
             end_to_end_runtime_per_sample = physics_runtime_s + cnn_runtime_per_sample
@@ -117,6 +134,7 @@ def main() -> int:
         "index": str(args.index.resolve()),
         "model": {
             "config": checkpoint["model_config"],
+            "physics_input_mode": physics_input_mode,
             "parameter_count": count_parameters(model),
         },
         "num_samples": metrics["num_samples"],
@@ -147,6 +165,7 @@ def main() -> int:
 
     print("Residual CNN evaluation complete")
     print(f"Samples: {metrics['num_samples']}")
+    print(f"Physics input mode: {physics_input_mode}")
     print(f"CNN-side inference runtime/sample: {cnn_runtime_per_sample:.6f} s")
     if args.measure_end_to_end:
         if physics_runtime_s is None:
@@ -182,6 +201,7 @@ def evaluate(
     out_dir: Path,
     decomposed: bool = False,
     conditioned: bool = False,
+    physics_input_mode: str = "v1",
 ) -> tuple[dict[str, Any], dict[str, dict[str, dict[str, float]]], float, float | None, float | None]:
     residual_acc = MetricAccumulator()
     final_acc = MetricAccumulator()
@@ -216,7 +236,7 @@ def evaluate(
 
         synchronize(device)
         start = time.perf_counter()
-        model_input = build_model_input(x, physics, stats)
+        model_input = build_model_input(x, physics, stats, physics_input_mode=physics_input_mode)
         coarse_norm = None
         if decomposed:
             outputs = model(model_input, metadata_input) if conditioned else model(model_input)

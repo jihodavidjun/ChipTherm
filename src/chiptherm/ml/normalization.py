@@ -152,12 +152,22 @@ def context_channel_names(dataset: Dataset[Any], indices: tuple[int, ...]) -> tu
     return tuple(f"channel_{index}" for index in indices)
 
 
-def build_model_input(x: torch.Tensor, physics: torch.Tensor, stats: NormalizationStats) -> torch.Tensor:
+def build_model_input(
+    x: torch.Tensor,
+    physics: torch.Tensor,
+    stats: NormalizationStats,
+    *,
+    physics_input_mode: str = "v1",
+) -> torch.Tensor:
+    if physics_input_mode not in {"v1", "none"}:
+        raise ValueError(f"unsupported physics_input_mode: {physics_input_mode}")
     x_norm = x.float().clone()
     x_norm[:, 0] = normalize_tensor(x_norm[:, 0], stats.power_density_mean, stats.power_density_std)
     for channel, mean, std in zip(stats.context_channel_indices, stats.context_channel_means, stats.context_channel_stds):
         if int(channel) < x_norm.shape[1]:
             x_norm[:, int(channel)] = normalize_tensor(x_norm[:, int(channel)], float(mean), float(std))
+    if physics_input_mode == "none":
+        return x_norm
     physics_norm = normalize_tensor(physics.float(), stats.physics_mean, stats.physics_std).unsqueeze(1)
     return torch.cat([x_norm, physics_norm], dim=1)
 

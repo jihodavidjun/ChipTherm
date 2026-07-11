@@ -62,6 +62,12 @@ def main() -> int:
     parser.add_argument("--metadata-conditioning", action="store_true")
     parser.add_argument("--metadata-hidden-dim", default=64, type=int)
     parser.add_argument("--metadata-embedding-dim", default=64, type=int)
+    parser.add_argument(
+        "--physics-input",
+        default="v1",
+        choices=["v1", "none"],
+        help="Spatial physics input mode. 'v1' appends normalized physics_v1; 'none' uses normalized X only.",
+    )
     parser.add_argument("--lambda-final", default=1.0, type=float)
     parser.add_argument("--lambda-mean", default=0.1, type=float)
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
@@ -100,7 +106,7 @@ def main() -> int:
     train_dataset = ChipThermDataset(args.train_index, target="residual", return_metadata=True)
     val_dataset = ChipThermDataset(args.val_index, target="residual", return_metadata=True)
     dataset_input_channels = int(train_dataset[0]["x"].shape[0])
-    model_input_channels = dataset_input_channels + 1
+    model_input_channels = dataset_input_channels + (1 if args.physics_input == "v1" else 0)
     train_loader = make_loader(train_dataset, args.batch_size, shuffle=True, num_workers=args.num_workers, device=device)
     train_eval_loader = make_loader(train_dataset, args.batch_size, shuffle=False, num_workers=args.num_workers, device=device)
     val_loader = make_loader(val_dataset, args.batch_size, shuffle=False, num_workers=args.num_workers, device=device)
@@ -119,6 +125,8 @@ def main() -> int:
         "name": "MiniUNetWithRefinement" if args.model_architecture == "miniunet_refine" else "MiniUNet",
         "input_channels": model_input_channels,
         "dataset_input_channels": dataset_input_channels,
+        "physics_input_mode": args.physics_input,
+        "model_input_channels": model_input_channels,
         "output_channels": 1,
         "base_channels": args.base_channels,
         "depth": args.depth,
@@ -154,6 +162,9 @@ def main() -> int:
         "base_channels": args.base_channels,
         "depth": args.depth,
         "model_architecture": args.model_architecture,
+        "physics_input_mode": args.physics_input,
+        "model_input_channels": model_input_channels,
+        "dataset_input_channels": dataset_input_channels,
         "refine_channels": args.refine_channels,
         "refine_blocks": args.refine_blocks,
         "device": str(device),
@@ -179,6 +190,13 @@ def main() -> int:
     }
     model = build_model(model_config).to(device)
     config["model"] = model.config() if hasattr(model, "config") else model_config
+    config["model"].update(
+        {
+            "physics_input_mode": args.physics_input,
+            "model_input_channels": model_input_channels,
+            "dataset_input_channels": dataset_input_channels,
+        }
+    )
     (out_dir / "config.json").write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     save_normalization_stats(stats, out_dir / "normalization.json")
 
@@ -188,6 +206,7 @@ def main() -> int:
     temp_criterion = nn.L1Loss()
 
     print(f"Model architecture: {args.model_architecture}")
+    print(f"Physics input mode: {args.physics_input}")
     print(f"Model input channels: {model_input_channels}")
     if args.model_architecture == "miniunet_refine":
         print(f"Refinement channels: {list(refinement_channel_indices)}")
@@ -216,6 +235,7 @@ def main() -> int:
             conditioned=is_conditioned_arch,
             lambda_final=args.lambda_final,
             lambda_mean=args.lambda_mean,
+            physics_input_mode=args.physics_input,
         )
         val_metrics, val_by_case = evaluate_model(
             model,
@@ -227,6 +247,7 @@ def main() -> int:
             conditioned=is_conditioned_arch,
             lambda_final=args.lambda_final,
             lambda_mean=args.lambda_mean,
+            physics_input_mode=args.physics_input,
         )
         train_final_mae_K: float | None = None
         if should_compute_train_mae(epoch, args.epochs, args.train_mae_every):
@@ -240,6 +261,7 @@ def main() -> int:
                 conditioned=is_conditioned_arch,
                 lambda_final=args.lambda_final,
                 lambda_mean=args.lambda_mean,
+                physics_input_mode=args.physics_input,
             )
             train_final_mae_K = float(train_metrics["final_temperature"]["mae_K"])
         epoch_runtime_s = time.perf_counter() - epoch_start
@@ -356,6 +378,7 @@ def train_one_epoch(
     conditioned: bool,
     lambda_final: float,
     lambda_mean: float,
+    physics_input_mode: str,
 ) -> dict[str, float]:
     model.train()
     total_loss = 0.0
@@ -374,7 +397,7 @@ def train_one_epoch(
         metadata_input = build_metadata_input(batch.get("metadata_vector"), stats)
         if metadata_input is not None:
             metadata_input = metadata_input.to(device, non_blocking=True)
-        model_input = build_model_input(x, physics, stats)
+        model_input = build_model_input(x, physics, stats, physics_input_mode=physics_input_mode)
 
         optimizer.zero_grad(set_to_none=True)
         if decomposed:
@@ -457,6 +480,7 @@ def evaluate_model(
     conditioned: bool = False,
     lambda_final: float = 1.0,
     lambda_mean: float = 0.1,
+    physics_input_mode: str = "v1",
 ) -> tuple[dict[str, Any], dict[str, dict[str, float]]]:
     model.eval()
     residual_acc = MetricAccumulator()
@@ -477,7 +501,7 @@ def evaluate_model(
         metadata_input = build_metadata_input(batch.get("metadata_vector"), stats)
         if metadata_input is not None:
             metadata_input = metadata_input.to(device, non_blocking=True)
-        model_input = build_model_input(x, physics, stats)
+        model_input = build_model_input(x, physics, stats, physics_input_mode=physics_input_mode)
         if decomposed:
             outputs = model(model_input, metadata_input) if conditioned else model(model_input)
             pred_temperature = reconstruct_decomposed_temperature(outputs, ambient)
@@ -660,7 +684,7 @@ def save_checkpoint(
             "best": best,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
-            "model_config": model.config(),
+            "model_config": config.get("model", model.config()),
             "training_config": config,
             "normalization": stats.to_dict(),
             "metrics": metrics,
