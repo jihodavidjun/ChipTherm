@@ -28,7 +28,7 @@ from chiptherm.ml.physics_candidates import (  # noqa: E402
 
 
 SPLITS = ("train", "val", "test")
-CANDIDATES = ("screened_poisson", "hybrid_local_global", "compact_rc")
+CANDIDATES = ("screened_poisson", "screened_poisson_calibrated", "hybrid_local_global", "compact_rc")
 
 
 def main() -> int:
@@ -40,6 +40,14 @@ def main() -> int:
     parser.add_argument("--k-spread-W-per-K", default=0.30, type=float)
     parser.add_argument("--g-sink-W-per-mm2K", default=0.004, type=float)
     parser.add_argument("--global-R-eff-K-per-W", default=0.0, type=float)
+    parser.add_argument("--source-scale", default=1.0, type=float)
+    parser.add_argument("--ambient-offset-K", default=0.0, type=float)
+    parser.add_argument("--calibration-file", default=None, type=Path)
+    parser.add_argument(
+        "--allow-periodic-fft-fallback",
+        action="store_true",
+        help="Allow FFT periodic fallback if SciPy DCT is unavailable. This changes boundary conditions.",
+    )
     parser.add_argument("--local-kernel-length-mm", default=1.5, type=float)
     parser.add_argument("--local-kernel-epsilon-mm", default=0.75, type=float)
     parser.add_argument("--local-kernel-gain-K-mm-per-W", default=0.08, type=float)
@@ -60,7 +68,10 @@ def main() -> int:
             ambient_K=args.ambient_K,
             k_spread_W_per_K=args.k_spread_W_per_K,
             g_sink_W_per_mm2K=args.g_sink_W_per_mm2K,
+            source_scale=args.source_scale,
+            ambient_offset_K=args.ambient_offset_K,
             global_R_eff_K_per_W=args.global_R_eff_K_per_W,
+            allow_periodic_fft_fallback=args.allow_periodic_fft_fallback,
             local_kernel_length_mm=args.local_kernel_length_mm,
             local_kernel_epsilon_mm=args.local_kernel_epsilon_mm,
             local_kernel_gain_K_mm_per_W=args.local_kernel_gain_K_mm_per_W,
@@ -68,6 +79,8 @@ def main() -> int:
             rc_iterations=args.rc_iterations,
             rc_relaxation=args.rc_relaxation,
         )
+        if args.calibration_file is not None:
+            config = load_calibrated_config(config, args.calibration_file.expanduser().resolve(), candidate)
         generate_candidate(
             source_root=source_root,
             out_dir=out_root / candidate,
@@ -145,6 +158,33 @@ def generate_candidate(
     print(f"Samples: {len(all_records)}")
     print(f"Runtime/sample: {manifest['generation_runtime_per_sample_s']:.6f} s")
     print(f"Output: {out_dir}")
+
+
+def load_calibrated_config(
+    base_config: PhysicsCandidateConfig,
+    calibration_file: Path,
+    candidate: str,
+) -> PhysicsCandidateConfig:
+    if not calibration_file.exists():
+        raise SystemExit(f"calibration file not found: {calibration_file}")
+    payload = json.loads(calibration_file.read_text(encoding="utf-8"))
+    params = payload.get("final_parameters") or payload.get("parameters") or {}
+    if not params:
+        raise SystemExit(f"calibration file has no final_parameters: {calibration_file}")
+    name = "screened_poisson_calibrated" if candidate == "screened_poisson_calibrated" else candidate
+    return PhysicsCandidateConfig(
+        **{
+            **base_config.to_dict(),
+            "name": name,
+            "k_spread_W_per_K": float(params.get("k_eff_W_per_K", params.get("k_spread_W_per_K", base_config.k_spread_W_per_K))),
+            "g_sink_W_per_mm2K": float(
+                params.get("g_eff_W_per_mm2K", params.get("g_sink_W_per_mm2K", base_config.g_sink_W_per_mm2K))
+            ),
+            "source_scale": float(params.get("alpha_source", params.get("source_scale", base_config.source_scale))),
+            "ambient_offset_K": float(params.get("ambient_offset_K", base_config.ambient_offset_K)),
+            "global_R_eff_K_per_W": float(params.get("global_R_eff_K_per_W", base_config.global_R_eff_K_per_W)),
+        }
+    )
 
 
 def generate_one_sample(

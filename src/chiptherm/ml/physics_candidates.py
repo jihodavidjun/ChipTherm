@@ -13,7 +13,7 @@ except Exception:  # pragma: no cover - used only when SciPy is unavailable.
     _scipy_idctn = None
 
 
-CandidateName = Literal["screened_poisson", "hybrid_local_global", "compact_rc"]
+CandidateName = Literal["screened_poisson", "screened_poisson_calibrated", "hybrid_local_global", "compact_rc"]
 EPSILON = 1.0e-12
 
 
@@ -31,7 +31,10 @@ class PhysicsCandidateConfig:
     cell_size_y_channel: int = 12
     k_spread_W_per_K: float = 0.30
     g_sink_W_per_mm2K: float = 0.004
+    source_scale: float = 1.0
+    ambient_offset_K: float = 0.0
     global_R_eff_K_per_W: float = 0.0
+    allow_periodic_fft_fallback: bool = False
     local_kernel_length_mm: float = 1.5
     local_kernel_epsilon_mm: float = 0.75
     local_kernel_gain_K_mm_per_W: float = 0.08
@@ -89,7 +92,9 @@ def predict_candidate_temperature(
     metadata = extract_package_grid_metadata(x, config, row_total_power_W=row_total_power_W)
     q_W_per_mm2 = power_density_source(x, config)
 
-    if config.name == "screened_poisson":
+    q_W_per_mm2 = q_W_per_mm2 * float(config.source_scale)
+
+    if config.name in {"screened_poisson", "screened_poisson_calibrated"}:
         rise = screened_poisson_rise(q_W_per_mm2, metadata, config)
     elif config.name == "hybrid_local_global":
         rise = screened_poisson_rise(q_W_per_mm2, metadata, config)
@@ -103,7 +108,7 @@ def predict_candidate_temperature(
 
     if config.global_R_eff_K_per_W:
         rise = rise + float(config.global_R_eff_K_per_W) * float(metadata.total_power_W)
-    temperature = (float(config.ambient_K) + rise).astype(np.float32, copy=False)
+    temperature = (float(config.ambient_K) + float(config.ambient_offset_K) + rise).astype(np.float32, copy=False)
     return temperature, metadata
 
 
@@ -168,13 +173,21 @@ def screened_poisson_rise(
     config: PhysicsCandidateConfig,
 ) -> np.ndarray:
     if _scipy_dctn is None or _scipy_idctn is None:
+        if not config.allow_periodic_fft_fallback:
+            raise RuntimeError(
+                "screened_poisson requires scipy.fft DCT for Neumann boundary conditions; "
+                "periodic FFT fallback is disabled because it changes the physics. "
+                "Set allow_periodic_fft_fallback=True only for explicit diagnostics."
+            )
         return screened_poisson_periodic_fft_rise(q_W_per_mm2, metadata, config)
     q_hat = _scipy_dctn(q_W_per_mm2, type=2, norm="ortho")
     rows, cols = q_W_per_mm2.shape
     mode_y = np.arange(rows, dtype=np.float64)
     mode_x = np.arange(cols, dtype=np.float64)
-    lambda_y = (np.pi * mode_y / metadata.package_height_mm) ** 2
-    lambda_x = (np.pi * mode_x / metadata.package_width_mm) ** 2
+    dy = max(float(metadata.cell_size_y_mm), EPSILON)
+    dx = max(float(metadata.cell_size_x_mm), EPSILON)
+    lambda_y = 4.0 * np.sin(np.pi * mode_y / (2.0 * rows)) ** 2 / (dy * dy)
+    lambda_x = 4.0 * np.sin(np.pi * mode_x / (2.0 * cols)) ** 2 / (dx * dx)
     denom = float(config.g_sink_W_per_mm2K) + float(config.k_spread_W_per_K) * (
         lambda_y[:, None] + lambda_x[None, :]
     )
