@@ -65,9 +65,12 @@ def main() -> int:
     parser.add_argument(
         "--physics-input",
         default="v1",
-        choices=["v1", "none"],
-        help="Spatial physics input mode. 'v1' appends normalized physics_v1; 'none' uses normalized X only.",
+        choices=["v1", "none", "gated_v1"],
+        help="Spatial physics input mode. 'v1' appends normalized physics_v1; 'none' uses normalized X only; 'gated_v1' metadata-gates normalized physics_v1.",
     )
+    parser.add_argument("--physics-gate-hidden-dim", default=32, type=int)
+    parser.add_argument("--physics-gate-init", default=0.9, type=float)
+    parser.add_argument("--physics-gate-regularization", default=0.0, type=float)
     parser.add_argument("--lambda-final", default=1.0, type=float)
     parser.add_argument("--lambda-mean", default=0.1, type=float)
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
@@ -92,8 +95,14 @@ def main() -> int:
         raise SystemExit("--hotspot-top-frac must be in the interval (0, 1]")
     if args.train_mae_every < 0:
         raise SystemExit("--train-mae-every must be non-negative")
+    if not 0.0 < args.physics_gate_init < 1.0:
+        raise SystemExit("--physics-gate-init must be in the interval (0, 1)")
+    if args.physics_gate_regularization < 0.0:
+        raise SystemExit("--physics-gate-regularization must be non-negative")
     is_conditioned_arch = args.model_architecture in {"miniunet_refine_conditioned", "miniunet_refine_conditioned_decomposed"}
     is_decomposed_arch = args.model_architecture in {"miniunet_refine_decomposed", "miniunet_refine_conditioned_decomposed"}
+    if args.physics_input == "gated_v1" and not is_conditioned_arch:
+        raise SystemExit("--physics-input gated_v1 requires a metadata-conditioned architecture")
     if args.metadata_conditioning and not is_conditioned_arch:
         print("--metadata-conditioning requested; using architecture-selected behavior only.")
 
@@ -106,7 +115,7 @@ def main() -> int:
     train_dataset = ChipThermDataset(args.train_index, target="residual", return_metadata=True)
     val_dataset = ChipThermDataset(args.val_index, target="residual", return_metadata=True)
     dataset_input_channels = int(train_dataset[0]["x"].shape[0])
-    model_input_channels = dataset_input_channels + (1 if args.physics_input == "v1" else 0)
+    model_input_channels = dataset_input_channels + (1 if args.physics_input in {"v1", "gated_v1"} else 0)
     train_loader = make_loader(train_dataset, args.batch_size, shuffle=True, num_workers=args.num_workers, device=device)
     train_eval_loader = make_loader(train_dataset, args.batch_size, shuffle=False, num_workers=args.num_workers, device=device)
     val_loader = make_loader(val_dataset, args.batch_size, shuffle=False, num_workers=args.num_workers, device=device)
@@ -127,6 +136,8 @@ def main() -> int:
         "dataset_input_channels": dataset_input_channels,
         "physics_input_mode": args.physics_input,
         "model_input_channels": model_input_channels,
+        "physics_gate_hidden_dim": args.physics_gate_hidden_dim,
+        "physics_gate_init": args.physics_gate_init,
         "output_channels": 1,
         "base_channels": args.base_channels,
         "depth": args.depth,
@@ -165,6 +176,9 @@ def main() -> int:
         "physics_input_mode": args.physics_input,
         "model_input_channels": model_input_channels,
         "dataset_input_channels": dataset_input_channels,
+        "physics_gate_hidden_dim": args.physics_gate_hidden_dim,
+        "physics_gate_init": args.physics_gate_init,
+        "physics_gate_regularization": args.physics_gate_regularization,
         "refine_channels": args.refine_channels,
         "refine_blocks": args.refine_blocks,
         "device": str(device),
@@ -195,6 +209,8 @@ def main() -> int:
             "physics_input_mode": args.physics_input,
             "model_input_channels": model_input_channels,
             "dataset_input_channels": dataset_input_channels,
+            "physics_gate_hidden_dim": args.physics_gate_hidden_dim,
+            "physics_gate_init": args.physics_gate_init,
         }
     )
     (out_dir / "config.json").write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -236,6 +252,8 @@ def main() -> int:
             lambda_final=args.lambda_final,
             lambda_mean=args.lambda_mean,
             physics_input_mode=args.physics_input,
+            physics_gate_regularization=args.physics_gate_regularization,
+            physics_gate_init=args.physics_gate_init,
         )
         val_metrics, val_by_case = evaluate_model(
             model,
@@ -287,6 +305,7 @@ def main() -> int:
             f"epoch {epoch:03d} train_loss={train_losses['total_loss']:.6f} lr={current_lr:.3e} "
             f"train_final_mae={format_optional_mae(train_final_mae_K)} "
             f"val_mae={val_final_mae:.3f}K val_rmse={val_metrics['final_temperature']['rmse_K']:.3f}K "
+            f"gate={format_gate_summary(val_metrics.get('physics_gate'))} "
             f"{'best' if is_best else ''}"
         )
 
@@ -379,6 +398,8 @@ def train_one_epoch(
     lambda_final: float,
     lambda_mean: float,
     physics_input_mode: str,
+    physics_gate_regularization: float,
+    physics_gate_init: float,
 ) -> dict[str, float]:
     model.train()
     total_loss = 0.0
@@ -387,6 +408,8 @@ def train_one_epoch(
     temp_loss_K_total = 0.0
     hotspot_loss_scaled_total = 0.0
     hotspot_loss_K_total = 0.0
+    gate_regularization_total = 0.0
+    gate_acc = ScalarSummaryAccumulator()
     total_samples = 0
     for batch in loader:
         x = batch["x"].to(device, non_blocking=True)
@@ -398,6 +421,7 @@ def train_one_epoch(
         if metadata_input is not None:
             metadata_input = metadata_input.to(device, non_blocking=True)
         model_input = build_model_input(x, physics, stats, physics_input_mode=physics_input_mode)
+        batch_size = int(x.shape[0])
 
         optimizer.zero_grad(set_to_none=True)
         if decomposed:
@@ -412,6 +436,13 @@ def train_one_epoch(
             hotspot_loss_K = pred_temperature.new_tensor(0.0)
             hotspot_loss_scaled = pred_temperature.new_tensor(0.0)
             loss = float(lambda_final) * final_loss + float(lambda_mean) * mean_loss
+            alpha = outputs.get("physics_gate_alpha")
+            if alpha is not None:
+                gate_acc.update(alpha)
+                if physics_gate_regularization > 0.0:
+                    gate_reg = torch.mean((alpha - float(physics_gate_init)) ** 2)
+                    loss = loss + float(physics_gate_regularization) * gate_reg
+                    gate_regularization_total += float(gate_reg.item()) * batch_size
         else:
             target = normalize_residual(residual, stats).unsqueeze(1)
             pred = model(model_input, metadata_input) if conditioned else model(model_input)
@@ -439,7 +470,6 @@ def train_one_epoch(
         loss.backward()
         optimizer.step()
 
-        batch_size = int(x.shape[0])
         total_loss += float(loss.item()) * batch_size
         residual_loss_total += float(residual_loss.item()) * batch_size
         temp_loss_scaled_total += float(temp_loss_scaled.item()) * batch_size
@@ -455,6 +485,8 @@ def train_one_epoch(
         "temp_loss_K": temp_loss_K_total / denominator,
         "hotspot_loss_scaled": hotspot_loss_scaled_total / denominator,
         "hotspot_loss_K": hotspot_loss_K_total / denominator,
+        "gate_regularization": gate_regularization_total / denominator,
+        **gate_acc.prefixed("gate_alpha"),
     }
 
 
@@ -466,6 +498,12 @@ def format_optional_mae(value: float | None) -> str:
     if value is None:
         return "skip"
     return f"{value:.3f}K"
+
+
+def format_gate_summary(summary: dict[str, float] | None) -> str:
+    if not summary:
+        return "n/a"
+    return f"{summary['mean']:.3f}/{summary['std']:.3f}"
 
 
 @torch.no_grad()
@@ -488,6 +526,7 @@ def evaluate_model(
     centered_acc = MetricAccumulator()
     mean_acc = ScalarMetricAccumulator()
     mean_bias_removed_acc = MetricAccumulator()
+    gate_acc = ScalarSummaryAccumulator()
     by_case: dict[str, dict[str, MetricAccumulator]] = defaultdict(lambda: {"residual": MetricAccumulator(), "final_temperature": MetricAccumulator()})
     total_loss = 0.0
     total_samples = 0
@@ -515,6 +554,9 @@ def evaluate_model(
             mean_acc.update(outputs["mean_rise"], mean_target)
             centered_acc.update(centered_pred, centered_target)
             mean_bias_removed_acc.update(centered_pred, centered_target)
+            alpha = outputs.get("physics_gate_alpha")
+            if alpha is not None:
+                gate_acc.update(alpha)
         else:
             target_norm = normalize_residual(residual, stats).unsqueeze(1)
             pred_norm = model(model_input, metadata_input) if conditioned else model(model_input)
@@ -541,6 +583,9 @@ def evaluate_model(
         metrics["mean_rise"] = mean_acc.compute()
         metrics["centered_field"] = centered_acc.compute()
         metrics["mean_bias_removed"] = mean_bias_removed_acc.compute()
+    gate_summary = gate_acc.compute()
+    if gate_summary:
+        metrics["physics_gate"] = gate_summary
     case_metrics = {
         case_id: {
             "residual": accs["residual"].compute(),
@@ -640,6 +685,29 @@ class ScalarMetricAccumulator:
         }
 
 
+class ScalarSummaryAccumulator:
+    def __init__(self) -> None:
+        self.values: list[float] = []
+
+    def update(self, value: torch.Tensor) -> None:
+        data = value.detach().float().reshape(-1).cpu().tolist()
+        self.values.extend(float(item) for item in data)
+
+    def compute(self) -> dict[str, float]:
+        if not self.values:
+            return {}
+        array = np.asarray(self.values, dtype=np.float64)
+        return {
+            "mean": float(array.mean()),
+            "std": float(array.std()),
+            "min": float(array.min()),
+            "max": float(array.max()),
+        }
+
+    def prefixed(self, prefix: str) -> dict[str, float]:
+        return {f"{prefix}_{key}": value for key, value in self.compute().items()}
+
+
 def metadata_values(metadata: dict[str, Any], key: str, batch_size: int) -> list[Any]:
     value = metadata[key]
     if isinstance(value, (list, tuple)):
@@ -706,6 +774,11 @@ def init_train_log(path: Path) -> None:
                 "train_temp_loss_K",
                 "train_hotspot_loss_scaled",
                 "train_hotspot_loss_K",
+                "train_gate_regularization",
+                "train_gate_alpha_mean",
+                "train_gate_alpha_std",
+                "train_gate_alpha_min",
+                "train_gate_alpha_max",
                 "train_final_temperature_mae_K",
                 "val_loss",
                 "val_residual_mae_K",
@@ -714,6 +787,10 @@ def init_train_log(path: Path) -> None:
                 "val_final_rmse_K",
                 "val_hotspot_temp_error_K",
                 "val_hotspot_location_error_cells",
+                "val_gate_alpha_mean",
+                "val_gate_alpha_std",
+                "val_gate_alpha_min",
+                "val_gate_alpha_max",
                 "epoch_runtime_s",
                 "is_best",
             ]
@@ -742,6 +819,11 @@ def append_train_log(
                 train_losses["temp_loss_K"],
                 train_losses["hotspot_loss_scaled"],
                 train_losses["hotspot_loss_K"],
+                train_losses["gate_regularization"],
+                train_losses.get("gate_alpha_mean", ""),
+                train_losses.get("gate_alpha_std", ""),
+                train_losses.get("gate_alpha_min", ""),
+                train_losses.get("gate_alpha_max", ""),
                 "" if train_final_mae_K is None else train_final_mae_K,
                 val_metrics["normalized_residual_loss"],
                 val_metrics["residual"]["mae_K"],
@@ -750,6 +832,10 @@ def append_train_log(
                 val_metrics["final_temperature"]["rmse_K"],
                 val_metrics["final_temperature"]["hotspot_temp_error_K"],
                 val_metrics["final_temperature"]["hotspot_location_error_cells"],
+                val_metrics.get("physics_gate", {}).get("mean", ""),
+                val_metrics.get("physics_gate", {}).get("std", ""),
+                val_metrics.get("physics_gate", {}).get("min", ""),
+                val_metrics.get("physics_gate", {}).get("max", ""),
                 epoch_runtime_s,
                 int(is_best),
             ]

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -249,6 +251,30 @@ class FiLM(nn.Module):
         return feature * gamma[:, :, None, None] + beta[:, :, None, None]
 
 
+class PhysicsReliabilityGate(nn.Module):
+    def __init__(self, embedding_dim: int, hidden_dim: int = 32, init_alpha: float = 0.9) -> None:
+        super().__init__()
+        if hidden_dim <= 0:
+            raise ValueError("physics gate hidden_dim must be positive")
+        if not 0.0 < float(init_alpha) < 1.0:
+            raise ValueError("physics gate init_alpha must be in the interval (0, 1)")
+        self.embedding_dim = embedding_dim
+        self.hidden_dim = hidden_dim
+        self.init_alpha = float(init_alpha)
+        self.net = nn.Sequential(
+            nn.Linear(embedding_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+        final = self.net[-1]
+        if isinstance(final, nn.Linear):
+            nn.init.zeros_(final.weight)
+            nn.init.constant_(final.bias, math.log(self.init_alpha / (1.0 - self.init_alpha)))
+
+    def forward(self, embedding: torch.Tensor) -> torch.Tensor:
+        return torch.sigmoid(self.net(embedding)).view(-1, 1, 1, 1)
+
+
 class FiLMMiniUNet(nn.Module):
     def __init__(
         self,
@@ -415,6 +441,9 @@ class DecomposedMiniUNetWithRefinement(nn.Module):
         metadata_hidden_dim: int = 64,
         metadata_embedding_dim: int = 64,
         conditioned: bool = False,
+        physics_input_mode: str = "v1",
+        physics_gate_hidden_dim: int = 32,
+        physics_gate_init: float = 0.9,
     ) -> None:
         super().__init__()
         indices = tuple(int(index) for index in refinement_channel_indices)
@@ -433,8 +462,20 @@ class DecomposedMiniUNetWithRefinement(nn.Module):
         self.metadata_dim = int(metadata_dim)
         self.metadata_hidden_dim = metadata_hidden_dim
         self.metadata_embedding_dim = metadata_embedding_dim
+        self.physics_input_mode = str(physics_input_mode)
+        if self.physics_input_mode not in {"v1", "none", "gated_v1"}:
+            raise ValueError(f"unsupported physics_input_mode: {self.physics_input_mode}")
+        if self.physics_input_mode == "gated_v1" and not self.conditioned:
+            raise ValueError("gated_v1 requires a metadata-conditioned decomposed model")
+        self.physics_gate_hidden_dim = int(physics_gate_hidden_dim)
+        self.physics_gate_init = float(physics_gate_init)
         if self.conditioned:
             self.metadata_encoder = MetadataEncoder(self.metadata_dim, metadata_hidden_dim, metadata_embedding_dim)
+            self.physics_gate = (
+                PhysicsReliabilityGate(metadata_embedding_dim, self.physics_gate_hidden_dim, self.physics_gate_init)
+                if self.physics_input_mode == "gated_v1"
+                else None
+            )
             self.coarse_model = FiLMMiniUNet(input_channels, output_channels, base_channels, depth, metadata_embedding_dim)
             self.refinement_model = ConditionedFullResolutionRefinementCNN(
                 len(indices) + output_channels,
@@ -445,6 +486,7 @@ class DecomposedMiniUNetWithRefinement(nn.Module):
             mean_input_dim = metadata_embedding_dim + input_channels
         else:
             self.metadata_encoder = None
+            self.physics_gate = None
             self.coarse_model = MiniUNet(input_channels, output_channels, base_channels, depth)
             self.refinement_model = FullResolutionRefinementCNN(
                 len(indices) + output_channels,
@@ -460,10 +502,16 @@ class DecomposedMiniUNetWithRefinement(nn.Module):
 
     def forward_components(self, x: torch.Tensor, metadata: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
         embedding = None
+        alpha = None
         if self.conditioned:
             if metadata is None:
                 raise ValueError("conditioned decomposed model requires metadata tensor")
             embedding = self.metadata_encoder(metadata)
+            if self.physics_gate is not None:
+                if x.shape[1] < 1:
+                    raise ValueError("gated_v1 requires a physics input channel")
+                alpha = self.physics_gate(embedding)
+                x = torch.cat([x[:, :-1], x[:, -1:] * alpha], dim=1)
         if isinstance(self.coarse_model, FiLMMiniUNet):
             coarse = self.coarse_model(x, embedding)
         else:
@@ -479,12 +527,15 @@ class DecomposedMiniUNetWithRefinement(nn.Module):
         pooled = x.mean(dim=(-2, -1))
         mean_input = torch.cat([embedding, pooled], dim=1) if embedding is not None else pooled
         mean_rise = self.mean_head(mean_input).squeeze(1)
-        return {
+        output = {
             "mean_rise": mean_rise,
             "centered_field": centered.squeeze(1),
             "coarse_centered_field": (coarse - coarse.mean(dim=(-2, -1), keepdim=True)).squeeze(1),
             "detail_field": detail.squeeze(1),
         }
+        if alpha is not None:
+            output["physics_gate_alpha"] = alpha.view(-1)
+        return output
 
     def forward(self, x: torch.Tensor, metadata: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
         return self.forward_components(x, metadata)
@@ -504,6 +555,10 @@ class DecomposedMiniUNetWithRefinement(nn.Module):
             "metadata_hidden_dim": self.metadata_hidden_dim,
             "metadata_embedding_dim": self.metadata_embedding_dim,
             "conditioned": self.conditioned,
+            "physics_input_mode": self.physics_input_mode,
+            "physics_gate_hidden_dim": self.physics_gate_hidden_dim,
+            "physics_gate_init": self.physics_gate_init,
+            "physics_gate_parameter_count": count_parameters(self.physics_gate) if self.physics_gate is not None else 0,
             "metadata_parameters": count_parameters(self.metadata_encoder) if self.metadata_encoder is not None else 0,
             "total_parameters": count_parameters(self),
         }
@@ -557,6 +612,9 @@ def build_model(config: dict[str, object]) -> nn.Module:
             metadata_hidden_dim=int(config.get("metadata_hidden_dim", 64)),
             metadata_embedding_dim=int(config.get("metadata_embedding_dim", 64)),
             conditioned=architecture == "miniunet_refine_conditioned_decomposed",
+            physics_input_mode=str(config.get("physics_input_mode", "v1")),
+            physics_gate_hidden_dim=int(config.get("physics_gate_hidden_dim", 32)),
+            physics_gate_init=float(config.get("physics_gate_init", 0.9)),
         )
     raise ValueError(f"unsupported model architecture: {architecture}")
 

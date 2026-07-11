@@ -159,7 +159,7 @@ def build_model_input(
     *,
     physics_input_mode: str = "v1",
 ) -> torch.Tensor:
-    if physics_input_mode not in {"v1", "none"}:
+    if physics_input_mode not in {"v1", "none", "gated_v1"}:
         raise ValueError(f"unsupported physics_input_mode: {physics_input_mode}")
     x_norm = x.float().clone()
     x_norm[:, 0] = normalize_tensor(x_norm[:, 0], stats.power_density_mean, stats.power_density_std)

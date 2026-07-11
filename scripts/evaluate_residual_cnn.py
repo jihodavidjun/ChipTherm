@@ -52,12 +52,12 @@ def main() -> int:
     decomposed = architecture in {"miniunet_refine_decomposed", "miniunet_refine_conditioned_decomposed"}
     conditioned = architecture in {"miniunet_refine_conditioned", "miniunet_refine_conditioned_decomposed"}
     physics_input_mode = str(checkpoint["model_config"].get("physics_input_mode", "v1"))
-    if physics_input_mode not in {"v1", "none"}:
+    if physics_input_mode not in {"v1", "none", "gated_v1"}:
         raise SystemExit(f"unsupported checkpoint physics_input_mode: {physics_input_mode}")
 
     dataset = ChipThermDataset(args.index, target="residual", return_metadata=True)
     dataset_input_channels = int(dataset[0]["x"].shape[0])
-    actual_input_channels = dataset_input_channels + (1 if physics_input_mode == "v1" else 0)
+    actual_input_channels = dataset_input_channels + (1 if physics_input_mode in {"v1", "gated_v1"} else 0)
     expected_input_channels = int(checkpoint["model_config"].get("input_channels", actual_input_channels))
     if actual_input_channels != expected_input_channels:
         raise SystemExit(
@@ -72,7 +72,7 @@ def main() -> int:
         pin_memory=device.type == "cuda",
     )
 
-    metrics, by_case, runtime_s, hotspot_runtime_s, physics_runtime_s = evaluate(
+    metrics, by_case, runtime_s, hotspot_runtime_s, physics_runtime_s, gate_runtime_s = evaluate(
         model,
         loader,
         stats,
@@ -85,6 +85,7 @@ def main() -> int:
         physics_input_mode=physics_input_mode,
     )
     cnn_runtime_per_sample = runtime_s / max(metrics["num_samples"], 1)
+    gate_runtime_per_sample = gate_runtime_s / max(metrics["num_samples"], 1) if gate_runtime_s > 0.0 else None
     cnn_side_speedup = hotspot_runtime_s / cnn_runtime_per_sample if hotspot_runtime_s and cnn_runtime_per_sample else None
     end_to_end_runtime_per_sample = None
     end_to_end_speedup = None
@@ -146,6 +147,7 @@ def main() -> int:
             "hotspot_runtime_reference_s": hotspot_runtime_s,
             "cnn_runtime_per_sample_s": cnn_runtime_per_sample,
             "physics_runtime_per_sample_s": physics_runtime_s,
+            "gating_overhead_per_sample_s": gate_runtime_per_sample,
             "end_to_end_runtime_per_sample_s": end_to_end_runtime_per_sample,
             "cnn_side_speedup_vs_hotspot": cnn_side_speedup,
             "end_to_end_speedup_vs_hotspot": end_to_end_speedup,
@@ -158,6 +160,7 @@ def main() -> int:
         "mean_rise": metrics.get("mean_rise"),
         "centered_field": metrics.get("centered_field"),
         "mean_bias_removed": metrics.get("mean_bias_removed"),
+        "physics_gate": metrics.get("physics_gate"),
         "improvement_vs_physics_baseline": improvement,
     }
     (out_dir / "metrics.json").write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -182,6 +185,14 @@ def main() -> int:
     if metrics.get("coarse_final_temperature"):
         coarse = metrics["coarse_final_temperature"]
         print(f"Coarse-only MAE/RMSE: {coarse['mae_K']:.3f} / {coarse['rmse_K']:.3f} K")
+    if metrics.get("physics_gate"):
+        gate = metrics["physics_gate"]
+        print(
+            "Physics gate alpha mean/std/min/max: "
+            f"{gate['mean']:.3f} / {gate['std']:.3f} / {gate['min']:.3f} / {gate['max']:.3f}"
+        )
+        if gate_runtime_per_sample is not None:
+            print(f"Estimated gate overhead/sample: {gate_runtime_per_sample:.9f} s")
     print(f"CNN final MAE/RMSE: {final_mae:.3f} / {final_rmse:.3f} K")
     print(f"Parameter count: {count_parameters(model)}")
     print(f"Improvement: MAE {improvement['mae_percent']:.2f}% / RMSE {improvement['rmse_percent']:.2f}%")
@@ -202,7 +213,7 @@ def evaluate(
     decomposed: bool = False,
     conditioned: bool = False,
     physics_input_mode: str = "v1",
-) -> tuple[dict[str, Any], dict[str, dict[str, dict[str, float]]], float, float | None, float | None]:
+) -> tuple[dict[str, Any], dict[str, dict[str, dict[str, float]]], float, float | None, float | None, float]:
     residual_acc = MetricAccumulator()
     final_acc = MetricAccumulator()
     physics_acc = MetricAccumulator()
@@ -210,6 +221,8 @@ def evaluate(
     mean_acc = ScalarMetricAccumulator()
     centered_acc = MetricAccumulator()
     mean_bias_removed_acc = MetricAccumulator()
+    gate_acc = ScalarSummaryAccumulator()
+    gate_rows: list[dict[str, Any]] = []
     has_coarse_prediction = False
     by_case: dict[str, dict[str, MetricAccumulator]] = defaultdict(
         lambda: {
@@ -222,6 +235,7 @@ def evaluate(
     hotspot_runtimes: list[float] = []
     physics_runtimes: list[float] = []
     inference_runtime_s = 0.0
+    gate_runtime_s = 0.0
     num_samples = 0
 
     for batch in loader:
@@ -233,11 +247,18 @@ def evaluate(
         metadata_input = build_metadata_input(batch.get("metadata_vector"), stats)
         if metadata_input is not None:
             metadata_input = metadata_input.to(device, non_blocking=True)
+        if getattr(model, "physics_gate", None) is not None and getattr(model, "metadata_encoder", None) is not None and metadata_input is not None:
+            synchronize(device)
+            gate_start = time.perf_counter()
+            _gate_alpha = model.physics_gate(model.metadata_encoder(metadata_input))
+            synchronize(device)
+            gate_runtime_s += time.perf_counter() - gate_start
 
         synchronize(device)
         start = time.perf_counter()
         model_input = build_model_input(x, physics, stats, physics_input_mode=physics_input_mode)
         coarse_norm = None
+        alpha = None
         if decomposed:
             outputs = model(model_input, metadata_input) if conditioned else model(model_input)
             pred_temperature = reconstruct_decomposed_temperature(outputs, ambient)
@@ -248,6 +269,9 @@ def evaluate(
             mean_acc.update(outputs["mean_rise"], mean_target)
             centered_acc.update(centered_pred, centered_target)
             mean_bias_removed_acc.update(centered_pred, centered_target)
+            alpha = outputs.get("physics_gate_alpha")
+            if alpha is not None:
+                gate_acc.update(alpha)
             coarse_temperature = None
         elif hasattr(model, "forward_components"):
             if conditioned:
@@ -299,6 +323,22 @@ def evaluate(
 
         if save_predictions:
             save_batch_predictions(out_dir, sample_uids, case_ids, pred_temperature, pred_residual)
+        if decomposed and "alpha" in locals() and alpha is not None:
+            append_gate_rows(
+                gate_rows,
+                batch,
+                sample_uids,
+                case_ids,
+                alpha,
+                pred_temperature,
+                temperature,
+                physics,
+                centered_pred if "centered_pred" in locals() else None,
+                centered_target if "centered_target" in locals() else None,
+                outputs.get("mean_rise") if "outputs" in locals() else None,
+                mean_target if "mean_target" in locals() else None,
+            )
+        alpha = None
 
     metrics = {
         "num_samples": num_samples,
@@ -312,6 +352,11 @@ def evaluate(
         metrics["mean_rise"] = mean_acc.compute()
         metrics["centered_field"] = centered_acc.compute()
         metrics["mean_bias_removed"] = mean_bias_removed_acc.compute()
+    gate_summary = gate_acc.compute()
+    if gate_summary:
+        metrics["physics_gate"] = gate_summary
+        write_gate_values(out_dir / "gate_values.csv", gate_rows)
+        write_gate_summary(out_dir / "gate_summary.json", gate_rows, gate_summary)
     case_payload = {
         case_id: {
             name: accumulator.compute()
@@ -321,13 +366,158 @@ def evaluate(
     }
     hotspot_runtime_s = float(sum(hotspot_runtimes) / len(hotspot_runtimes)) if hotspot_runtimes else None
     physics_runtime_s = float(sum(physics_runtimes) / len(physics_runtimes)) if physics_runtimes else None
-    return metrics, case_payload, inference_runtime_s, hotspot_runtime_s, physics_runtime_s
+    return metrics, case_payload, inference_runtime_s, hotspot_runtime_s, physics_runtime_s, gate_runtime_s
 
 
 def reconstruct_decomposed_temperature(outputs: dict[str, torch.Tensor], ambient: torch.Tensor) -> torch.Tensor:
     centered = outputs["centered_field"]
     centered = centered - centered.mean(dim=(-2, -1), keepdim=True)
     return ambient[:, None, None] + outputs["mean_rise"][:, None, None] + centered
+
+
+def append_gate_rows(
+    rows: list[dict[str, Any]],
+    batch: dict[str, Any],
+    sample_uids: list[Any],
+    case_ids: list[Any],
+    alpha: torch.Tensor,
+    pred_temperature: torch.Tensor,
+    temperature: torch.Tensor,
+    physics: torch.Tensor,
+    centered_pred: torch.Tensor | None,
+    centered_target: torch.Tensor | None,
+    mean_rise: torch.Tensor | None,
+    mean_target: torch.Tensor | None,
+) -> None:
+    alpha_cpu = alpha.detach().float().reshape(-1).cpu()
+    pred_cpu = pred_temperature.detach().float().cpu()
+    temp_cpu = temperature.detach().float().cpu()
+    physics_cpu = physics.detach().float().cpu()
+    centered_pred_cpu = centered_pred.detach().float().cpu() if centered_pred is not None else None
+    centered_target_cpu = centered_target.detach().float().cpu() if centered_target is not None else None
+    mean_rise_cpu = mean_rise.detach().float().cpu() if mean_rise is not None else None
+    mean_target_cpu = mean_target.detach().float().cpu() if mean_target is not None else None
+    metadata = batch["metadata"]
+    feature_map = metadata.get("metadata_features", {}) if isinstance(metadata, dict) else {}
+    for index, alpha_value in enumerate(alpha_cpu.tolist()):
+        final_error = pred_cpu[index] - temp_cpu[index]
+        physics_error = physics_cpu[index] - temp_cpu[index]
+        row = {
+            "sample_uid": str(sample_uids[index]),
+            "case_id": str(case_ids[index]),
+            "alpha": float(alpha_value),
+            "final_mae_K": float(final_error.abs().mean().item()),
+            "centered_field_mae_K": "",
+            "mean_rise_abs_error_K": "",
+            "physics_v1_mae_K": float(physics_error.abs().mean().item()),
+            "occupied_fraction": metadata_feature_value(feature_map, "occupied_fraction", index),
+            "whitespace_fraction": metadata_feature_value(feature_map, "whitespace_fraction", index),
+            "total_power_W": metadata_feature_value(feature_map, "total_power_W", index),
+            "mean_power_density_W_per_mm2": metadata_feature_value(feature_map, "mean_power_density_W_per_mm2", index),
+            "minimum_pairwise_chiplet_distance_mm": "",
+        }
+        if centered_pred_cpu is not None and centered_target_cpu is not None:
+            row["centered_field_mae_K"] = float((centered_pred_cpu[index] - centered_target_cpu[index]).abs().mean().item())
+        if mean_rise_cpu is not None and mean_target_cpu is not None:
+            row["mean_rise_abs_error_K"] = float(abs(mean_rise_cpu[index].item() - mean_target_cpu[index].item()))
+        rows.append(row)
+
+
+def metadata_feature_value(feature_map: Any, name: str, index: int) -> float | str:
+    if not isinstance(feature_map, dict) or name not in feature_map:
+        return ""
+    value = feature_map[name]
+    if torch.is_tensor(value):
+        return float(value[index].item())
+    if isinstance(value, (list, tuple)):
+        return float(value[index])
+    return float(value)
+
+
+def write_gate_values(path: Path, rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    columns = list(rows[0].keys())
+    with path.open("w", encoding="utf-8", newline="") as fp:
+        writer = csv.DictWriter(fp, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_gate_summary(path: Path, rows: list[dict[str, Any]], overall: dict[str, float]) -> None:
+    by_case: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        by_case[str(row["case_id"])].append(row)
+    case_summary = {
+        case_id: {
+            "num_samples": len(items),
+            "alpha_mean": mean_float(item["alpha"] for item in items),
+            "alpha_std": std_float(item["alpha"] for item in items),
+            "final_mae_K": mean_float(item["final_mae_K"] for item in items),
+            "centered_field_mae_K": mean_float(item["centered_field_mae_K"] for item in items),
+            "physics_v1_mae_K": mean_float(item["physics_v1_mae_K"] for item in items),
+        }
+        for case_id, items in sorted(by_case.items())
+    }
+    correlations = {}
+    for key in (
+        "final_mae_K",
+        "centered_field_mae_K",
+        "physics_v1_mae_K",
+        "occupied_fraction",
+        "whitespace_fraction",
+        "total_power_W",
+        "mean_power_density_W_per_mm2",
+    ):
+        correlations[f"alpha_vs_{key}"] = pearson_corr(rows, "alpha", key)
+    payload = {
+        "overall": overall,
+        "by_case": case_summary,
+        "correlations": correlations,
+        "notes": "minimum_pairwise_chiplet_distance_mm is left blank here because it is not present in compact metadata_features.csv.",
+    }
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    case_path = path.with_name("gate_by_case.csv")
+    with case_path.open("w", encoding="utf-8", newline="") as fp:
+        columns = ["case_id", "num_samples", "alpha_mean", "alpha_std", "final_mae_K", "centered_field_mae_K", "physics_v1_mae_K"]
+        writer = csv.DictWriter(fp, fieldnames=columns)
+        writer.writeheader()
+        for case_id, summary in case_summary.items():
+            writer.writerow({"case_id": case_id, **summary})
+
+
+def numeric_values(values: Any) -> list[float]:
+    result = []
+    for value in values:
+        if value == "" or value is None:
+            continue
+        result.append(float(value))
+    return result
+
+
+def mean_float(values: Any) -> float | None:
+    data = numeric_values(values)
+    if not data:
+        return None
+    return float(np.mean(np.asarray(data, dtype=np.float64)))
+
+
+def std_float(values: Any) -> float | None:
+    data = numeric_values(values)
+    if not data:
+        return None
+    return float(np.std(np.asarray(data, dtype=np.float64)))
+
+
+def pearson_corr(rows: list[dict[str, Any]], x_key: str, y_key: str) -> float | None:
+    pairs = [(row[x_key], row[y_key]) for row in rows if row.get(x_key) not in {"", None} and row.get(y_key) not in {"", None}]
+    if len(pairs) < 2:
+        return None
+    x = np.asarray([float(pair[0]) for pair in pairs], dtype=np.float64)
+    y = np.asarray([float(pair[1]) for pair in pairs], dtype=np.float64)
+    if float(x.std()) == 0.0 or float(y.std()) == 0.0:
+        return None
+    return float(np.corrcoef(x, y)[0, 1])
 
 
 class MetricAccumulator:
@@ -397,6 +587,25 @@ class ScalarMetricAccumulator:
             "mae_K": self.sum_abs / self.count,
             "rmse_K": (self.sum_sq / self.count) ** 0.5,
             "mean_signed_error_K": self.sum_signed / self.count,
+        }
+
+
+class ScalarSummaryAccumulator:
+    def __init__(self) -> None:
+        self.values: list[float] = []
+
+    def update(self, value: torch.Tensor) -> None:
+        self.values.extend(float(item) for item in value.detach().float().reshape(-1).cpu().tolist())
+
+    def compute(self) -> dict[str, float]:
+        if not self.values:
+            return {}
+        array = np.asarray(self.values, dtype=np.float64)
+        return {
+            "mean": float(array.mean()),
+            "std": float(array.std()),
+            "min": float(array.min()),
+            "max": float(array.max()),
         }
 
 
