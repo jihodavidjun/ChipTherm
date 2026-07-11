@@ -78,6 +78,16 @@ class MiniUNet(nn.Module):
             h = decoder(h)
         return self.head(h)
 
+    def forward_features(self, x: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        skips: list[torch.Tensor] = []
+        h = x
+        for index, encoder in enumerate(self.encoders):
+            h = encoder(h)
+            if index < len(self.encoders) - 1:
+                skips.append(h)
+                h = self.pool(h)
+        return h, skips
+
     def config(self) -> dict[str, int]:
         return {
             "architecture": self.architecture,
@@ -203,6 +213,302 @@ class MiniUNetWithRefinement(nn.Module):
         }
 
 
+class MetadataEncoder(nn.Module):
+    def __init__(self, metadata_dim: int, hidden_dim: int = 64, embedding_dim: int = 64) -> None:
+        super().__init__()
+        if metadata_dim <= 0:
+            raise ValueError("metadata_dim must be positive for metadata conditioning")
+        self.metadata_dim = metadata_dim
+        self.hidden_dim = hidden_dim
+        self.embedding_dim = embedding_dim
+        self.net = nn.Sequential(
+            nn.Linear(metadata_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, embedding_dim),
+            nn.SiLU(),
+        )
+
+    def forward(self, metadata: torch.Tensor) -> torch.Tensor:
+        return self.net(metadata.float())
+
+
+class FiLM(nn.Module):
+    def __init__(self, embedding_dim: int, channels: int) -> None:
+        super().__init__()
+        self.proj = nn.Linear(embedding_dim, channels * 2)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+        with torch.no_grad():
+            self.proj.bias[:channels].fill_(1.0)
+
+    def forward(self, feature: torch.Tensor, embedding: torch.Tensor | None) -> torch.Tensor:
+        if embedding is None:
+            return feature
+        gamma_beta = self.proj(embedding)
+        gamma, beta = torch.chunk(gamma_beta, 2, dim=1)
+        return feature * gamma[:, :, None, None] + beta[:, :, None, None]
+
+
+class FiLMMiniUNet(nn.Module):
+    def __init__(
+        self,
+        input_channels: int,
+        output_channels: int = 1,
+        base_channels: int = 32,
+        depth: int = 3,
+        metadata_embedding_dim: int = 64,
+    ) -> None:
+        super().__init__()
+        if depth < 2:
+            raise ValueError("FiLMMiniUNet depth must be at least 2")
+        self.input_channels = input_channels
+        self.output_channels = output_channels
+        self.base_channels = base_channels
+        self.depth = depth
+        self.metadata_embedding_dim = metadata_embedding_dim
+        channels = [base_channels * (2**i) for i in range(depth)]
+        encoders: list[nn.Module] = []
+        in_ch = input_channels
+        for out_ch in channels:
+            encoders.append(ConvBlock(in_ch, out_ch))
+            in_ch = out_ch
+        self.encoders = nn.ModuleList(encoders)
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.bottleneck_film = FiLM(metadata_embedding_dim, channels[-1])
+        decoder_channels = list(reversed(channels[:-1]))
+        current_ch = channels[-1]
+        decoders: list[nn.Module] = []
+        films: list[nn.Module] = []
+        for skip_ch in decoder_channels:
+            decoders.append(ConvBlock(current_ch + skip_ch, skip_ch))
+            films.append(FiLM(metadata_embedding_dim, skip_ch))
+            current_ch = skip_ch
+        self.decoders = nn.ModuleList(decoders)
+        self.decoder_films = nn.ModuleList(films)
+        self.head = nn.Conv2d(current_ch, output_channels, kernel_size=1)
+
+    def forward_features(self, x: torch.Tensor, metadata_embedding: torch.Tensor | None = None) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        skips: list[torch.Tensor] = []
+        h = x
+        for index, encoder in enumerate(self.encoders):
+            h = encoder(h)
+            if index < len(self.encoders) - 1:
+                skips.append(h)
+                h = self.pool(h)
+        h = self.bottleneck_film(h, metadata_embedding)
+        return h, skips
+
+    def decode(self, h: torch.Tensor, skips: list[torch.Tensor], metadata_embedding: torch.Tensor | None = None) -> torch.Tensor:
+        for decoder, film, skip in zip(self.decoders, self.decoder_films, reversed(skips)):
+            h = F.interpolate(h, size=skip.shape[-2:], mode="bilinear", align_corners=False)
+            h = torch.cat([h, skip], dim=1)
+            h = decoder(h)
+            h = film(h, metadata_embedding)
+        return self.head(h)
+
+    def forward(self, x: torch.Tensor, metadata_embedding: torch.Tensor | None = None) -> torch.Tensor:
+        h, skips = self.forward_features(x, metadata_embedding)
+        return self.decode(h, skips, metadata_embedding)
+
+
+class ConditionedFullResolutionRefinementCNN(FullResolutionRefinementCNN):
+    def __init__(self, input_channels: int, refine_channels: int = 32, refine_blocks: int = 4, metadata_embedding_dim: int = 64) -> None:
+        super().__init__(input_channels, refine_channels=refine_channels, refine_blocks=refine_blocks)
+        self.film = FiLM(metadata_embedding_dim, refine_channels)
+
+    def forward(self, x: torch.Tensor, metadata_embedding: torch.Tensor | None = None) -> torch.Tensor:
+        h = self.input_projection(x)
+        h = self.film(h, metadata_embedding)
+        h = self.blocks(h)
+        return self.output_projection(h)
+
+
+class ConditionedMiniUNetWithRefinement(nn.Module):
+    def __init__(
+        self,
+        input_channels: int = 34,
+        output_channels: int = 1,
+        base_channels: int = 32,
+        depth: int = 3,
+        refine_channels: int = 32,
+        refine_blocks: int = 4,
+        refinement_channel_indices: tuple[int, ...] | list[int] = (),
+        refinement_channel_names: tuple[str, ...] | list[str] = (),
+        metadata_dim: int = 1,
+        metadata_hidden_dim: int = 64,
+        metadata_embedding_dim: int = 64,
+    ) -> None:
+        super().__init__()
+        indices = tuple(int(index) for index in refinement_channel_indices)
+        if not indices:
+            raise ValueError("ConditionedMiniUNetWithRefinement requires refinement_channel_indices")
+        self.architecture = "miniunet_refine_conditioned"
+        self.input_channels = input_channels
+        self.output_channels = output_channels
+        self.base_channels = base_channels
+        self.depth = depth
+        self.refine_channels = refine_channels
+        self.refine_blocks = refine_blocks
+        self.refinement_channel_indices = indices
+        self.refinement_channel_names = tuple(str(name) for name in refinement_channel_names)
+        self.metadata_dim = metadata_dim
+        self.metadata_hidden_dim = metadata_hidden_dim
+        self.metadata_embedding_dim = metadata_embedding_dim
+        self.metadata_encoder = MetadataEncoder(metadata_dim, metadata_hidden_dim, metadata_embedding_dim)
+        self.coarse_model = FiLMMiniUNet(input_channels, output_channels, base_channels, depth, metadata_embedding_dim)
+        self.refinement_model = ConditionedFullResolutionRefinementCNN(
+            len(indices) + output_channels,
+            refine_channels=refine_channels,
+            refine_blocks=refine_blocks,
+            metadata_embedding_dim=metadata_embedding_dim,
+        )
+
+    def forward_components(
+        self, x: torch.Tensor, metadata: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if metadata is None:
+            raise ValueError("conditioned model requires metadata tensor")
+        embedding = self.metadata_encoder(metadata)
+        coarse = self.coarse_model(x, embedding)
+        selected = x[:, list(self.refinement_channel_indices), :, :]
+        detail = self.refinement_model(torch.cat([selected, coarse], dim=1), embedding)
+        final = coarse + detail
+        return final, coarse, detail
+
+    def forward(self, x: torch.Tensor, metadata: torch.Tensor | None = None) -> torch.Tensor:
+        final, _, _ = self.forward_components(x, metadata)
+        return final
+
+    def config(self) -> dict[str, object]:
+        return {
+            "architecture": self.architecture,
+            "input_channels": self.input_channels,
+            "output_channels": self.output_channels,
+            "base_channels": self.base_channels,
+            "depth": self.depth,
+            "refine_channels": self.refine_channels,
+            "refine_blocks": self.refine_blocks,
+            "refinement_channel_indices": list(self.refinement_channel_indices),
+            "refinement_channel_names": list(self.refinement_channel_names),
+            "metadata_dim": self.metadata_dim,
+            "metadata_hidden_dim": self.metadata_hidden_dim,
+            "metadata_embedding_dim": self.metadata_embedding_dim,
+            "coarse_parameters": count_parameters(self.coarse_model),
+            "refinement_parameters": count_parameters(self.refinement_model),
+            "metadata_parameters": count_parameters(self.metadata_encoder),
+            "total_parameters": count_parameters(self),
+        }
+
+
+class DecomposedMiniUNetWithRefinement(nn.Module):
+    def __init__(
+        self,
+        input_channels: int = 34,
+        output_channels: int = 1,
+        base_channels: int = 32,
+        depth: int = 3,
+        refine_channels: int = 32,
+        refine_blocks: int = 4,
+        refinement_channel_indices: tuple[int, ...] | list[int] = (),
+        refinement_channel_names: tuple[str, ...] | list[str] = (),
+        metadata_dim: int = 0,
+        metadata_hidden_dim: int = 64,
+        metadata_embedding_dim: int = 64,
+        conditioned: bool = False,
+    ) -> None:
+        super().__init__()
+        indices = tuple(int(index) for index in refinement_channel_indices)
+        if not indices:
+            raise ValueError("DecomposedMiniUNetWithRefinement requires refinement_channel_indices")
+        self.conditioned = bool(conditioned)
+        self.architecture = "miniunet_refine_conditioned_decomposed" if self.conditioned else "miniunet_refine_decomposed"
+        self.input_channels = input_channels
+        self.output_channels = output_channels
+        self.base_channels = base_channels
+        self.depth = depth
+        self.refine_channels = refine_channels
+        self.refine_blocks = refine_blocks
+        self.refinement_channel_indices = indices
+        self.refinement_channel_names = tuple(str(name) for name in refinement_channel_names)
+        self.metadata_dim = int(metadata_dim)
+        self.metadata_hidden_dim = metadata_hidden_dim
+        self.metadata_embedding_dim = metadata_embedding_dim
+        if self.conditioned:
+            self.metadata_encoder = MetadataEncoder(self.metadata_dim, metadata_hidden_dim, metadata_embedding_dim)
+            self.coarse_model = FiLMMiniUNet(input_channels, output_channels, base_channels, depth, metadata_embedding_dim)
+            self.refinement_model = ConditionedFullResolutionRefinementCNN(
+                len(indices) + output_channels,
+                refine_channels=refine_channels,
+                refine_blocks=refine_blocks,
+                metadata_embedding_dim=metadata_embedding_dim,
+            )
+            mean_input_dim = metadata_embedding_dim + input_channels
+        else:
+            self.metadata_encoder = None
+            self.coarse_model = MiniUNet(input_channels, output_channels, base_channels, depth)
+            self.refinement_model = FullResolutionRefinementCNN(
+                len(indices) + output_channels,
+                refine_channels=refine_channels,
+                refine_blocks=refine_blocks,
+            )
+            mean_input_dim = input_channels
+        self.mean_head = nn.Sequential(
+            nn.Linear(mean_input_dim, metadata_hidden_dim),
+            nn.SiLU(),
+            nn.Linear(metadata_hidden_dim, 1),
+        )
+
+    def forward_components(self, x: torch.Tensor, metadata: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
+        embedding = None
+        if self.conditioned:
+            if metadata is None:
+                raise ValueError("conditioned decomposed model requires metadata tensor")
+            embedding = self.metadata_encoder(metadata)
+        if isinstance(self.coarse_model, FiLMMiniUNet):
+            coarse = self.coarse_model(x, embedding)
+        else:
+            coarse = self.coarse_model(x)
+        selected = x[:, list(self.refinement_channel_indices), :, :]
+        detail_input = torch.cat([selected, coarse], dim=1)
+        if isinstance(self.refinement_model, ConditionedFullResolutionRefinementCNN):
+            detail = self.refinement_model(detail_input, embedding)
+        else:
+            detail = self.refinement_model(detail_input)
+        centered = coarse + detail
+        centered = centered - centered.mean(dim=(-2, -1), keepdim=True)
+        pooled = x.mean(dim=(-2, -1))
+        mean_input = torch.cat([embedding, pooled], dim=1) if embedding is not None else pooled
+        mean_rise = self.mean_head(mean_input).squeeze(1)
+        return {
+            "mean_rise": mean_rise,
+            "centered_field": centered.squeeze(1),
+            "coarse_centered_field": (coarse - coarse.mean(dim=(-2, -1), keepdim=True)).squeeze(1),
+            "detail_field": detail.squeeze(1),
+        }
+
+    def forward(self, x: torch.Tensor, metadata: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
+        return self.forward_components(x, metadata)
+
+    def config(self) -> dict[str, object]:
+        return {
+            "architecture": self.architecture,
+            "input_channels": self.input_channels,
+            "output_channels": self.output_channels,
+            "base_channels": self.base_channels,
+            "depth": self.depth,
+            "refine_channels": self.refine_channels,
+            "refine_blocks": self.refine_blocks,
+            "refinement_channel_indices": list(self.refinement_channel_indices),
+            "refinement_channel_names": list(self.refinement_channel_names),
+            "metadata_dim": self.metadata_dim,
+            "metadata_hidden_dim": self.metadata_hidden_dim,
+            "metadata_embedding_dim": self.metadata_embedding_dim,
+            "conditioned": self.conditioned,
+            "metadata_parameters": count_parameters(self.metadata_encoder) if self.metadata_encoder is not None else 0,
+            "total_parameters": count_parameters(self),
+        }
+
+
 def build_model(config: dict[str, object]) -> nn.Module:
     architecture = str(config.get("architecture") or config.get("name") or "miniunet").lower()
     if architecture == "miniunet":
@@ -222,6 +528,35 @@ def build_model(config: dict[str, object]) -> nn.Module:
             refine_blocks=int(config.get("refine_blocks", 4)),
             refinement_channel_indices=tuple(int(index) for index in config.get("refinement_channel_indices", ())),
             refinement_channel_names=tuple(str(name) for name in config.get("refinement_channel_names", ())),
+        )
+    if architecture == "miniunet_refine_conditioned":
+        return ConditionedMiniUNetWithRefinement(
+            input_channels=int(config.get("input_channels", 34)),
+            output_channels=int(config.get("output_channels", 1)),
+            base_channels=int(config.get("base_channels", 32)),
+            depth=int(config.get("depth", 3)),
+            refine_channels=int(config.get("refine_channels", 32)),
+            refine_blocks=int(config.get("refine_blocks", 4)),
+            refinement_channel_indices=tuple(int(index) for index in config.get("refinement_channel_indices", ())),
+            refinement_channel_names=tuple(str(name) for name in config.get("refinement_channel_names", ())),
+            metadata_dim=int(config.get("metadata_dim", 1)),
+            metadata_hidden_dim=int(config.get("metadata_hidden_dim", 64)),
+            metadata_embedding_dim=int(config.get("metadata_embedding_dim", 64)),
+        )
+    if architecture in {"miniunet_refine_decomposed", "miniunet_refine_conditioned_decomposed"}:
+        return DecomposedMiniUNetWithRefinement(
+            input_channels=int(config.get("input_channels", 34)),
+            output_channels=int(config.get("output_channels", 1)),
+            base_channels=int(config.get("base_channels", 32)),
+            depth=int(config.get("depth", 3)),
+            refine_channels=int(config.get("refine_channels", 32)),
+            refine_blocks=int(config.get("refine_blocks", 4)),
+            refinement_channel_indices=tuple(int(index) for index in config.get("refinement_channel_indices", ())),
+            refinement_channel_names=tuple(str(name) for name in config.get("refinement_channel_names", ())),
+            metadata_dim=int(config.get("metadata_dim", 0)),
+            metadata_hidden_dim=int(config.get("metadata_hidden_dim", 64)),
+            metadata_embedding_dim=int(config.get("metadata_embedding_dim", 64)),
+            conditioned=architecture == "miniunet_refine_conditioned_decomposed",
         )
     raise ValueError(f"unsupported model architecture: {architecture}")
 

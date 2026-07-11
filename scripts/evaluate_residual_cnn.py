@@ -24,7 +24,7 @@ if str(SRC_ROOT) not in sys.path:
 
 from chiptherm.ml.dataset import ChipThermDataset
 from chiptherm.ml.models import build_model, count_parameters
-from chiptherm.ml.normalization import NormalizationStats, build_model_input, unnormalize_residual
+from chiptherm.ml.normalization import NormalizationStats, build_metadata_input, build_model_input, unnormalize_residual
 
 
 def main() -> int:
@@ -48,6 +48,9 @@ def main() -> int:
     model = build_model(checkpoint["model_config"]).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
+    architecture = str(checkpoint["model_config"].get("architecture", "miniunet"))
+    decomposed = architecture in {"miniunet_refine_decomposed", "miniunet_refine_conditioned_decomposed"}
+    conditioned = architecture in {"miniunet_refine_conditioned", "miniunet_refine_conditioned_decomposed"}
 
     dataset = ChipThermDataset(args.index, target="residual", return_metadata=True)
     actual_input_channels = int(dataset[0]["x"].shape[0]) + 1
@@ -73,6 +76,8 @@ def main() -> int:
         measure_end_to_end=args.measure_end_to_end,
         save_predictions=args.save_predictions,
         out_dir=out_dir,
+        decomposed=decomposed,
+        conditioned=conditioned,
     )
     cnn_runtime_per_sample = runtime_s / max(metrics["num_samples"], 1)
     cnn_side_speedup = hotspot_runtime_s / cnn_runtime_per_sample if hotspot_runtime_s and cnn_runtime_per_sample else None
@@ -132,6 +137,9 @@ def main() -> int:
         "cnn_final_temperature": metrics["cnn_final_temperature"],
         "cnn_residual": metrics["cnn_residual"],
         "coarse_final_temperature": metrics.get("coarse_final_temperature"),
+        "mean_rise": metrics.get("mean_rise"),
+        "centered_field": metrics.get("centered_field"),
+        "mean_bias_removed": metrics.get("mean_bias_removed"),
         "improvement_vs_physics_baseline": improvement,
     }
     (out_dir / "metrics.json").write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -172,11 +180,16 @@ def evaluate(
     measure_end_to_end: bool,
     save_predictions: bool,
     out_dir: Path,
+    decomposed: bool = False,
+    conditioned: bool = False,
 ) -> tuple[dict[str, Any], dict[str, dict[str, dict[str, float]]], float, float | None, float | None]:
     residual_acc = MetricAccumulator()
     final_acc = MetricAccumulator()
     physics_acc = MetricAccumulator()
     coarse_final_acc = MetricAccumulator()
+    mean_acc = ScalarMetricAccumulator()
+    centered_acc = MetricAccumulator()
+    mean_bias_removed_acc = MetricAccumulator()
     has_coarse_prediction = False
     by_case: dict[str, dict[str, MetricAccumulator]] = defaultdict(
         lambda: {
@@ -196,23 +209,44 @@ def evaluate(
         physics = batch["physics"].to(device, non_blocking=True)
         residual = batch["residual"].to(device, non_blocking=True)
         temperature = batch["temperature"].to(device, non_blocking=True)
+        ambient = batch["ambient_K"].to(device, non_blocking=True).float()
+        metadata_input = build_metadata_input(batch.get("metadata_vector"), stats)
+        if metadata_input is not None:
+            metadata_input = metadata_input.to(device, non_blocking=True)
 
         synchronize(device)
         start = time.perf_counter()
         model_input = build_model_input(x, physics, stats)
         coarse_norm = None
-        if hasattr(model, "forward_components"):
-            pred_norm, coarse_norm, _detail_norm = model.forward_components(model_input)
-        else:
-            pred_norm = model(model_input)
-        pred_residual = unnormalize_residual(pred_norm.squeeze(1), stats)
-        pred_temperature = physics + pred_residual
-        if coarse_norm is not None:
-            coarse_residual = unnormalize_residual(coarse_norm.squeeze(1), stats)
-            coarse_temperature = physics + coarse_residual
-            has_coarse_prediction = True
-        else:
+        if decomposed:
+            outputs = model(model_input, metadata_input) if conditioned else model(model_input)
+            pred_temperature = reconstruct_decomposed_temperature(outputs, ambient)
+            pred_residual = pred_temperature - physics
+            centered_pred = pred_temperature - pred_temperature.mean(dim=(-2, -1), keepdim=True)
+            centered_target = temperature - temperature.mean(dim=(-2, -1), keepdim=True)
+            mean_target = (temperature - ambient[:, None, None]).mean(dim=(-2, -1))
+            mean_acc.update(outputs["mean_rise"], mean_target)
+            centered_acc.update(centered_pred, centered_target)
+            mean_bias_removed_acc.update(centered_pred, centered_target)
             coarse_temperature = None
+        elif hasattr(model, "forward_components"):
+            if conditioned:
+                pred_norm, coarse_norm, _detail_norm = model.forward_components(model_input, metadata_input)
+            else:
+                pred_norm, coarse_norm, _detail_norm = model.forward_components(model_input)
+            pred_residual = unnormalize_residual(pred_norm.squeeze(1), stats)
+            pred_temperature = physics + pred_residual
+        else:
+            pred_norm = model(model_input, metadata_input) if conditioned else model(model_input)
+            pred_residual = unnormalize_residual(pred_norm.squeeze(1), stats)
+            pred_temperature = physics + pred_residual
+        if not decomposed:
+            if coarse_norm is not None:
+                coarse_residual = unnormalize_residual(coarse_norm.squeeze(1), stats)
+                coarse_temperature = physics + coarse_residual
+                has_coarse_prediction = True
+            else:
+                coarse_temperature = None
         synchronize(device)
         inference_runtime_s += time.perf_counter() - start
 
@@ -254,6 +288,10 @@ def evaluate(
     }
     if has_coarse_prediction:
         metrics["coarse_final_temperature"] = coarse_final_acc.compute()
+    if decomposed:
+        metrics["mean_rise"] = mean_acc.compute()
+        metrics["centered_field"] = centered_acc.compute()
+        metrics["mean_bias_removed"] = mean_bias_removed_acc.compute()
     case_payload = {
         case_id: {
             name: accumulator.compute()
@@ -264,6 +302,12 @@ def evaluate(
     hotspot_runtime_s = float(sum(hotspot_runtimes) / len(hotspot_runtimes)) if hotspot_runtimes else None
     physics_runtime_s = float(sum(physics_runtimes) / len(physics_runtimes)) if physics_runtimes else None
     return metrics, case_payload, inference_runtime_s, hotspot_runtime_s, physics_runtime_s
+
+
+def reconstruct_decomposed_temperature(outputs: dict[str, torch.Tensor], ambient: torch.Tensor) -> torch.Tensor:
+    centered = outputs["centered_field"]
+    centered = centered - centered.mean(dim=(-2, -1), keepdim=True)
+    return ambient[:, None, None] + outputs["mean_rise"][:, None, None] + centered
 
 
 class MetricAccumulator:
@@ -309,6 +353,30 @@ class MetricAccumulator:
             "mean_signed_error_K": self.sum_signed / self.num_cells,
             "hotspot_temp_error_K": self.hotspot_temp_error_sum / max(self.num_samples, 1),
             "hotspot_location_error_cells": self.hotspot_location_error_sum / max(self.num_samples, 1),
+        }
+
+
+class ScalarMetricAccumulator:
+    def __init__(self) -> None:
+        self.count = 0
+        self.sum_abs = 0.0
+        self.sum_sq = 0.0
+        self.sum_signed = 0.0
+
+    def update(self, pred: torch.Tensor, target: torch.Tensor) -> None:
+        error = pred.detach().float().cpu() - target.detach().float().cpu()
+        self.count += int(error.numel())
+        self.sum_abs += float(error.abs().sum().item())
+        self.sum_sq += float((error * error).sum().item())
+        self.sum_signed += float(error.sum().item())
+
+    def compute(self) -> dict[str, float]:
+        if self.count == 0:
+            return {}
+        return {
+            "mae_K": self.sum_abs / self.count,
+            "rmse_K": (self.sum_sq / self.count) ** 0.5,
+            "mean_signed_error_K": self.sum_signed / self.count,
         }
 
 

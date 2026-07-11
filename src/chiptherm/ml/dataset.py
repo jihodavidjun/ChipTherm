@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 from collections import Counter
 from pathlib import Path
 from typing import Any, Callable, Literal
@@ -34,6 +35,7 @@ class ChipThermDataset(Dataset):
         if not self.index_csv.exists():
             raise FileNotFoundError(self.index_csv)
         self.rows = self._read_rows(self.index_csv)
+        self.metadata_feature_names, self.metadata_feature_rows = self._load_metadata_features()
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -59,7 +61,11 @@ class ChipThermDataset(Dataset):
             "physics": physics,
             "temperature": temperature,
             "residual": residual,
+            "ambient_K": torch.tensor(self._ambient_for_row(row), dtype=torch.float32),
         }
+        metadata_vector = self._metadata_vector_for_row(row)
+        if metadata_vector is not None:
+            sample["metadata_vector"] = metadata_vector
         if self.return_metadata:
             sample["metadata"] = self._metadata(row)
         if self.transform is not None:
@@ -89,6 +95,7 @@ class ChipThermDataset(Dataset):
             "mean_hotspot_temperature_K": self._mean("mean_temperature_K"),
             "mean_power_W": self._mean("total_power_W"),
             "mean_chiplet_count": self._mean("num_chiplets"),
+            "metadata_features": self.metadata_feature_names,
         }
 
     def summary(self) -> str:
@@ -121,6 +128,23 @@ class ChipThermDataset(Dataset):
             raise ValueError(f"{path} does not contain any samples")
         return rows
 
+    def _load_metadata_features(self) -> tuple[list[str], dict[str, dict[str, float]]]:
+        table_path = self.index_csv.parent / "metadata_features.csv"
+        manifest_path = self.index_csv.parent / "metadata_manifest.json"
+        if not table_path.exists() or not manifest_path.exists():
+            return [], {}
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        active_features = [str(name) for name in manifest.get("active_features", [])]
+        rows: dict[str, dict[str, float]] = {}
+        with table_path.open("r", encoding="utf-8", newline="") as fp:
+            reader = csv.DictReader(fp)
+            missing = [name for name in active_features if name not in (reader.fieldnames or [])]
+            if missing:
+                raise ValueError(f"{table_path} missing active metadata columns: {', '.join(missing)}")
+            for row in reader:
+                rows[row["sample_uid"]] = {name: float(row[name]) for name in active_features}
+        return active_features, rows
+
     def _load_tensor(self, path_value: str, *, expected_ndim: int) -> torch.Tensor:
         path = self._resolve_path(path_value)
         array = np.load(path).astype(np.float32, copy=False)
@@ -145,7 +169,7 @@ class ChipThermDataset(Dataset):
         return candidates[0]
 
     def _metadata(self, row: dict[str, str]) -> dict[str, Any]:
-        return {
+        payload = {
             "sample_uid": row["sample_uid"],
             "original_sample_uid": row.get("original_sample_uid"),
             "case_id": row["case_id"],
@@ -159,7 +183,27 @@ class ChipThermDataset(Dataset):
             "y_path": row["y_path"],
             "prediction_path": row["prediction_path"],
             "residual_path": row["residual_path"],
+            "ambient_K": self._ambient_for_row(row),
         }
+        if self.metadata_feature_names:
+            payload["metadata_features"] = {
+                name: float(self.metadata_feature_rows[row["sample_uid"]][name])
+                for name in self.metadata_feature_names
+            }
+        return payload
+
+    def _metadata_vector_for_row(self, row: dict[str, str]) -> torch.Tensor | None:
+        if not self.metadata_feature_names:
+            return None
+        values = self.metadata_feature_rows.get(row["sample_uid"])
+        if values is None:
+            raise ValueError(f"metadata_features.csv missing sample_uid {row['sample_uid']}")
+        return torch.tensor([float(values[name]) for name in self.metadata_feature_names], dtype=torch.float32)
+
+    def _ambient_for_row(self, row: dict[str, str]) -> float:
+        if self.metadata_feature_rows and "ambient_K" in self.metadata_feature_rows.get(row["sample_uid"], {}):
+            return float(self.metadata_feature_rows[row["sample_uid"]]["ambient_K"])
+        return 318.15
 
     def _array_shape(self, column: str) -> tuple[int, ...]:
         path = self._resolve_path(self.rows[0][column])

@@ -27,6 +27,7 @@ from chiptherm.ml.dataset import ChipThermDataset
 from chiptherm.ml.models import build_model, count_parameters
 from chiptherm.ml.normalization import (
     NormalizationStats,
+    build_metadata_input,
     build_model_input,
     compute_normalization_stats,
     normalize_residual,
@@ -45,9 +46,24 @@ def main() -> int:
     parser.add_argument("--lr", default=1.0e-3, type=float)
     parser.add_argument("--base-channels", default=16, type=int)
     parser.add_argument("--depth", default=3, type=int)
-    parser.add_argument("--model-architecture", default="miniunet", choices=["miniunet", "miniunet_refine"])
+    parser.add_argument(
+        "--model-architecture",
+        default="miniunet",
+        choices=[
+            "miniunet",
+            "miniunet_refine",
+            "miniunet_refine_conditioned",
+            "miniunet_refine_decomposed",
+            "miniunet_refine_conditioned_decomposed",
+        ],
+    )
     parser.add_argument("--refine-channels", default=32, type=int)
     parser.add_argument("--refine-blocks", default=4, type=int)
+    parser.add_argument("--metadata-conditioning", action="store_true")
+    parser.add_argument("--metadata-hidden-dim", default=64, type=int)
+    parser.add_argument("--metadata-embedding-dim", default=64, type=int)
+    parser.add_argument("--lambda-final", default=1.0, type=float)
+    parser.add_argument("--lambda-mean", default=0.1, type=float)
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
     parser.add_argument("--num-workers", default=0, type=int)
     parser.add_argument("--seed", default=0, type=int)
@@ -70,6 +86,10 @@ def main() -> int:
         raise SystemExit("--hotspot-top-frac must be in the interval (0, 1]")
     if args.train_mae_every < 0:
         raise SystemExit("--train-mae-every must be non-negative")
+    is_conditioned_arch = args.model_architecture in {"miniunet_refine_conditioned", "miniunet_refine_conditioned_decomposed"}
+    is_decomposed_arch = args.model_architecture in {"miniunet_refine_decomposed", "miniunet_refine_conditioned_decomposed"}
+    if args.metadata_conditioning and not is_conditioned_arch:
+        print("--metadata-conditioning requested; using architecture-selected behavior only.")
 
     set_seed(args.seed)
     device = select_device(args.device)
@@ -86,10 +106,13 @@ def main() -> int:
     val_loader = make_loader(val_dataset, args.batch_size, shuffle=False, num_workers=args.num_workers, device=device)
 
     stats = compute_normalization_stats(train_dataset, batch_size=args.batch_size, num_workers=args.num_workers)
+    metadata_dim = len(stats.metadata_feature_names)
+    if is_conditioned_arch and metadata_dim <= 0:
+        raise SystemExit("metadata-conditioned architecture requires metadata_features.csv/metadata_manifest.json")
     refinement_channel_indices, refinement_channel_names = refinement_channels_for_dataset(
         dataset_input_channels,
         stats,
-        enabled=args.model_architecture == "miniunet_refine",
+        enabled=args.model_architecture != "miniunet",
     )
     model_config: dict[str, Any] = {
         "architecture": args.model_architecture,
@@ -100,13 +123,22 @@ def main() -> int:
         "base_channels": args.base_channels,
         "depth": args.depth,
     }
-    if args.model_architecture == "miniunet_refine":
+    if args.model_architecture != "miniunet":
         model_config.update(
             {
                 "refine_channels": args.refine_channels,
                 "refine_blocks": args.refine_blocks,
                 "refinement_channel_indices": list(refinement_channel_indices),
                 "refinement_channel_names": list(refinement_channel_names),
+            }
+        )
+    if is_conditioned_arch or is_decomposed_arch:
+        model_config.update(
+            {
+                "metadata_dim": metadata_dim,
+                "metadata_feature_names": list(stats.metadata_feature_names),
+                "metadata_hidden_dim": args.metadata_hidden_dim,
+                "metadata_embedding_dim": args.metadata_embedding_dim,
             }
         )
 
@@ -134,6 +166,10 @@ def main() -> int:
         "hotspot_top_frac": args.hotspot_top_frac,
         "hotspot_loss_scaling": "hotspot L1 loss in Kelvin over top ground-truth HotSpot cells divided by train residual_std before weighting",
         "train_mae_every": args.train_mae_every,
+        "lambda_final": args.lambda_final,
+        "lambda_mean": args.lambda_mean,
+        "target_decomposition": is_decomposed_arch,
+        "metadata_conditioning": is_conditioned_arch,
         "model": model_config,
         "loss": (
             "SmoothL1Loss on normalized residual plus optional temp_loss_weight * L1(T_pred, HotSpot) / residual_std "
@@ -176,11 +212,35 @@ def main() -> int:
             temp_loss_weight=args.temp_loss_weight,
             hotspot_loss_weight=args.hotspot_loss_weight,
             hotspot_top_frac=args.hotspot_top_frac,
+            decomposed=is_decomposed_arch,
+            conditioned=is_conditioned_arch,
+            lambda_final=args.lambda_final,
+            lambda_mean=args.lambda_mean,
         )
-        val_metrics, val_by_case = evaluate_model(model, val_loader, criterion, stats, device)
+        val_metrics, val_by_case = evaluate_model(
+            model,
+            val_loader,
+            criterion,
+            stats,
+            device,
+            decomposed=is_decomposed_arch,
+            conditioned=is_conditioned_arch,
+            lambda_final=args.lambda_final,
+            lambda_mean=args.lambda_mean,
+        )
         train_final_mae_K: float | None = None
         if should_compute_train_mae(epoch, args.epochs, args.train_mae_every):
-            train_metrics, _ = evaluate_model(model, train_eval_loader, criterion, stats, device)
+            train_metrics, _ = evaluate_model(
+                model,
+                train_eval_loader,
+                criterion,
+                stats,
+                device,
+                decomposed=is_decomposed_arch,
+                conditioned=is_conditioned_arch,
+                lambda_final=args.lambda_final,
+                lambda_mean=args.lambda_mean,
+            )
             train_final_mae_K = float(train_metrics["final_temperature"]["mae_K"])
         epoch_runtime_s = time.perf_counter() - epoch_start
         val_final_mae = float(val_metrics["final_temperature"]["mae_K"])
@@ -292,6 +352,10 @@ def train_one_epoch(
     temp_loss_weight: float,
     hotspot_loss_weight: float,
     hotspot_top_frac: float,
+    decomposed: bool,
+    conditioned: bool,
+    lambda_final: float,
+    lambda_mean: float,
 ) -> dict[str, float]:
     model.train()
     total_loss = 0.0
@@ -306,32 +370,49 @@ def train_one_epoch(
         physics = batch["physics"].to(device, non_blocking=True)
         residual = batch["residual"].to(device, non_blocking=True)
         temperature = batch["temperature"].to(device, non_blocking=True)
+        ambient = batch["ambient_K"].to(device, non_blocking=True).float()
+        metadata_input = build_metadata_input(batch.get("metadata_vector"), stats)
+        if metadata_input is not None:
+            metadata_input = metadata_input.to(device, non_blocking=True)
         model_input = build_model_input(x, physics, stats)
-        target = normalize_residual(residual, stats).unsqueeze(1)
 
         optimizer.zero_grad(set_to_none=True)
-        pred = model(model_input)
-        residual_loss = criterion(pred, target)
-        if temp_loss_weight > 0.0 or hotspot_loss_weight > 0.0:
-            pred_residual_K = unnormalize_residual(pred.squeeze(1), stats)
-            pred_temperature = physics + pred_residual_K
-        if temp_loss_weight > 0.0:
-            temp_loss_K = temp_criterion(pred_temperature, temperature)
-            temp_loss_scaled = temp_loss_K / max(float(stats.residual_std), 1.0e-8)
+        if decomposed:
+            outputs = model(model_input, metadata_input) if conditioned else model(model_input)
+            pred_temperature = reconstruct_decomposed_temperature(outputs, ambient)
+            mean_target = (temperature - ambient[:, None, None]).mean(dim=(-2, -1))
+            final_loss = temp_criterion(pred_temperature, temperature)
+            mean_loss = temp_criterion(outputs["mean_rise"], mean_target)
+            residual_loss = final_loss
+            temp_loss_K = final_loss
+            temp_loss_scaled = mean_loss
+            hotspot_loss_K = pred_temperature.new_tensor(0.0)
+            hotspot_loss_scaled = pred_temperature.new_tensor(0.0)
+            loss = float(lambda_final) * final_loss + float(lambda_mean) * mean_loss
         else:
-            temp_loss_K = pred.new_tensor(0.0)
-            temp_loss_scaled = pred.new_tensor(0.0)
-        if hotspot_loss_weight > 0.0:
-            hotspot_loss_K = hotspot_l1_loss(pred_temperature, temperature, hotspot_top_frac)
-            hotspot_loss_scaled = hotspot_loss_K / max(float(stats.residual_std), 1.0e-8)
-        else:
-            hotspot_loss_K = pred.new_tensor(0.0)
-            hotspot_loss_scaled = pred.new_tensor(0.0)
-        loss = (
-            residual_loss
-            + float(temp_loss_weight) * temp_loss_scaled
-            + float(hotspot_loss_weight) * hotspot_loss_scaled
-        )
+            target = normalize_residual(residual, stats).unsqueeze(1)
+            pred = model(model_input, metadata_input) if conditioned else model(model_input)
+            residual_loss = criterion(pred, target)
+            if temp_loss_weight > 0.0 or hotspot_loss_weight > 0.0:
+                pred_residual_K = unnormalize_residual(pred.squeeze(1), stats)
+                pred_temperature = physics + pred_residual_K
+            if temp_loss_weight > 0.0:
+                temp_loss_K = temp_criterion(pred_temperature, temperature)
+                temp_loss_scaled = temp_loss_K / max(float(stats.residual_std), 1.0e-8)
+            else:
+                temp_loss_K = pred.new_tensor(0.0)
+                temp_loss_scaled = pred.new_tensor(0.0)
+            if hotspot_loss_weight > 0.0:
+                hotspot_loss_K = hotspot_l1_loss(pred_temperature, temperature, hotspot_top_frac)
+                hotspot_loss_scaled = hotspot_loss_K / max(float(stats.residual_std), 1.0e-8)
+            else:
+                hotspot_loss_K = pred.new_tensor(0.0)
+                hotspot_loss_scaled = pred.new_tensor(0.0)
+            loss = (
+                residual_loss
+                + float(temp_loss_weight) * temp_loss_scaled
+                + float(hotspot_loss_weight) * hotspot_loss_scaled
+            )
         loss.backward()
         optimizer.step()
 
@@ -371,10 +452,18 @@ def evaluate_model(
     criterion: nn.Module,
     stats: NormalizationStats,
     device: torch.device,
+    *,
+    decomposed: bool = False,
+    conditioned: bool = False,
+    lambda_final: float = 1.0,
+    lambda_mean: float = 0.1,
 ) -> tuple[dict[str, Any], dict[str, dict[str, float]]]:
     model.eval()
     residual_acc = MetricAccumulator()
     final_acc = MetricAccumulator()
+    centered_acc = MetricAccumulator()
+    mean_acc = ScalarMetricAccumulator()
+    mean_bias_removed_acc = MetricAccumulator()
     by_case: dict[str, dict[str, MetricAccumulator]] = defaultdict(lambda: {"residual": MetricAccumulator(), "final_temperature": MetricAccumulator()})
     total_loss = 0.0
     total_samples = 0
@@ -384,12 +473,30 @@ def evaluate_model(
         physics = batch["physics"].to(device, non_blocking=True)
         residual = batch["residual"].to(device, non_blocking=True)
         temperature = batch["temperature"].to(device, non_blocking=True)
+        ambient = batch["ambient_K"].to(device, non_blocking=True).float()
+        metadata_input = build_metadata_input(batch.get("metadata_vector"), stats)
+        if metadata_input is not None:
+            metadata_input = metadata_input.to(device, non_blocking=True)
         model_input = build_model_input(x, physics, stats)
-        target_norm = normalize_residual(residual, stats).unsqueeze(1)
-        pred_norm = model(model_input)
-        loss = criterion(pred_norm, target_norm)
-        pred_residual = unnormalize_residual(pred_norm.squeeze(1), stats)
-        pred_temperature = physics + pred_residual
+        if decomposed:
+            outputs = model(model_input, metadata_input) if conditioned else model(model_input)
+            pred_temperature = reconstruct_decomposed_temperature(outputs, ambient)
+            pred_residual = pred_temperature - physics
+            mean_target = (temperature - ambient[:, None, None]).mean(dim=(-2, -1))
+            final_loss = torch.nn.functional.smooth_l1_loss(pred_temperature, temperature)
+            mean_loss = torch.nn.functional.smooth_l1_loss(outputs["mean_rise"], mean_target)
+            loss = float(lambda_final) * final_loss + float(lambda_mean) * mean_loss
+            centered_pred = pred_temperature - pred_temperature.mean(dim=(-2, -1), keepdim=True)
+            centered_target = temperature - temperature.mean(dim=(-2, -1), keepdim=True)
+            mean_acc.update(outputs["mean_rise"], mean_target)
+            centered_acc.update(centered_pred, centered_target)
+            mean_bias_removed_acc.update(centered_pred, centered_target)
+        else:
+            target_norm = normalize_residual(residual, stats).unsqueeze(1)
+            pred_norm = model(model_input, metadata_input) if conditioned else model(model_input)
+            loss = criterion(pred_norm, target_norm)
+            pred_residual = unnormalize_residual(pred_norm.squeeze(1), stats)
+            pred_temperature = physics + pred_residual
         case_ids = metadata_values(batch["metadata"], "case_id", int(x.shape[0]))
 
         batch_size = int(x.shape[0])
@@ -406,6 +513,10 @@ def evaluate_model(
         "residual": residual_acc.compute(),
         "final_temperature": final_acc.compute(),
     }
+    if decomposed:
+        metrics["mean_rise"] = mean_acc.compute()
+        metrics["centered_field"] = centered_acc.compute()
+        metrics["mean_bias_removed"] = mean_bias_removed_acc.compute()
     case_metrics = {
         case_id: {
             "residual": accs["residual"].compute(),
@@ -414,6 +525,12 @@ def evaluate_model(
         for case_id, accs in sorted(by_case.items())
     }
     return metrics, case_metrics
+
+
+def reconstruct_decomposed_temperature(outputs: dict[str, torch.Tensor], ambient: torch.Tensor) -> torch.Tensor:
+    centered = outputs["centered_field"]
+    centered = centered - centered.mean(dim=(-2, -1), keepdim=True)
+    return ambient[:, None, None] + outputs["mean_rise"][:, None, None] + centered
 
 
 def hotspot_l1_loss(pred_temperature: torch.Tensor, temperature: torch.Tensor, top_frac: float) -> torch.Tensor:
@@ -472,6 +589,30 @@ class MetricAccumulator:
             "mean_signed_error_K": self.sum_signed / self.num_cells,
             "hotspot_temp_error_K": self.hotspot_temp_error_sum / max(self.num_samples, 1),
             "hotspot_location_error_cells": self.hotspot_location_error_sum / max(self.num_samples, 1),
+        }
+
+
+class ScalarMetricAccumulator:
+    def __init__(self) -> None:
+        self.count = 0
+        self.sum_abs = 0.0
+        self.sum_sq = 0.0
+        self.sum_signed = 0.0
+
+    def update(self, pred: torch.Tensor, target: torch.Tensor) -> None:
+        error = pred.detach().float().cpu() - target.detach().float().cpu()
+        self.count += int(error.numel())
+        self.sum_abs += float(error.abs().sum().item())
+        self.sum_sq += float((error * error).sum().item())
+        self.sum_signed += float(error.sum().item())
+
+    def compute(self) -> dict[str, float]:
+        if self.count == 0:
+            return {}
+        return {
+            "mae_K": self.sum_abs / self.count,
+            "rmse_K": (self.sum_sq / self.count) ** 0.5,
+            "mean_signed_error_K": self.sum_signed / self.count,
         }
 
 
