@@ -38,7 +38,12 @@ def main() -> int:
     parser.add_argument("--num-workers", default=0, type=int)
     parser.add_argument("--save-predictions", action="store_true")
     parser.add_argument("--measure-end-to-end", action="store_true")
+    parser.add_argument("--profile-components", action="store_true")
+    parser.add_argument("--disable-graph-correction", action="store_true")
+    parser.add_argument("--graph-correction-scale", default=1.0, type=float)
     args = parser.parse_args()
+    if args.disable_graph_correction:
+        args.graph_correction_scale = 0.0
 
     device = select_device(args.device)
     out_dir = args.out_dir.resolve()
@@ -89,6 +94,7 @@ def main() -> int:
         physics_input_mode=physics_input_mode,
         graph_enabled=graph_enabled,
         graph_stats=graph_stats,
+        graph_correction_scale=args.graph_correction_scale,
     )
     cnn_runtime_per_sample = runtime_s / max(metrics["num_samples"], 1)
     gate_runtime_per_sample = gate_runtime_s / max(metrics["num_samples"], 1) if gate_runtime_s > 0.0 else None
@@ -168,8 +174,25 @@ def main() -> int:
         "mean_bias_removed": metrics.get("mean_bias_removed"),
         "physics_gate": metrics.get("physics_gate"),
         "graph_correction_abs_mean": metrics.get("graph_correction_abs_mean"),
+        "cnn_only_final_temperature": metrics.get("cnn_only_final_temperature"),
+        "cnn_only_centered_field": metrics.get("cnn_only_centered_field"),
+        "graph_improvement": metrics.get("graph_improvement"),
         "improvement_vs_physics_baseline": improvement,
     }
+    component_profile = None
+    if args.profile_components and graph_enabled:
+        component_profile = profile_components(
+            model,
+            loader,
+            stats,
+            device,
+            conditioned=conditioned,
+            physics_input_mode=physics_input_mode,
+            graph_stats=graph_stats,
+            graph_correction_scale=args.graph_correction_scale,
+        )
+        payload["component_runtime"] = component_profile
+        (out_dir / "component_runtime.json").write_text(json.dumps(component_profile, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     (out_dir / "metrics.json").write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     write_case_metrics(out_dir / "metrics_by_case.csv", by_case)
 
@@ -207,6 +230,11 @@ def main() -> int:
             f"{graph_summary['mean']:.3f} / {graph_summary['std']:.3f} / "
             f"{graph_summary['min']:.3f} / {graph_summary['max']:.3f} K"
         )
+        if metrics.get("cnn_only_final_temperature"):
+            cnn_only = metrics["cnn_only_final_temperature"]
+            graph_improvement = metrics.get("graph_improvement", {})
+            print(f"CNN-only MAE/RMSE: {cnn_only['mae_K']:.3f} / {cnn_only['rmse_K']:.3f} K")
+            print(f"Graph MAE improvement: {graph_improvement.get('mae_K', float('nan')):.3f} K")
     print(f"CNN final MAE/RMSE: {final_mae:.3f} / {final_rmse:.3f} K")
     print(f"Parameter count: {count_parameters(model)}")
     print(f"Improvement: MAE {improvement['mae_percent']:.2f}% / RMSE {improvement['rmse_percent']:.2f}%")
@@ -229,22 +257,32 @@ def evaluate(
     physics_input_mode: str = "v1",
     graph_enabled: bool = False,
     graph_stats: Any | None = None,
+    graph_correction_scale: float = 1.0,
 ) -> tuple[dict[str, Any], dict[str, dict[str, dict[str, float]]], float, float | None, float | None, float]:
     residual_acc = MetricAccumulator()
     final_acc = MetricAccumulator()
+    cnn_only_final_acc = MetricAccumulator()
     physics_acc = MetricAccumulator()
     coarse_final_acc = MetricAccumulator()
     mean_acc = ScalarMetricAccumulator()
     centered_acc = MetricAccumulator()
+    cnn_only_centered_acc = MetricAccumulator()
     mean_bias_removed_acc = MetricAccumulator()
     gate_acc = ScalarSummaryAccumulator()
     graph_correction_acc = ScalarSummaryAccumulator()
+    graph_correction_max_acc = ScalarSummaryAccumulator()
+    graph_correction_rms_acc = ScalarSummaryAccumulator()
+    graph_correction_std_acc = ScalarSummaryAccumulator()
+    cnn_centered_abs_acc = ScalarSummaryAccumulator()
+    final_centered_abs_acc = ScalarSummaryAccumulator()
+    graph_rows: list[dict[str, Any]] = []
     gate_rows: list[dict[str, Any]] = []
     has_coarse_prediction = False
     by_case: dict[str, dict[str, MetricAccumulator]] = defaultdict(
         lambda: {
             "cnn_residual": MetricAccumulator(),
             "cnn_final_temperature": MetricAccumulator(),
+            "cnn_only_final_temperature": MetricAccumulator(),
             "physics_baseline": MetricAccumulator(),
             "coarse_final_temperature": MetricAccumulator(),
         }
@@ -278,7 +316,15 @@ def evaluate(
         coarse_norm = None
         alpha = None
         if decomposed:
-            outputs = call_model(model, model_input, metadata_input, graph_batch, conditioned=conditioned, graph_enabled=graph_enabled)
+            outputs = call_model(
+                model,
+                model_input,
+                metadata_input,
+                graph_batch,
+                conditioned=conditioned,
+                graph_enabled=graph_enabled,
+                graph_correction_scale=graph_correction_scale,
+            )
             pred_temperature = reconstruct_decomposed_temperature(outputs, ambient)
             pred_residual = pred_temperature - physics
             centered_pred = pred_temperature - pred_temperature.mean(dim=(-2, -1), keepdim=True)
@@ -292,7 +338,18 @@ def evaluate(
                 gate_acc.update(alpha)
             graph_correction = outputs.get("graph_correction_field")
             if graph_correction is not None:
-                graph_correction_acc.update(graph_correction.abs().mean(dim=(-2, -1)))
+                graph_abs = graph_correction.abs()
+                graph_correction_acc.update(graph_abs.mean(dim=(-2, -1)))
+                graph_correction_max_acc.update(graph_abs.amax(dim=(-2, -1)))
+                graph_correction_rms_acc.update(torch.sqrt(torch.mean(graph_correction * graph_correction, dim=(-2, -1))))
+                graph_correction_std_acc.update(graph_correction.std(dim=(-2, -1)))
+                cnn_centered = outputs["cnn_centered_field"]
+                cnn_centered_abs_acc.update(cnn_centered.abs().mean(dim=(-2, -1)))
+                final_centered_abs_acc.update(outputs["centered_field"].abs().mean(dim=(-2, -1)))
+                cnn_only_temperature = ambient[:, None, None] + outputs["mean_rise"][:, None, None] + cnn_centered
+                cnn_only_centered = cnn_only_temperature - cnn_only_temperature.mean(dim=(-2, -1), keepdim=True)
+                cnn_only_final_acc.update(cnn_only_temperature, temperature)
+                cnn_only_centered_acc.update(cnn_only_centered, centered_target)
             coarse_temperature = None
         elif hasattr(model, "forward_components"):
             if conditioned:
@@ -339,11 +396,28 @@ def evaluate(
             case_metrics["cnn_residual"].update(pred_residual[index : index + 1], residual[index : index + 1])
             case_metrics["cnn_final_temperature"].update(pred_temperature[index : index + 1], temperature[index : index + 1])
             case_metrics["physics_baseline"].update(physics[index : index + 1], temperature[index : index + 1])
+            if decomposed and "cnn_only_temperature" in locals():
+                case_metrics["cnn_only_final_temperature"].update(
+                    cnn_only_temperature[index : index + 1],
+                    temperature[index : index + 1],
+                )
             if coarse_temperature is not None:
                 case_metrics["coarse_final_temperature"].update(coarse_temperature[index : index + 1], temperature[index : index + 1])
 
         if save_predictions:
             save_batch_predictions(out_dir, sample_uids, case_ids, pred_temperature, pred_residual)
+        if decomposed and "cnn_only_temperature" in locals() and "graph_correction" in locals() and graph_correction is not None:
+            append_graph_rows(
+                graph_rows,
+                batch,
+                sample_uids,
+                case_ids,
+                cnn_only_temperature,
+                pred_temperature,
+                temperature,
+                graph_correction,
+            )
+            del cnn_only_temperature
         if decomposed and "alpha" in locals() and alpha is not None:
             append_gate_rows(
                 gate_rows,
@@ -373,9 +447,26 @@ def evaluate(
         metrics["mean_rise"] = mean_acc.compute()
         metrics["centered_field"] = centered_acc.compute()
         metrics["mean_bias_removed"] = mean_bias_removed_acc.compute()
+    cnn_only_summary = cnn_only_final_acc.compute()
+    if cnn_only_summary:
+        metrics["cnn_only_final_temperature"] = cnn_only_summary
+        metrics["cnn_only_centered_field"] = cnn_only_centered_acc.compute()
+        metrics["graph_improvement"] = {
+            "mae_K": cnn_only_summary["mae_K"] - metrics["cnn_final_temperature"]["mae_K"],
+            "rmse_K": cnn_only_summary["rmse_K"] - metrics["cnn_final_temperature"]["rmse_K"],
+            "graph_correction_scale": float(graph_correction_scale),
+        }
     graph_summary = graph_correction_acc.compute()
     if graph_summary:
         metrics["graph_correction_abs_mean"] = graph_summary
+        metrics["graph_correction_abs_max"] = graph_correction_max_acc.compute()
+        metrics["graph_correction_rms"] = graph_correction_rms_acc.compute()
+        metrics["graph_correction_spatial_std"] = graph_correction_std_acc.compute()
+        metrics["cnn_centered_field_abs_mean"] = cnn_centered_abs_acc.compute()
+        metrics["final_centered_field_abs_mean"] = final_centered_abs_acc.compute()
+        denominator = max(float(metrics["cnn_centered_field_abs_mean"]["mean"]), 1.0e-8)
+        metrics["graph_to_cnn_ratio"] = float(metrics["graph_correction_abs_mean"]["mean"] / denominator)
+        write_graph_contribution_rows(out_dir / "graph_contribution_by_sample.csv", graph_rows)
     gate_summary = gate_acc.compute()
     if gate_summary:
         metrics["physics_gate"] = gate_summary
@@ -388,6 +479,9 @@ def evaluate(
         }
         for case_id, accs in sorted(by_case.items())
     }
+    if graph_summary:
+        write_graph_contribution_by_case(out_dir / "graph_contribution_by_case.csv", case_payload)
+        write_graph_contribution_summary(out_dir / "graph_contribution_summary.json", metrics, case_payload)
     hotspot_runtime_s = float(sum(hotspot_runtimes) / len(hotspot_runtimes)) if hotspot_runtimes else None
     physics_runtime_s = float(sum(physics_runtimes) / len(physics_runtimes)) if physics_runtimes else None
     return metrics, case_payload, inference_runtime_s, hotspot_runtime_s, physics_runtime_s, gate_runtime_s
@@ -397,6 +491,103 @@ def reconstruct_decomposed_temperature(outputs: dict[str, torch.Tensor], ambient
     centered = outputs["centered_field"]
     centered = centered - centered.mean(dim=(-2, -1), keepdim=True)
     return ambient[:, None, None] + outputs["mean_rise"][:, None, None] + centered
+
+
+@torch.no_grad()
+def profile_components(
+    model: nn.Module,
+    loader: DataLoader[dict[str, Any]],
+    stats: NormalizationStats,
+    device: torch.device,
+    *,
+    conditioned: bool,
+    physics_input_mode: str,
+    graph_stats: Any | None,
+    graph_correction_scale: float,
+    warmup_batches: int = 2,
+    profile_batches: int = 20,
+) -> dict[str, Any]:
+    if not hasattr(model, "forward_profile"):
+        return {"error": "checkpoint model does not expose forward_profile"}
+    timing_values: dict[str, list[float]] = defaultdict(list)
+    nodes_per_sample: list[float] = []
+    edges_per_sample: list[float] = []
+    max_nodes = 0
+    max_edges = 0
+
+    def sync() -> None:
+        synchronize(device)
+
+    measured = 0
+    for batch_index, batch in enumerate(loader):
+        sync()
+        prep_start = time.perf_counter()
+        x = batch["x"].to(device, non_blocking=True)
+        physics = batch["physics"].to(device, non_blocking=True)
+        metadata_input = build_metadata_input(batch.get("metadata_vector"), stats)
+        if metadata_input is None and conditioned:
+            raise ValueError("conditioned graph model requires metadata")
+        if metadata_input is not None:
+            metadata_input = metadata_input.to(device, non_blocking=True)
+        graph_batch = prepare_graph_batch(batch, True, graph_stats, device)
+        model_input = build_model_input(x, physics, stats, physics_input_mode=physics_input_mode)
+        sync()
+        prep_time = time.perf_counter() - prep_start
+        graph = graph_batch or {}
+        num_graphs = int(graph["num_graphs"].item())
+        node_counts = torch.bincount(graph["node_batch"].detach().cpu(), minlength=num_graphs).numpy()
+        edge_count = int(graph["edge_features"].shape[0])
+        nodes_per_sample.extend(float(value) for value in node_counts.tolist())
+        edges_per_sample.append(edge_count / max(num_graphs, 1))
+        max_nodes = max(max_nodes, int(node_counts.max()) if len(node_counts) else 0)
+        max_edges = max(max_edges, edge_count)
+
+        sync()
+        forward_start = time.perf_counter()
+        _outputs, component_times = model.forward_profile(
+            model_input,
+            metadata_input,
+            graph_batch,
+            synchronize=sync,
+            graph_correction_scale=graph_correction_scale,
+        )
+        sync()
+        total_time = time.perf_counter() - forward_start
+        if batch_index >= warmup_batches:
+            timing_values["batch_preparation_s"].append(prep_time)
+            timing_values["total_forward_s"].append(total_time)
+            for key, value in component_times.items():
+                timing_values[key].append(float(value))
+            measured += 1
+        if measured >= profile_batches:
+            break
+    return {
+        "warmup_batches": warmup_batches,
+        "profiled_batches": measured,
+        "timings": {key: summarize_times(values) for key, values in sorted(timing_values.items())},
+        "graph_size": {
+            "average_nodes_per_sample": float(np.mean(nodes_per_sample)) if nodes_per_sample else None,
+            "average_directed_edges_per_sample": float(np.mean(edges_per_sample)) if edges_per_sample else None,
+            "maximum_nodes_per_sample": max_nodes,
+            "maximum_directed_edges_per_batch": max_edges,
+        },
+        "rasterizer_audit": {
+            "status": "partially vectorized, Python-loop dominated over graphs and chiplet nodes; no Python loop over individual grid cells.",
+            "gradient_path": "node_raster_head outputs are multiplied by differentiable halo weights, then consumed by convolutional fusion.",
+            "optimization_opportunity": "Vectorizing rasterization across nodes/graphs or caching static halo weights should reduce graph overhead substantially.",
+        },
+    }
+
+
+def summarize_times(values: list[float]) -> dict[str, float]:
+    if not values:
+        return {}
+    array = np.asarray(values, dtype=np.float64)
+    return {
+        "mean_s": float(array.mean()),
+        "median_s": float(np.median(array)),
+        "p95_s": float(np.percentile(array, 95)),
+    }
 
 
 def prepare_graph_batch(
@@ -422,9 +613,16 @@ def call_model(
     *,
     conditioned: bool,
     graph_enabled: bool,
+    graph_correction_scale: float = 1.0,
 ) -> Any:
     if graph_enabled:
-        return model(model_input, metadata_input, graph_batch)
+        return model(
+            model_input,
+            metadata_input,
+            graph_batch,
+            return_diagnostics=True,
+            graph_correction_scale=graph_correction_scale,
+        )
     if conditioned:
         return model(model_input, metadata_input)
     return model(model_input)
@@ -476,6 +674,112 @@ def append_gate_rows(
         if mean_rise_cpu is not None and mean_target_cpu is not None:
             row["mean_rise_abs_error_K"] = float(abs(mean_rise_cpu[index].item() - mean_target_cpu[index].item()))
         rows.append(row)
+
+
+def append_graph_rows(
+    rows: list[dict[str, Any]],
+    batch: dict[str, Any],
+    sample_uids: list[Any],
+    case_ids: list[Any],
+    cnn_only_temperature: torch.Tensor,
+    fused_temperature: torch.Tensor,
+    temperature: torch.Tensor,
+    graph_correction: torch.Tensor,
+) -> None:
+    cnn_cpu = cnn_only_temperature.detach().float().cpu()
+    fused_cpu = fused_temperature.detach().float().cpu()
+    temp_cpu = temperature.detach().float().cpu()
+    graph_cpu = graph_correction.detach().float().cpu()
+    metadata = batch["metadata"]
+    feature_map = metadata.get("metadata_features", {}) if isinstance(metadata, dict) else {}
+    batch_size = int(cnn_cpu.shape[0])
+    chiplet_counts = metadata_values(metadata, "num_chiplets", batch_size)
+    for index in range(batch_size):
+        cnn_error = cnn_cpu[index] - temp_cpu[index]
+        fused_error = fused_cpu[index] - temp_cpu[index]
+        graph_item = graph_cpu[index]
+        cnn_mae = float(cnn_error.abs().mean().item())
+        fused_mae = float(fused_error.abs().mean().item())
+        rows.append(
+            {
+                "sample_uid": str(sample_uids[index]),
+                "case_id": str(case_ids[index]),
+                "cnn_only_mae_K": cnn_mae,
+                "fused_mae_K": fused_mae,
+                "mae_improvement_K": cnn_mae - fused_mae,
+                "graph_correction_abs_mean_K": float(graph_item.abs().mean().item()),
+                "graph_correction_abs_max_K": float(graph_item.abs().max().item()),
+                "graph_correction_rms_K": float(torch.sqrt(torch.mean(graph_item * graph_item)).item()),
+                "chiplet_count": chiplet_counts[index] if index < len(chiplet_counts) else "",
+                "occupied_fraction": metadata_feature_value(feature_map, "occupied_fraction", index),
+                "whitespace_fraction": metadata_feature_value(feature_map, "whitespace_fraction", index),
+                "total_power_W": metadata_feature_value(feature_map, "total_power_W", index),
+                "minimum_pairwise_chiplet_distance_mm": metadata_feature_value(feature_map, "minimum_pairwise_chiplet_distance_mm", index),
+            }
+        )
+
+
+def write_graph_contribution_rows(path: Path, rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    columns = list(rows[0].keys())
+    with path.open("w", encoding="utf-8", newline="") as fp:
+        writer = csv.DictWriter(fp, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_graph_contribution_by_case(path: Path, case_payload: dict[str, dict[str, dict[str, float]]]) -> None:
+    columns = [
+        "case_id",
+        "cnn_only_mae_K",
+        "cnn_only_rmse_K",
+        "fused_mae_K",
+        "fused_rmse_K",
+        "mae_improvement_K",
+        "rmse_improvement_K",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as fp:
+        writer = csv.DictWriter(fp, fieldnames=columns)
+        writer.writeheader()
+        for case_id, metrics in sorted(case_payload.items()):
+            cnn_only = metrics.get("cnn_only_final_temperature", {})
+            fused = metrics.get("cnn_final_temperature", {})
+            if not cnn_only or not fused:
+                continue
+            writer.writerow(
+                {
+                    "case_id": case_id,
+                    "cnn_only_mae_K": cnn_only["mae_K"],
+                    "cnn_only_rmse_K": cnn_only["rmse_K"],
+                    "fused_mae_K": fused["mae_K"],
+                    "fused_rmse_K": fused["rmse_K"],
+                    "mae_improvement_K": cnn_only["mae_K"] - fused["mae_K"],
+                    "rmse_improvement_K": cnn_only["rmse_K"] - fused["rmse_K"],
+                }
+            )
+
+
+def write_graph_contribution_summary(
+    path: Path,
+    metrics: dict[str, Any],
+    case_payload: dict[str, dict[str, dict[str, float]]],
+) -> None:
+    case02 = case_payload.get("case02", {})
+    payload = {
+        "overall": metrics.get("graph_improvement"),
+        "graph_correction_abs_mean": metrics.get("graph_correction_abs_mean"),
+        "graph_correction_abs_max": metrics.get("graph_correction_abs_max"),
+        "graph_correction_rms": metrics.get("graph_correction_rms"),
+        "graph_correction_spatial_std": metrics.get("graph_correction_spatial_std"),
+        "graph_to_cnn_ratio": metrics.get("graph_to_cnn_ratio"),
+        "case02": {
+            "cnn_only": case02.get("cnn_only_final_temperature"),
+            "fused": case02.get("cnn_final_temperature"),
+        },
+        "notes": "Positive MAE improvement means fused CNN-GNN is better than CNN-only within the same checkpoint.",
+    }
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def metadata_feature_value(feature_map: Any, name: str, index: int) -> float | str:
@@ -690,6 +994,9 @@ def write_case_metrics(path: Path, case_metrics: dict[str, dict[str, dict[str, f
         "physics_rmse_K",
         "cnn_final_mae_K",
         "cnn_final_rmse_K",
+        "cnn_only_final_mae_K",
+        "cnn_only_final_rmse_K",
+        "graph_delta_mae_K",
         "cnn_final_max_abs_error_K",
         "cnn_final_mean_signed_error_K",
         "cnn_hotspot_temp_error_K",
@@ -705,6 +1012,7 @@ def write_case_metrics(path: Path, case_metrics: dict[str, dict[str, dict[str, f
         for case_id, metrics in sorted(case_metrics.items()):
             physics = metrics["physics_baseline"]
             final = metrics["cnn_final_temperature"]
+            cnn_only = metrics.get("cnn_only_final_temperature", {})
             coarse = metrics.get("coarse_final_temperature", {})
             writer.writerow(
                 {
@@ -713,6 +1021,9 @@ def write_case_metrics(path: Path, case_metrics: dict[str, dict[str, dict[str, f
                     "physics_rmse_K": physics["rmse_K"],
                     "cnn_final_mae_K": final["mae_K"],
                     "cnn_final_rmse_K": final["rmse_K"],
+                    "cnn_only_final_mae_K": cnn_only.get("mae_K", ""),
+                    "cnn_only_final_rmse_K": cnn_only.get("rmse_K", ""),
+                    "graph_delta_mae_K": (cnn_only.get("mae_K", 0.0) - final["mae_K"]) if cnn_only else "",
                     "cnn_final_max_abs_error_K": final["max_abs_error_K"],
                     "cnn_final_mean_signed_error_K": final["mean_signed_error_K"],
                     "cnn_hotspot_temp_error_K": final["hotspot_temp_error_K"],

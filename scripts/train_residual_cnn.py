@@ -379,6 +379,7 @@ def main() -> int:
             f"train_final_mae={format_optional_mae(train_final_mae_K)} "
             f"val_mae={val_final_mae:.3f}K val_rmse={val_metrics['final_temperature']['rmse_K']:.3f}K "
             f"gate={format_gate_summary(val_metrics.get('physics_gate'))} "
+            f"{format_graph_epoch_summary(val_metrics, val_by_case)} "
             f"{'best' if is_best else ''}"
         )
 
@@ -594,6 +595,26 @@ def format_gate_summary(summary: dict[str, float] | None) -> str:
     return f"{summary['mean']:.3f}/{summary['std']:.3f}"
 
 
+def format_graph_epoch_summary(metrics: dict[str, Any], by_case: dict[str, dict[str, dict[str, float]]]) -> str:
+    if "graph_correction_abs_mean" not in metrics:
+        return "graph=n/a"
+    graph_abs = metrics["graph_correction_abs_mean"]["mean"]
+    graph_ratio = metrics.get("graph_to_cnn_ratio", float("nan"))
+    cnn_only = metrics.get("cnn_only_final_temperature", {}).get("mae_K")
+    fused = metrics.get("final_temperature", {}).get("mae_K")
+    case02 = by_case.get("case02", {})
+    case02_cnn = case02.get("cnn_only_final_temperature", {}).get("mae_K")
+    case02_fused = case02.get("final_temperature", {}).get("mae_K")
+    parts = [f"graph_abs={graph_abs:.3f}", f"graph_ratio={graph_ratio:.3f}"]
+    if cnn_only is not None and fused is not None:
+        parts.append(f"cnn_only={cnn_only:.3f}K")
+        parts.append(f"fused={fused:.3f}K")
+        parts.append(f"delta={cnn_only - fused:.3f}K")
+    if case02_cnn is not None and case02_fused is not None:
+        parts.append(f"case02_delta={case02_cnn - case02_fused:.3f}K")
+    return " ".join(parts)
+
+
 @torch.no_grad()
 def evaluate_model(
     model: nn.Module,
@@ -613,12 +634,25 @@ def evaluate_model(
     model.eval()
     residual_acc = MetricAccumulator()
     final_acc = MetricAccumulator()
+    cnn_only_final_acc = MetricAccumulator()
     centered_acc = MetricAccumulator()
+    cnn_only_centered_acc = MetricAccumulator()
     mean_acc = ScalarMetricAccumulator()
     mean_bias_removed_acc = MetricAccumulator()
     gate_acc = ScalarSummaryAccumulator()
     graph_correction_acc = ScalarSummaryAccumulator()
-    by_case: dict[str, dict[str, MetricAccumulator]] = defaultdict(lambda: {"residual": MetricAccumulator(), "final_temperature": MetricAccumulator()})
+    graph_correction_max_acc = ScalarSummaryAccumulator()
+    graph_correction_rms_acc = ScalarSummaryAccumulator()
+    graph_correction_std_acc = ScalarSummaryAccumulator()
+    cnn_centered_abs_acc = ScalarSummaryAccumulator()
+    final_centered_abs_acc = ScalarSummaryAccumulator()
+    by_case: dict[str, dict[str, MetricAccumulator]] = defaultdict(
+        lambda: {
+            "residual": MetricAccumulator(),
+            "final_temperature": MetricAccumulator(),
+            "cnn_only_final_temperature": MetricAccumulator(),
+        }
+    )
     total_loss = 0.0
     total_samples = 0
 
@@ -651,7 +685,18 @@ def evaluate_model(
                 gate_acc.update(alpha)
             graph_correction = outputs.get("graph_correction_field")
             if graph_correction is not None:
-                graph_correction_acc.update(graph_correction.abs().mean(dim=(-2, -1)))
+                graph_abs = graph_correction.abs()
+                graph_correction_acc.update(graph_abs.mean(dim=(-2, -1)))
+                graph_correction_max_acc.update(graph_abs.amax(dim=(-2, -1)))
+                graph_correction_rms_acc.update(torch.sqrt(torch.mean(graph_correction * graph_correction, dim=(-2, -1))))
+                graph_correction_std_acc.update(graph_correction.std(dim=(-2, -1)))
+                cnn_centered = outputs["cnn_centered_field"]
+                cnn_centered_abs_acc.update(cnn_centered.abs().mean(dim=(-2, -1)))
+                final_centered_abs_acc.update(outputs["centered_field"].abs().mean(dim=(-2, -1)))
+                cnn_only_temperature = ambient[:, None, None] + outputs["mean_rise"][:, None, None] + cnn_centered
+                cnn_only_centered = cnn_only_temperature - cnn_only_temperature.mean(dim=(-2, -1), keepdim=True)
+                cnn_only_final_acc.update(cnn_only_temperature, temperature)
+                cnn_only_centered_acc.update(cnn_only_centered, centered_target)
         else:
             target_norm = normalize_residual(residual, stats).unsqueeze(1)
             pred_norm = model(model_input, metadata_input) if conditioned else model(model_input)
@@ -668,6 +713,13 @@ def evaluate_model(
         for index, case_id in enumerate(case_ids):
             by_case[str(case_id)]["residual"].update(pred_residual[index : index + 1], residual[index : index + 1])
             by_case[str(case_id)]["final_temperature"].update(pred_temperature[index : index + 1], temperature[index : index + 1])
+            if decomposed and "cnn_only_temperature" in locals():
+                by_case[str(case_id)]["cnn_only_final_temperature"].update(
+                    cnn_only_temperature[index : index + 1],
+                    temperature[index : index + 1],
+                )
+        if "cnn_only_temperature" in locals():
+            del cnn_only_temperature
 
     metrics = {
         "normalized_residual_loss": total_loss / max(total_samples, 1),
@@ -678,9 +730,21 @@ def evaluate_model(
         metrics["mean_rise"] = mean_acc.compute()
         metrics["centered_field"] = centered_acc.compute()
         metrics["mean_bias_removed"] = mean_bias_removed_acc.compute()
+    cnn_only_summary = cnn_only_final_acc.compute()
+    if cnn_only_summary:
+        metrics["cnn_only_final_temperature"] = cnn_only_summary
+        metrics["cnn_only_centered_field"] = cnn_only_centered_acc.compute()
+        metrics["graph_delta_val_mae_K"] = cnn_only_summary["mae_K"] - metrics["final_temperature"]["mae_K"]
     graph_summary = graph_correction_acc.compute()
     if graph_summary:
         metrics["graph_correction_abs_mean"] = graph_summary
+        metrics["graph_correction_abs_max"] = graph_correction_max_acc.compute()
+        metrics["graph_correction_rms"] = graph_correction_rms_acc.compute()
+        metrics["graph_correction_spatial_std"] = graph_correction_std_acc.compute()
+        metrics["cnn_centered_field_abs_mean"] = cnn_centered_abs_acc.compute()
+        metrics["final_centered_field_abs_mean"] = final_centered_abs_acc.compute()
+        denominator = max(float(metrics["cnn_centered_field_abs_mean"]["mean"]), 1.0e-8)
+        metrics["graph_to_cnn_ratio"] = float(metrics["graph_correction_abs_mean"]["mean"] / denominator)
     gate_summary = gate_acc.compute()
     if gate_summary:
         metrics["physics_gate"] = gate_summary
@@ -688,9 +752,17 @@ def evaluate_model(
         case_id: {
             "residual": accs["residual"].compute(),
             "final_temperature": accs["final_temperature"].compute(),
+            "cnn_only_final_temperature": accs["cnn_only_final_temperature"].compute(),
         }
         for case_id, accs in sorted(by_case.items())
     }
+    if "case02" in case_metrics and case_metrics["case02"].get("cnn_only_final_temperature"):
+        cnn_only_case02 = case_metrics["case02"]["cnn_only_final_temperature"]
+        fused_case02 = case_metrics["case02"]["final_temperature"]
+        if cnn_only_case02 and fused_case02:
+            metrics["case02_cnn_only_mae_K"] = cnn_only_case02["mae_K"]
+            metrics["case02_fused_mae_K"] = fused_case02["mae_K"]
+            metrics["case02_graph_delta_mae_K"] = cnn_only_case02["mae_K"] - fused_case02["mae_K"]
     return metrics, case_metrics
 
 
@@ -950,6 +1022,12 @@ def init_train_log(path: Path) -> None:
                 "val_residual_rmse_K",
                 "val_final_mae_K",
                 "val_final_rmse_K",
+                "val_cnn_only_mae_K",
+                "val_cnn_only_rmse_K",
+                "val_graph_improvement_K",
+                "val_case02_fused_mae_K",
+                "val_case02_cnn_only_mae_K",
+                "val_case02_graph_improvement_K",
                 "val_hotspot_temp_error_K",
                 "val_hotspot_location_error_cells",
                 "val_gate_alpha_mean",
@@ -957,6 +1035,10 @@ def init_train_log(path: Path) -> None:
                 "val_gate_alpha_min",
                 "val_gate_alpha_max",
                 "val_graph_correction_abs_mean",
+                "val_graph_correction_abs_max",
+                "val_graph_correction_rms",
+                "val_graph_correction_spatial_std",
+                "val_graph_to_cnn_ratio",
                 "epoch_runtime_s",
                 "is_best",
             ]
@@ -998,6 +1080,12 @@ def append_train_log(
                 val_metrics["residual"]["rmse_K"],
                 val_metrics["final_temperature"]["mae_K"],
                 val_metrics["final_temperature"]["rmse_K"],
+                val_metrics.get("cnn_only_final_temperature", {}).get("mae_K", ""),
+                val_metrics.get("cnn_only_final_temperature", {}).get("rmse_K", ""),
+                val_metrics.get("graph_delta_val_mae_K", ""),
+                val_metrics.get("case02_fused_mae_K", ""),
+                val_metrics.get("case02_cnn_only_mae_K", ""),
+                val_metrics.get("case02_graph_delta_mae_K", ""),
                 val_metrics["final_temperature"]["hotspot_temp_error_K"],
                 val_metrics["final_temperature"]["hotspot_location_error_cells"],
                 val_metrics.get("physics_gate", {}).get("mean", ""),
@@ -1005,6 +1093,10 @@ def append_train_log(
                 val_metrics.get("physics_gate", {}).get("min", ""),
                 val_metrics.get("physics_gate", {}).get("max", ""),
                 val_metrics.get("graph_correction_abs_mean", {}).get("mean", ""),
+                val_metrics.get("graph_correction_abs_max", {}).get("mean", ""),
+                val_metrics.get("graph_correction_rms", {}).get("mean", ""),
+                val_metrics.get("graph_correction_spatial_std", {}).get("mean", ""),
+                val_metrics.get("graph_to_cnn_ratio", ""),
                 epoch_runtime_s,
                 int(is_best),
             ]
@@ -1059,6 +1151,9 @@ def write_case_metrics(path: Path, case_metrics: dict[str, dict[str, dict[str, f
         "residual_rmse_K",
         "final_temperature_mae_K",
         "final_temperature_rmse_K",
+        "cnn_only_final_temperature_mae_K",
+        "cnn_only_final_temperature_rmse_K",
+        "graph_delta_mae_K",
         "final_temperature_max_abs_error_K",
         "final_temperature_mean_signed_error_K",
         "hotspot_temp_error_K",
@@ -1070,6 +1165,7 @@ def write_case_metrics(path: Path, case_metrics: dict[str, dict[str, dict[str, f
         for case_id, metrics in sorted(case_metrics.items()):
             final = metrics["final_temperature"]
             residual = metrics["residual"]
+            cnn_only = metrics.get("cnn_only_final_temperature", {})
             writer.writerow(
                 {
                     "case_id": case_id,
@@ -1077,6 +1173,9 @@ def write_case_metrics(path: Path, case_metrics: dict[str, dict[str, dict[str, f
                     "residual_rmse_K": residual["rmse_K"],
                     "final_temperature_mae_K": final["mae_K"],
                     "final_temperature_rmse_K": final["rmse_K"],
+                    "cnn_only_final_temperature_mae_K": cnn_only.get("mae_K", ""),
+                    "cnn_only_final_temperature_rmse_K": cnn_only.get("rmse_K", ""),
+                    "graph_delta_mae_K": (cnn_only.get("mae_K", 0.0) - final["mae_K"]) if cnn_only else "",
                     "final_temperature_max_abs_error_K": final["max_abs_error_K"],
                     "final_temperature_mean_signed_error_K": final["mean_signed_error_K"],
                     "hotspot_temp_error_K": final["hotspot_temp_error_K"],

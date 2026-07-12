@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import time
 
 import torch
 from torch import nn
@@ -670,11 +671,15 @@ class DecomposedMiniUNetWithGraph(nn.Module):
         x: torch.Tensor,
         metadata: torch.Tensor | None = None,
         graph: dict[str, torch.Tensor] | None = None,
+        *,
+        return_diagnostics: bool = False,
+        graph_correction_scale: float = 1.0,
+        ambient: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         if graph is None:
             raise ValueError("graph architecture requires graph batch")
         cnn_outputs = self.cnn_model(x, metadata)
-        graph_outputs = self.graph_model(graph)
+        graph_outputs = self.graph_model(graph, return_diagnostics=return_diagnostics)
         graph_maps = rasterize_node_values(
             graph_outputs["node_raster_values"],
             graph,
@@ -685,17 +690,29 @@ class DecomposedMiniUNetWithGraph(nn.Module):
         cnn_centered = cnn_outputs["centered_field"]
         correction = self.fusion_head(torch.cat([cnn_centered.unsqueeze(1), graph_maps], dim=1)).squeeze(1)
         correction = correction - correction.mean(dim=(-2, -1), keepdim=True)
-        centered = cnn_centered + correction
+        scaled_correction = correction * float(graph_correction_scale)
+        centered_before_projection = cnn_centered + scaled_correction
+        centered = centered_before_projection
         centered = centered - centered.mean(dim=(-2, -1), keepdim=True)
         mean_delta = self.graph_mean_head(graph_outputs["graph_embedding"]).squeeze(1)
         outputs = dict(cnn_outputs)
         outputs["cnn_centered_field"] = cnn_centered
         outputs["graph_correction_field"] = correction
+        outputs["scaled_graph_correction_field"] = scaled_correction
+        outputs["centered_before_zero_mean"] = centered_before_projection
         outputs["graph_correction_abs_mean"] = correction.abs().mean(dim=(-2, -1))
         outputs["graph_correction_abs_max"] = correction.abs().amax(dim=(-2, -1))
         outputs["graph_mean_delta"] = mean_delta
         outputs["mean_rise"] = cnn_outputs["mean_rise"] + mean_delta
         outputs["centered_field"] = centered
+        if return_diagnostics:
+            outputs["final_centered_field"] = centered
+            outputs["graph_raster_features"] = graph_maps
+            outputs["node_embeddings"] = graph_outputs["node_embeddings"]
+            outputs["global_graph_embedding"] = graph_outputs["graph_embedding"]
+            if ambient is not None:
+                outputs["final_temperature"] = ambient[:, None, None] + outputs["mean_rise"][:, None, None] + centered
+                outputs["cnn_only_temperature"] = ambient[:, None, None] + outputs["mean_rise"][:, None, None] + cnn_centered
         return outputs
 
     def forward(
@@ -703,8 +720,73 @@ class DecomposedMiniUNetWithGraph(nn.Module):
         x: torch.Tensor,
         metadata: torch.Tensor | None = None,
         graph: dict[str, torch.Tensor] | None = None,
+        *,
+        return_diagnostics: bool = False,
+        graph_correction_scale: float = 1.0,
+        ambient: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        return self.forward_components(x, metadata, graph)
+        return self.forward_components(
+            x,
+            metadata,
+            graph,
+            return_diagnostics=return_diagnostics,
+            graph_correction_scale=graph_correction_scale,
+            ambient=ambient,
+        )
+
+    def forward_profile(
+        self,
+        x: torch.Tensor,
+        metadata: torch.Tensor,
+        graph: dict[str, torch.Tensor],
+        *,
+        synchronize: object | None = None,
+        graph_correction_scale: float = 1.0,
+    ) -> tuple[dict[str, torch.Tensor], dict[str, float]]:
+        timings: dict[str, float] = {}
+
+        def tic() -> float:
+            if synchronize is not None:
+                synchronize()
+            return time.perf_counter()
+
+        def toc(name: str, start: float) -> None:
+            if synchronize is not None:
+                synchronize()
+            timings[name] = timings.get(name, 0.0) + time.perf_counter() - start
+
+        start = tic()
+        cnn_outputs = self.cnn_model(x, metadata)
+        toc("cnn_branch_s", start)
+        graph_outputs, graph_timings = self.graph_model.forward_profile(graph, synchronize=synchronize)
+        timings.update(graph_timings)
+        start = tic()
+        graph_maps = rasterize_node_values(
+            graph_outputs["node_raster_values"],
+            graph,
+            height=int(x.shape[-2]),
+            width=int(x.shape[-1]),
+            halo_decay_mm=self.graph_halo_decay_mm,
+        )
+        toc("graph_rasterization_s", start)
+        start = tic()
+        cnn_centered = cnn_outputs["centered_field"]
+        correction = self.fusion_head(torch.cat([cnn_centered.unsqueeze(1), graph_maps], dim=1)).squeeze(1)
+        correction = correction - correction.mean(dim=(-2, -1), keepdim=True)
+        centered = cnn_centered + correction * float(graph_correction_scale)
+        centered = centered - centered.mean(dim=(-2, -1), keepdim=True)
+        mean_delta = self.graph_mean_head(graph_outputs["graph_embedding"]).squeeze(1)
+        outputs = dict(cnn_outputs)
+        outputs["cnn_centered_field"] = cnn_centered
+        outputs["graph_correction_field"] = correction
+        outputs["scaled_graph_correction_field"] = correction * float(graph_correction_scale)
+        outputs["centered_field"] = centered
+        outputs["mean_rise"] = cnn_outputs["mean_rise"] + mean_delta
+        outputs["graph_raster_features"] = graph_maps
+        outputs["node_embeddings"] = graph_outputs["node_embeddings"]
+        outputs["global_graph_embedding"] = graph_outputs["graph_embedding"]
+        toc("fusion_head_s", start)
+        return outputs, timings
 
     def config(self) -> dict[str, object]:
         graph_parameters = count_parameters(self.graph_model)

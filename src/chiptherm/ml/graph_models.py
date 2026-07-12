@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import time
 from typing import Any
 
 import torch
@@ -228,7 +229,7 @@ class ChipletMessagePassingGNN(nn.Module):
         self.node_raster_head = nn.Linear(hidden_dim, raster_channels)
         self.global_head = MLP(hidden_dim, hidden_dim, hidden_dim, layers=2)
 
-    def forward(self, graph: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    def forward(self, graph: dict[str, torch.Tensor], *, return_diagnostics: bool = False) -> dict[str, torch.Tensor]:
         node_features = graph["node_features"].float()
         edge_features = graph["edge_features"].float()
         edge_index = graph["edge_index"].long()
@@ -261,11 +262,76 @@ class ChipletMessagePassingGNN(nn.Module):
         graph_counts = torch.zeros(num_graphs, dtype=h.dtype, device=h.device)
         graph_counts.index_add_(0, node_batch, torch.ones(h.shape[0], dtype=h.dtype, device=h.device))
         graph_embedding = graph_embedding / graph_counts.clamp_min(1.0).unsqueeze(1)
-        return {
+        result = {
             "node_embeddings": h,
             "node_raster_values": self.node_raster_head(h),
             "graph_embedding": self.global_head(graph_embedding),
         }
+        if return_diagnostics:
+            result["encoded_edges"] = edge_h
+        return result
+
+    def forward_profile(self, graph: dict[str, torch.Tensor], synchronize: Any | None = None) -> tuple[dict[str, torch.Tensor], dict[str, float]]:
+        timings: dict[str, float] = {}
+
+        def tic() -> float:
+            if synchronize is not None:
+                synchronize()
+            return time.perf_counter()
+
+        def toc(name: str, start: float) -> None:
+            if synchronize is not None:
+                synchronize()
+            timings[name] = timings.get(name, 0.0) + time.perf_counter() - start
+
+        node_features = graph["node_features"].float()
+        edge_features = graph["edge_features"].float()
+        edge_index = graph["edge_index"].long()
+        node_batch = graph["node_batch"].long()
+        num_graphs = int(graph["num_graphs"].item()) if torch.is_tensor(graph["num_graphs"]) else int(graph["num_graphs"])
+        start = tic()
+        h = self.node_encoder(node_features)
+        toc("node_edge_encoding_s", start)
+        start = tic()
+        edge_h = self.edge_encoder(edge_features)
+        toc("node_edge_encoding_s", start)
+        if edge_index.numel() > 0:
+            src = edge_index[0]
+            dst = edge_index[1]
+        else:
+            src = torch.empty(0, dtype=torch.long, device=h.device)
+            dst = torch.empty(0, dtype=torch.long, device=h.device)
+        start = tic()
+        for message_mlp, update_mlp, norm in zip(self.message_mlps, self.update_mlps, self.norms):
+            aggregate = torch.zeros_like(h)
+            if src.numel() > 0:
+                parts = [h[src], h[dst]]
+                if self.use_edge_features:
+                    parts.append(edge_h)
+                messages = message_mlp(torch.cat(parts, dim=1))
+                aggregate.index_add_(0, dst, messages)
+                if self.aggregation == "mean":
+                    degree = torch.zeros(h.shape[0], dtype=h.dtype, device=h.device)
+                    degree.index_add_(0, dst, torch.ones(dst.shape[0], dtype=h.dtype, device=h.device))
+                    aggregate = aggregate / degree.clamp_min(1.0).unsqueeze(1)
+            update = update_mlp(torch.cat([h, aggregate], dim=1))
+            h = norm(h + update)
+        toc("message_passing_s", start)
+        start = tic()
+        graph_embedding = torch.zeros(num_graphs, h.shape[1], dtype=h.dtype, device=h.device)
+        graph_embedding.index_add_(0, node_batch, h)
+        graph_counts = torch.zeros(num_graphs, dtype=h.dtype, device=h.device)
+        graph_counts.index_add_(0, node_batch, torch.ones(h.shape[0], dtype=h.dtype, device=h.device))
+        graph_embedding = graph_embedding / graph_counts.clamp_min(1.0).unsqueeze(1)
+        graph_embedding = self.global_head(graph_embedding)
+        node_raster_values = self.node_raster_head(h)
+        toc("graph_pooling_s", start)
+        return {
+            "node_embeddings": h,
+            "node_raster_values": node_raster_values,
+            "graph_embedding": graph_embedding,
+            "encoded_edges": edge_h,
+        }, timings
 
 
 def rasterize_node_values(
@@ -304,4 +370,3 @@ def rasterize_node_values(
             weight = torch.exp(-distance / decay)
             maps[graph_index] += node_values[node_index, :, None, None] * weight[None, :, :]
     return maps
-
