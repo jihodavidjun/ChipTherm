@@ -6,6 +6,8 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+from .graph_models import ChipletMessagePassingGNN, rasterize_node_values
+
 
 def count_parameters(module: nn.Module) -> int:
     return sum(parameter.numel() for parameter in module.parameters() if parameter.requires_grad)
@@ -564,6 +566,182 @@ class DecomposedMiniUNetWithRefinement(nn.Module):
         }
 
 
+class DecomposedMiniUNetWithGraph(nn.Module):
+    """Conditioned decomposed CNN with a parallel chiplet interaction GNN."""
+
+    def __init__(
+        self,
+        input_channels: int = 34,
+        output_channels: int = 1,
+        base_channels: int = 32,
+        depth: int = 3,
+        refine_channels: int = 32,
+        refine_blocks: int = 4,
+        refinement_channel_indices: tuple[int, ...] | list[int] = (),
+        refinement_channel_names: tuple[str, ...] | list[str] = (),
+        metadata_dim: int = 0,
+        metadata_hidden_dim: int = 64,
+        metadata_embedding_dim: int = 64,
+        physics_input_mode: str = "v1",
+        physics_gate_hidden_dim: int = 32,
+        physics_gate_init: float = 0.9,
+        graph_node_feature_dim: int = 24,
+        graph_edge_feature_dim: int = 15,
+        graph_hidden_dim: int = 96,
+        graph_edge_hidden_dim: int = 64,
+        graph_layers: int = 4,
+        graph_message_aggregation: str = "sum",
+        graph_raster_channels: int = 16,
+        graph_halo_decay_mm: float = 4.0,
+        graph_use_edge_features: bool = True,
+        freeze_cnn: bool = False,
+    ) -> None:
+        super().__init__()
+        self.architecture = "miniunet_refine_conditioned_decomposed_graph"
+        self.input_channels = input_channels
+        self.output_channels = output_channels
+        self.base_channels = base_channels
+        self.depth = depth
+        self.refine_channels = refine_channels
+        self.refine_blocks = refine_blocks
+        self.refinement_channel_indices = tuple(int(index) for index in refinement_channel_indices)
+        self.refinement_channel_names = tuple(str(name) for name in refinement_channel_names)
+        self.metadata_dim = int(metadata_dim)
+        self.metadata_hidden_dim = int(metadata_hidden_dim)
+        self.metadata_embedding_dim = int(metadata_embedding_dim)
+        self.physics_input_mode = str(physics_input_mode)
+        self.graph_node_feature_dim = int(graph_node_feature_dim)
+        self.graph_edge_feature_dim = int(graph_edge_feature_dim)
+        self.graph_hidden_dim = int(graph_hidden_dim)
+        self.graph_edge_hidden_dim = int(graph_edge_hidden_dim)
+        self.graph_layers = int(graph_layers)
+        self.graph_message_aggregation = str(graph_message_aggregation)
+        self.graph_raster_channels = int(graph_raster_channels)
+        self.graph_halo_decay_mm = float(graph_halo_decay_mm)
+        self.graph_use_edge_features = bool(graph_use_edge_features)
+        self.freeze_cnn = bool(freeze_cnn)
+        self.cnn_model = DecomposedMiniUNetWithRefinement(
+            input_channels=input_channels,
+            output_channels=output_channels,
+            base_channels=base_channels,
+            depth=depth,
+            refine_channels=refine_channels,
+            refine_blocks=refine_blocks,
+            refinement_channel_indices=refinement_channel_indices,
+            refinement_channel_names=refinement_channel_names,
+            metadata_dim=metadata_dim,
+            metadata_hidden_dim=metadata_hidden_dim,
+            metadata_embedding_dim=metadata_embedding_dim,
+            conditioned=True,
+            physics_input_mode=physics_input_mode,
+            physics_gate_hidden_dim=physics_gate_hidden_dim,
+            physics_gate_init=physics_gate_init,
+        )
+        self.graph_model = ChipletMessagePassingGNN(
+            node_feature_dim=graph_node_feature_dim,
+            edge_feature_dim=graph_edge_feature_dim,
+            hidden_dim=graph_hidden_dim,
+            edge_hidden_dim=graph_edge_hidden_dim,
+            layers=graph_layers,
+            aggregation=graph_message_aggregation,
+            raster_channels=graph_raster_channels,
+            use_edge_features=graph_use_edge_features,
+        )
+        self.fusion_head = nn.Sequential(
+            nn.Conv2d(graph_raster_channels + 1, refine_channels, kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(refine_channels, refine_channels, kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(refine_channels, 1, kernel_size=3, padding=1),
+        )
+        final_conv = self.fusion_head[-1]
+        if isinstance(final_conv, nn.Conv2d):
+            nn.init.zeros_(final_conv.weight)
+            nn.init.zeros_(final_conv.bias)
+        self.graph_mean_head = nn.Linear(graph_hidden_dim, 1)
+        nn.init.zeros_(self.graph_mean_head.weight)
+        nn.init.zeros_(self.graph_mean_head.bias)
+        if self.freeze_cnn:
+            for parameter in self.cnn_model.parameters():
+                parameter.requires_grad_(False)
+
+    def forward_components(
+        self,
+        x: torch.Tensor,
+        metadata: torch.Tensor | None = None,
+        graph: dict[str, torch.Tensor] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        if graph is None:
+            raise ValueError("graph architecture requires graph batch")
+        cnn_outputs = self.cnn_model(x, metadata)
+        graph_outputs = self.graph_model(graph)
+        graph_maps = rasterize_node_values(
+            graph_outputs["node_raster_values"],
+            graph,
+            height=int(x.shape[-2]),
+            width=int(x.shape[-1]),
+            halo_decay_mm=self.graph_halo_decay_mm,
+        )
+        cnn_centered = cnn_outputs["centered_field"]
+        correction = self.fusion_head(torch.cat([cnn_centered.unsqueeze(1), graph_maps], dim=1)).squeeze(1)
+        correction = correction - correction.mean(dim=(-2, -1), keepdim=True)
+        centered = cnn_centered + correction
+        centered = centered - centered.mean(dim=(-2, -1), keepdim=True)
+        mean_delta = self.graph_mean_head(graph_outputs["graph_embedding"]).squeeze(1)
+        outputs = dict(cnn_outputs)
+        outputs["cnn_centered_field"] = cnn_centered
+        outputs["graph_correction_field"] = correction
+        outputs["graph_correction_abs_mean"] = correction.abs().mean(dim=(-2, -1))
+        outputs["graph_correction_abs_max"] = correction.abs().amax(dim=(-2, -1))
+        outputs["graph_mean_delta"] = mean_delta
+        outputs["mean_rise"] = cnn_outputs["mean_rise"] + mean_delta
+        outputs["centered_field"] = centered
+        return outputs
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        metadata: torch.Tensor | None = None,
+        graph: dict[str, torch.Tensor] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        return self.forward_components(x, metadata, graph)
+
+    def config(self) -> dict[str, object]:
+        graph_parameters = count_parameters(self.graph_model)
+        fusion_parameters = count_parameters(self.fusion_head) + count_parameters(self.graph_mean_head)
+        return {
+            "architecture": self.architecture,
+            "input_channels": self.input_channels,
+            "output_channels": self.output_channels,
+            "base_channels": self.base_channels,
+            "depth": self.depth,
+            "refine_channels": self.refine_channels,
+            "refine_blocks": self.refine_blocks,
+            "refinement_channel_indices": list(self.refinement_channel_indices),
+            "refinement_channel_names": list(self.refinement_channel_names),
+            "metadata_dim": self.metadata_dim,
+            "metadata_hidden_dim": self.metadata_hidden_dim,
+            "metadata_embedding_dim": self.metadata_embedding_dim,
+            "conditioned": True,
+            "physics_input_mode": self.physics_input_mode,
+            "graph_enabled": True,
+            "graph_node_feature_dim": self.graph_node_feature_dim,
+            "graph_edge_feature_dim": self.graph_edge_feature_dim,
+            "graph_hidden_dim": self.graph_hidden_dim,
+            "graph_edge_hidden_dim": self.graph_edge_hidden_dim,
+            "graph_layers": self.graph_layers,
+            "graph_message_aggregation": self.graph_message_aggregation,
+            "graph_raster_channels": self.graph_raster_channels,
+            "graph_halo_decay_mm": self.graph_halo_decay_mm,
+            "graph_use_edge_features": self.graph_use_edge_features,
+            "freeze_cnn": self.freeze_cnn,
+            "cnn_parameter_count": count_parameters(self.cnn_model),
+            "graph_parameter_count": graph_parameters,
+            "fusion_parameter_count": fusion_parameters,
+            "total_parameters": count_parameters(self),
+        }
+
+
 def build_model(config: dict[str, object]) -> nn.Module:
     architecture = str(config.get("architecture") or config.get("name") or "miniunet").lower()
     if architecture == "miniunet":
@@ -615,6 +793,33 @@ def build_model(config: dict[str, object]) -> nn.Module:
             physics_input_mode=str(config.get("physics_input_mode", "v1")),
             physics_gate_hidden_dim=int(config.get("physics_gate_hidden_dim", 32)),
             physics_gate_init=float(config.get("physics_gate_init", 0.9)),
+        )
+    if architecture == "miniunet_refine_conditioned_decomposed_graph":
+        return DecomposedMiniUNetWithGraph(
+            input_channels=int(config.get("input_channels", 34)),
+            output_channels=int(config.get("output_channels", 1)),
+            base_channels=int(config.get("base_channels", 32)),
+            depth=int(config.get("depth", 3)),
+            refine_channels=int(config.get("refine_channels", 32)),
+            refine_blocks=int(config.get("refine_blocks", 4)),
+            refinement_channel_indices=tuple(int(index) for index in config.get("refinement_channel_indices", ())),
+            refinement_channel_names=tuple(str(name) for name in config.get("refinement_channel_names", ())),
+            metadata_dim=int(config.get("metadata_dim", 0)),
+            metadata_hidden_dim=int(config.get("metadata_hidden_dim", 64)),
+            metadata_embedding_dim=int(config.get("metadata_embedding_dim", 64)),
+            physics_input_mode=str(config.get("physics_input_mode", "v1")),
+            physics_gate_hidden_dim=int(config.get("physics_gate_hidden_dim", 32)),
+            physics_gate_init=float(config.get("physics_gate_init", 0.9)),
+            graph_node_feature_dim=int(config.get("graph_node_feature_dim", 24)),
+            graph_edge_feature_dim=int(config.get("graph_edge_feature_dim", 15)),
+            graph_hidden_dim=int(config.get("graph_hidden_dim", 96)),
+            graph_edge_hidden_dim=int(config.get("graph_edge_hidden_dim", 64)),
+            graph_layers=int(config.get("graph_layers", 4)),
+            graph_message_aggregation=str(config.get("graph_message_aggregation", "sum")),
+            graph_raster_channels=int(config.get("graph_raster_channels", 16)),
+            graph_halo_decay_mm=float(config.get("graph_halo_decay_mm", 4.0)),
+            graph_use_edge_features=bool(config.get("graph_use_edge_features", True)),
+            freeze_cnn=bool(config.get("freeze_cnn", False)),
         )
     raise ValueError(f"unsupported model architecture: {architecture}")
 

@@ -23,7 +23,8 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from chiptherm.ml.dataset import ChipThermDataset
+from chiptherm.ml.dataset import ChipThermDataset, chiptherm_collate
+from chiptherm.ml.graph_models import compute_graph_normalization_stats, move_graph_to_device, normalize_graph_batch
 from chiptherm.ml.models import build_model, count_parameters
 from chiptherm.ml.normalization import (
     NormalizationStats,
@@ -55,6 +56,7 @@ def main() -> int:
             "miniunet_refine_conditioned",
             "miniunet_refine_decomposed",
             "miniunet_refine_conditioned_decomposed",
+            "miniunet_refine_conditioned_decomposed_graph",
         ],
     )
     parser.add_argument("--refine-channels", default=32, type=int)
@@ -71,6 +73,16 @@ def main() -> int:
     parser.add_argument("--physics-gate-hidden-dim", default=32, type=int)
     parser.add_argument("--physics-gate-init", default=0.9, type=float)
     parser.add_argument("--physics-gate-regularization", default=0.0, type=float)
+    parser.add_argument("--graph-hidden-dim", default=96, type=int)
+    parser.add_argument("--graph-edge-hidden-dim", default=64, type=int)
+    parser.add_argument("--graph-layers", default=4, type=int)
+    parser.add_argument("--graph-message-aggregation", default="sum", choices=["sum", "mean"])
+    parser.add_argument("--graph-raster-channels", default=16, type=int)
+    parser.add_argument("--graph-halo-decay-mm", default=4.0, type=float)
+    parser.add_argument("--graph-use-edge-features", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--lambda-graph", default=0.0, type=float)
+    parser.add_argument("--freeze-cnn", action="store_true")
+    parser.add_argument("--init-checkpoint", default=None, type=Path, help="Optional checkpoint used to initialize matching model or CNN-submodule weights.")
     parser.add_argument("--lambda-final", default=1.0, type=float)
     parser.add_argument("--lambda-mean", default=0.1, type=float)
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
@@ -99,8 +111,19 @@ def main() -> int:
         raise SystemExit("--physics-gate-init must be in the interval (0, 1)")
     if args.physics_gate_regularization < 0.0:
         raise SystemExit("--physics-gate-regularization must be non-negative")
-    is_conditioned_arch = args.model_architecture in {"miniunet_refine_conditioned", "miniunet_refine_conditioned_decomposed"}
-    is_decomposed_arch = args.model_architecture in {"miniunet_refine_decomposed", "miniunet_refine_conditioned_decomposed"}
+    if args.lambda_graph < 0.0:
+        raise SystemExit("--lambda-graph must be non-negative")
+    is_graph_arch = args.model_architecture == "miniunet_refine_conditioned_decomposed_graph"
+    is_conditioned_arch = args.model_architecture in {
+        "miniunet_refine_conditioned",
+        "miniunet_refine_conditioned_decomposed",
+        "miniunet_refine_conditioned_decomposed_graph",
+    }
+    is_decomposed_arch = args.model_architecture in {
+        "miniunet_refine_decomposed",
+        "miniunet_refine_conditioned_decomposed",
+        "miniunet_refine_conditioned_decomposed_graph",
+    }
     if args.physics_input == "gated_v1" and not is_conditioned_arch:
         raise SystemExit("--physics-input gated_v1 requires a metadata-conditioned architecture")
     if args.metadata_conditioning and not is_conditioned_arch:
@@ -112,15 +135,21 @@ def main() -> int:
     checkpoints_dir = out_dir / "checkpoints"
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
 
-    train_dataset = ChipThermDataset(args.train_index, target="residual", return_metadata=True)
-    val_dataset = ChipThermDataset(args.val_index, target="residual", return_metadata=True)
+    train_dataset = ChipThermDataset(args.train_index, target="residual", return_metadata=True, return_graph=is_graph_arch)
+    val_dataset = ChipThermDataset(args.val_index, target="residual", return_metadata=True, return_graph=is_graph_arch)
     dataset_input_channels = int(train_dataset[0]["x"].shape[0])
     model_input_channels = dataset_input_channels + (1 if args.physics_input in {"v1", "gated_v1"} else 0)
-    train_loader = make_loader(train_dataset, args.batch_size, shuffle=True, num_workers=args.num_workers, device=device)
-    train_eval_loader = make_loader(train_dataset, args.batch_size, shuffle=False, num_workers=args.num_workers, device=device)
-    val_loader = make_loader(val_dataset, args.batch_size, shuffle=False, num_workers=args.num_workers, device=device)
+    train_loader = make_loader(train_dataset, args.batch_size, shuffle=True, num_workers=args.num_workers, device=device, graph_enabled=is_graph_arch)
+    train_eval_loader = make_loader(train_dataset, args.batch_size, shuffle=False, num_workers=args.num_workers, device=device, graph_enabled=is_graph_arch)
+    val_loader = make_loader(val_dataset, args.batch_size, shuffle=False, num_workers=args.num_workers, device=device, graph_enabled=is_graph_arch)
 
-    stats = compute_normalization_stats(train_dataset, batch_size=args.batch_size, num_workers=args.num_workers)
+    stats_dataset = (
+        ChipThermDataset(args.train_index, target="residual", return_metadata=True, return_graph=False)
+        if is_graph_arch
+        else train_dataset
+    )
+    stats = compute_normalization_stats(stats_dataset, batch_size=args.batch_size, num_workers=args.num_workers)
+    graph_stats = compute_graph_normalization_stats(train_dataset) if is_graph_arch else None
     metadata_dim = len(stats.metadata_feature_names)
     if is_conditioned_arch and metadata_dim <= 0:
         raise SystemExit("metadata-conditioned architecture requires metadata_features.csv/metadata_manifest.json")
@@ -160,6 +189,28 @@ def main() -> int:
                 "metadata_embedding_dim": args.metadata_embedding_dim,
             }
         )
+    if is_graph_arch:
+        sample_graph = train_dataset[0].get("graph")
+        if sample_graph is None:
+            raise SystemExit("graph architecture requires graph_path artifacts in the training index")
+        model_config.update(
+            {
+                "graph_enabled": True,
+                "graph_node_feature_dim": int(sample_graph["node_features"].shape[1]),
+                "graph_edge_feature_dim": int(sample_graph["edge_features"].shape[1]),
+                "graph_hidden_dim": args.graph_hidden_dim,
+                "graph_edge_hidden_dim": args.graph_edge_hidden_dim,
+                "graph_layers": args.graph_layers,
+                "graph_message_aggregation": args.graph_message_aggregation,
+                "graph_raster_channels": args.graph_raster_channels,
+                "graph_halo_decay_mm": args.graph_halo_decay_mm,
+                "graph_use_edge_features": args.graph_use_edge_features,
+                "freeze_cnn": args.freeze_cnn,
+                "graph_node_feature_names": list(getattr(train_dataset, "graph_node_feature_names", ()) or []),
+                "graph_edge_feature_names": list(getattr(train_dataset, "graph_edge_feature_names", ()) or []),
+                "graph_normalization": graph_stats.to_dict() if graph_stats is not None else None,
+            }
+        )
 
     config = {
         "schema_version": 1,
@@ -179,6 +230,16 @@ def main() -> int:
         "physics_gate_hidden_dim": args.physics_gate_hidden_dim,
         "physics_gate_init": args.physics_gate_init,
         "physics_gate_regularization": args.physics_gate_regularization,
+        "graph_hidden_dim": args.graph_hidden_dim,
+        "graph_edge_hidden_dim": args.graph_edge_hidden_dim,
+        "graph_layers": args.graph_layers,
+        "graph_message_aggregation": args.graph_message_aggregation,
+        "graph_raster_channels": args.graph_raster_channels,
+        "graph_halo_decay_mm": args.graph_halo_decay_mm,
+        "graph_use_edge_features": args.graph_use_edge_features,
+        "lambda_graph": args.lambda_graph,
+        "freeze_cnn": args.freeze_cnn,
+        "init_checkpoint": str(args.init_checkpoint.resolve()) if args.init_checkpoint else None,
         "refine_channels": args.refine_channels,
         "refine_blocks": args.refine_blocks,
         "device": str(device),
@@ -195,6 +256,7 @@ def main() -> int:
         "lambda_mean": args.lambda_mean,
         "target_decomposition": is_decomposed_arch,
         "metadata_conditioning": is_conditioned_arch,
+        "graph_enabled": is_graph_arch,
         "model": model_config,
         "loss": (
             "SmoothL1Loss on normalized residual plus optional temp_loss_weight * L1(T_pred, HotSpot) / residual_std "
@@ -203,6 +265,7 @@ def main() -> int:
         "target": "residual = HotSpot - PhysicsBaseline",
     }
     model = build_model(model_config).to(device)
+    init_summary = load_initial_checkpoint(model, args.init_checkpoint, device) if args.init_checkpoint else None
     config["model"] = model.config() if hasattr(model, "config") else model_config
     config["model"].update(
         {
@@ -211,6 +274,7 @@ def main() -> int:
             "dataset_input_channels": dataset_input_channels,
             "physics_gate_hidden_dim": args.physics_gate_hidden_dim,
             "physics_gate_init": args.physics_gate_init,
+            "graph_normalization": graph_stats.to_dict() if graph_stats is not None else None,
         }
     )
     (out_dir / "config.json").write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -227,6 +291,8 @@ def main() -> int:
     if args.model_architecture == "miniunet_refine":
         print(f"Refinement channels: {list(refinement_channel_indices)}")
         print(f"Refinement channel names: {', '.join(refinement_channel_names)}")
+    if init_summary:
+        print(f"Initialized from {args.init_checkpoint}: {init_summary}")
     print(f"Trainable parameters: {count_parameters(model)}")
 
     log_path = out_dir / "train_log.csv"
@@ -254,6 +320,9 @@ def main() -> int:
             physics_input_mode=args.physics_input,
             physics_gate_regularization=args.physics_gate_regularization,
             physics_gate_init=args.physics_gate_init,
+            graph_enabled=is_graph_arch,
+            graph_stats=graph_stats,
+            lambda_graph=args.lambda_graph,
         )
         val_metrics, val_by_case = evaluate_model(
             model,
@@ -266,6 +335,8 @@ def main() -> int:
             lambda_final=args.lambda_final,
             lambda_mean=args.lambda_mean,
             physics_input_mode=args.physics_input,
+            graph_enabled=is_graph_arch,
+            graph_stats=graph_stats,
         )
         train_final_mae_K: float | None = None
         if should_compute_train_mae(epoch, args.epochs, args.train_mae_every):
@@ -280,6 +351,8 @@ def main() -> int:
                 lambda_final=args.lambda_final,
                 lambda_mean=args.lambda_mean,
                 physics_input_mode=args.physics_input,
+                graph_enabled=is_graph_arch,
+                graph_stats=graph_stats,
             )
             train_final_mae_K = float(train_metrics["final_temperature"]["mae_K"])
         epoch_runtime_s = time.perf_counter() - epoch_start
@@ -400,6 +473,9 @@ def train_one_epoch(
     physics_input_mode: str,
     physics_gate_regularization: float,
     physics_gate_init: float,
+    graph_enabled: bool = False,
+    graph_stats: Any | None = None,
+    lambda_graph: float = 0.0,
 ) -> dict[str, float]:
     model.train()
     total_loss = 0.0
@@ -409,6 +485,8 @@ def train_one_epoch(
     hotspot_loss_scaled_total = 0.0
     hotspot_loss_K_total = 0.0
     gate_regularization_total = 0.0
+    graph_regularization_total = 0.0
+    graph_correction_total = 0.0
     gate_acc = ScalarSummaryAccumulator()
     total_samples = 0
     for batch in loader:
@@ -420,12 +498,13 @@ def train_one_epoch(
         metadata_input = build_metadata_input(batch.get("metadata_vector"), stats)
         if metadata_input is not None:
             metadata_input = metadata_input.to(device, non_blocking=True)
+        graph_batch = prepare_graph_batch(batch, graph_enabled, graph_stats, device)
         model_input = build_model_input(x, physics, stats, physics_input_mode=physics_input_mode)
         batch_size = int(x.shape[0])
 
         optimizer.zero_grad(set_to_none=True)
         if decomposed:
-            outputs = model(model_input, metadata_input) if conditioned else model(model_input)
+            outputs = call_model(model, model_input, metadata_input, graph_batch, conditioned=conditioned, graph_enabled=graph_enabled)
             pred_temperature = reconstruct_decomposed_temperature(outputs, ambient)
             mean_target = (temperature - ambient[:, None, None]).mean(dim=(-2, -1))
             final_loss = temp_criterion(pred_temperature, temperature)
@@ -443,9 +522,16 @@ def train_one_epoch(
                     gate_reg = torch.mean((alpha - float(physics_gate_init)) ** 2)
                     loss = loss + float(physics_gate_regularization) * gate_reg
                     gate_regularization_total += float(gate_reg.item()) * batch_size
+            graph_correction = outputs.get("graph_correction_field")
+            if graph_correction is not None:
+                graph_mag = torch.mean(torch.abs(graph_correction))
+                graph_correction_total += float(graph_mag.item()) * batch_size
+                if lambda_graph > 0.0:
+                    loss = loss + float(lambda_graph) * graph_mag
+                    graph_regularization_total += float(graph_mag.item()) * batch_size
         else:
             target = normalize_residual(residual, stats).unsqueeze(1)
-            pred = model(model_input, metadata_input) if conditioned else model(model_input)
+            pred = call_model(model, model_input, metadata_input, graph_batch, conditioned=conditioned, graph_enabled=graph_enabled)
             residual_loss = criterion(pred, target)
             if temp_loss_weight > 0.0 or hotspot_loss_weight > 0.0:
                 pred_residual_K = unnormalize_residual(pred.squeeze(1), stats)
@@ -486,6 +572,8 @@ def train_one_epoch(
         "hotspot_loss_scaled": hotspot_loss_scaled_total / denominator,
         "hotspot_loss_K": hotspot_loss_K_total / denominator,
         "gate_regularization": gate_regularization_total / denominator,
+        "graph_regularization": graph_regularization_total / denominator,
+        "graph_correction_abs_mean": graph_correction_total / denominator,
         **gate_acc.prefixed("gate_alpha"),
     }
 
@@ -519,6 +607,8 @@ def evaluate_model(
     lambda_final: float = 1.0,
     lambda_mean: float = 0.1,
     physics_input_mode: str = "v1",
+    graph_enabled: bool = False,
+    graph_stats: Any | None = None,
 ) -> tuple[dict[str, Any], dict[str, dict[str, float]]]:
     model.eval()
     residual_acc = MetricAccumulator()
@@ -527,6 +617,7 @@ def evaluate_model(
     mean_acc = ScalarMetricAccumulator()
     mean_bias_removed_acc = MetricAccumulator()
     gate_acc = ScalarSummaryAccumulator()
+    graph_correction_acc = ScalarSummaryAccumulator()
     by_case: dict[str, dict[str, MetricAccumulator]] = defaultdict(lambda: {"residual": MetricAccumulator(), "final_temperature": MetricAccumulator()})
     total_loss = 0.0
     total_samples = 0
@@ -540,9 +631,10 @@ def evaluate_model(
         metadata_input = build_metadata_input(batch.get("metadata_vector"), stats)
         if metadata_input is not None:
             metadata_input = metadata_input.to(device, non_blocking=True)
+        graph_batch = prepare_graph_batch(batch, graph_enabled, graph_stats, device)
         model_input = build_model_input(x, physics, stats, physics_input_mode=physics_input_mode)
         if decomposed:
-            outputs = model(model_input, metadata_input) if conditioned else model(model_input)
+            outputs = call_model(model, model_input, metadata_input, graph_batch, conditioned=conditioned, graph_enabled=graph_enabled)
             pred_temperature = reconstruct_decomposed_temperature(outputs, ambient)
             pred_residual = pred_temperature - physics
             mean_target = (temperature - ambient[:, None, None]).mean(dim=(-2, -1))
@@ -557,6 +649,9 @@ def evaluate_model(
             alpha = outputs.get("physics_gate_alpha")
             if alpha is not None:
                 gate_acc.update(alpha)
+            graph_correction = outputs.get("graph_correction_field")
+            if graph_correction is not None:
+                graph_correction_acc.update(graph_correction.abs().mean(dim=(-2, -1)))
         else:
             target_norm = normalize_residual(residual, stats).unsqueeze(1)
             pred_norm = model(model_input, metadata_input) if conditioned else model(model_input)
@@ -583,6 +678,9 @@ def evaluate_model(
         metrics["mean_rise"] = mean_acc.compute()
         metrics["centered_field"] = centered_acc.compute()
         metrics["mean_bias_removed"] = mean_bias_removed_acc.compute()
+    graph_summary = graph_correction_acc.compute()
+    if graph_summary:
+        metrics["graph_correction_abs_mean"] = graph_summary
     gate_summary = gate_acc.compute()
     if gate_summary:
         metrics["physics_gate"] = gate_summary
@@ -600,6 +698,37 @@ def reconstruct_decomposed_temperature(outputs: dict[str, torch.Tensor], ambient
     centered = outputs["centered_field"]
     centered = centered - centered.mean(dim=(-2, -1), keepdim=True)
     return ambient[:, None, None] + outputs["mean_rise"][:, None, None] + centered
+
+
+def prepare_graph_batch(
+    batch: dict[str, Any],
+    graph_enabled: bool,
+    graph_stats: Any | None,
+    device: torch.device,
+) -> dict[str, torch.Tensor] | None:
+    if not graph_enabled:
+        return None
+    graph = batch.get("graph")
+    if graph is None:
+        raise ValueError("graph-enabled model requires graph data from the dataset")
+    graph = move_graph_to_device(graph, device)
+    return normalize_graph_batch(graph, graph_stats)
+
+
+def call_model(
+    model: nn.Module,
+    model_input: torch.Tensor,
+    metadata_input: torch.Tensor | None,
+    graph_batch: dict[str, torch.Tensor] | None,
+    *,
+    conditioned: bool,
+    graph_enabled: bool,
+) -> Any:
+    if graph_enabled:
+        return model(model_input, metadata_input, graph_batch)
+    if conditioned:
+        return model(model_input, metadata_input)
+    return model(model_input)
 
 
 def hotspot_l1_loss(pred_temperature: torch.Tensor, temperature: torch.Tensor, top_frac: float) -> torch.Tensor:
@@ -724,6 +853,7 @@ def make_loader(
     shuffle: bool,
     num_workers: int,
     device: torch.device,
+    graph_enabled: bool = False,
 ) -> DataLoader[dict[str, Any]]:
     return DataLoader(
         dataset,
@@ -731,6 +861,7 @@ def make_loader(
         shuffle=shuffle,
         num_workers=num_workers,
         pin_memory=device.type == "cuda",
+        collate_fn=chiptherm_collate if graph_enabled else None,
     )
 
 
@@ -761,6 +892,38 @@ def save_checkpoint(
     )
 
 
+def load_initial_checkpoint(model: nn.Module, checkpoint_path: Path, device: torch.device) -> dict[str, int]:
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+    source_state = checkpoint.get("model_state_dict", checkpoint)
+    target_state = model.state_dict()
+    mapped: dict[str, torch.Tensor] = {}
+    direct_matches = 0
+    cnn_matches = 0
+    skipped = 0
+    for key, value in source_state.items():
+        if key in target_state and tuple(target_state[key].shape) == tuple(value.shape):
+            mapped[key] = value
+            direct_matches += 1
+            continue
+        wrapped_key = f"cnn_model.{key}"
+        if wrapped_key in target_state and tuple(target_state[wrapped_key].shape) == tuple(value.shape):
+            mapped[wrapped_key] = value
+            cnn_matches += 1
+        else:
+            skipped += 1
+    missing, unexpected = model.load_state_dict(mapped, strict=False)
+    return {
+        "direct_tensors_loaded": direct_matches,
+        "cnn_submodule_tensors_loaded": cnn_matches,
+        "source_tensors_skipped": skipped,
+        "missing_after_partial_load": len(missing),
+        "unexpected_after_partial_load": len(unexpected),
+    }
+
+
 def init_train_log(path: Path) -> None:
     with path.open("w", encoding="utf-8", newline="") as fp:
         writer = csv.writer(fp)
@@ -779,6 +942,8 @@ def init_train_log(path: Path) -> None:
                 "train_gate_alpha_std",
                 "train_gate_alpha_min",
                 "train_gate_alpha_max",
+                "train_graph_regularization",
+                "train_graph_correction_abs_mean",
                 "train_final_temperature_mae_K",
                 "val_loss",
                 "val_residual_mae_K",
@@ -791,6 +956,7 @@ def init_train_log(path: Path) -> None:
                 "val_gate_alpha_std",
                 "val_gate_alpha_min",
                 "val_gate_alpha_max",
+                "val_graph_correction_abs_mean",
                 "epoch_runtime_s",
                 "is_best",
             ]
@@ -824,6 +990,8 @@ def append_train_log(
                 train_losses.get("gate_alpha_std", ""),
                 train_losses.get("gate_alpha_min", ""),
                 train_losses.get("gate_alpha_max", ""),
+                train_losses.get("graph_regularization", ""),
+                train_losses.get("graph_correction_abs_mean", ""),
                 "" if train_final_mae_K is None else train_final_mae_K,
                 val_metrics["normalized_residual_loss"],
                 val_metrics["residual"]["mae_K"],
@@ -836,6 +1004,7 @@ def append_train_log(
                 val_metrics.get("physics_gate", {}).get("std", ""),
                 val_metrics.get("physics_gate", {}).get("min", ""),
                 val_metrics.get("physics_gate", {}).get("max", ""),
+                val_metrics.get("graph_correction_abs_mean", {}).get("mean", ""),
                 epoch_runtime_s,
                 int(is_best),
             ]

@@ -25,7 +25,8 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from chiptherm.ml.dataset import ChipThermDataset
+from chiptherm.ml.dataset import ChipThermDataset, chiptherm_collate, collate_graphs
+from chiptherm.ml.graph_models import move_graph_to_device, normalize_graph_batch
 from chiptherm.ml.models import build_model
 from chiptherm.ml.normalization import NormalizationStats, build_metadata_input, build_model_input, unnormalize_residual
 
@@ -90,13 +91,14 @@ def main() -> int:
     model.eval()
     model_info = architecture_info(checkpoint["model_config"])
 
-    dataset = ChipThermDataset(args.index, target="residual", return_metadata=True)
+    dataset = ChipThermDataset(args.index, target="residual", return_metadata=True, return_graph=bool(model_info.get("graph_enabled")))
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
+        collate_fn=chiptherm_collate if bool(model_info.get("graph_enabled")) else None,
     )
 
     records, all_cnn_errors, regional_sums = analyze(model, loader, stats, device, model_info)
@@ -144,8 +146,10 @@ def architecture_info(model_config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"unsupported physics_input_mode: {physics_input_mode}")
     return {
         "architecture": architecture,
-        "conditioned": architecture in {"miniunet_refine_conditioned", "miniunet_refine_conditioned_decomposed"},
-        "decomposed": architecture in {"miniunet_refine_decomposed", "miniunet_refine_conditioned_decomposed"},
+        "conditioned": architecture in {"miniunet_refine_conditioned", "miniunet_refine_conditioned_decomposed", "miniunet_refine_conditioned_decomposed_graph"},
+        "decomposed": architecture in {"miniunet_refine_decomposed", "miniunet_refine_conditioned_decomposed", "miniunet_refine_conditioned_decomposed_graph"},
+        "graph_enabled": architecture == "miniunet_refine_conditioned_decomposed_graph",
+        "graph_normalization": model_config.get("graph_normalization"),
         "metadata_dim": int(model_config.get("metadata_dim", 0) or 0),
         "physics_input_mode": physics_input_mode,
     }
@@ -183,7 +187,8 @@ def analyze(
         metadata_input = build_metadata_input(batch.get("metadata_vector"), stats)
         if metadata_input is not None:
             metadata_input = metadata_input.to(device, non_blocking=True)
-        prediction = predict_temperature(model, model_input, physics, ambient, metadata_input, stats, model_info)
+        graph_batch = prepare_graph_batch(batch, bool(model_info.get("graph_enabled")), model_info.get("graph_normalization"), device)
+        prediction = predict_temperature(model, model_input, physics, ambient, metadata_input, graph_batch, stats, model_info)
         pred_temperature = prediction["temperature"]
 
         x_np = x.detach().cpu().numpy()
@@ -299,6 +304,7 @@ def predict_temperature(
     physics: torch.Tensor,
     ambient: torch.Tensor,
     metadata_input: torch.Tensor | None,
+    graph_batch: dict[str, torch.Tensor] | None,
     stats: NormalizationStats,
     model_info: dict[str, Any],
 ) -> dict[str, torch.Tensor]:
@@ -307,7 +313,10 @@ def predict_temperature(
     if conditioned and metadata_input is None:
         raise ValueError("conditioned checkpoint requires metadata tensor; build metadata_features.csv first")
     if decomposed:
-        outputs = model(model_input, metadata_input) if conditioned else model(model_input)
+        if bool(model_info.get("graph_enabled")):
+            outputs = model(model_input, metadata_input, graph_batch)
+        else:
+            outputs = model(model_input, metadata_input) if conditioned else model(model_input)
         centered = outputs["centered_field"]
         centered = centered - centered.mean(dim=(-2, -1), keepdim=True)
         temperature = ambient[:, None, None] + outputs["mean_rise"][:, None, None] + centered
@@ -326,6 +335,21 @@ def predict_temperature(
         pred_norm = model(model_input, metadata_input) if conditioned else model(model_input)
     pred_residual = unnormalize_residual(pred_norm.squeeze(1), stats)
     return {"temperature": physics + pred_residual, "residual": pred_residual}
+
+
+def prepare_graph_batch(
+    batch: dict[str, Any],
+    graph_enabled: bool,
+    graph_stats: Any | None,
+    device: torch.device,
+) -> dict[str, torch.Tensor] | None:
+    if not graph_enabled:
+        return None
+    graph = batch.get("graph")
+    if graph is None:
+        raise ValueError("graph-enabled checkpoint requires graph_path artifacts in the analysis index")
+    graph = move_graph_to_device(graph, device)
+    return normalize_graph_batch(graph, graph_stats)
 
 
 def to_numpy_or_none(value: torch.Tensor | None) -> np.ndarray | None:
@@ -630,7 +654,11 @@ def write_sample_panels(
             metadata_input = build_metadata_input(sample["metadata_vector"].unsqueeze(0), stats)
             if metadata_input is not None:
                 metadata_input = metadata_input.to(device)
-        pred = predict_temperature(model, model_input, physics, ambient, metadata_input, stats, model_info)["temperature"]
+        graph_batch = None
+        if bool(model_info.get("graph_enabled")):
+            graph_batch = collate_graphs([sample["graph"]])
+            graph_batch = prepare_graph_batch({"graph": graph_batch}, True, model_info.get("graph_normalization"), device)
+        pred = predict_temperature(model, model_input, physics, ambient, metadata_input, graph_batch, stats, model_info)["temperature"]
         draw_sample_panel(
             sample,
             pred.squeeze(0).detach().cpu().numpy(),

@@ -22,7 +22,8 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from chiptherm.ml.dataset import ChipThermDataset
+from chiptherm.ml.dataset import ChipThermDataset, chiptherm_collate
+from chiptherm.ml.graph_models import move_graph_to_device, normalize_graph_batch
 from chiptherm.ml.models import build_model, count_parameters
 from chiptherm.ml.normalization import NormalizationStats, build_metadata_input, build_model_input, unnormalize_residual
 
@@ -49,13 +50,15 @@ def main() -> int:
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
     architecture = str(checkpoint["model_config"].get("architecture", "miniunet"))
-    decomposed = architecture in {"miniunet_refine_decomposed", "miniunet_refine_conditioned_decomposed"}
-    conditioned = architecture in {"miniunet_refine_conditioned", "miniunet_refine_conditioned_decomposed"}
+    graph_enabled = architecture == "miniunet_refine_conditioned_decomposed_graph"
+    decomposed = architecture in {"miniunet_refine_decomposed", "miniunet_refine_conditioned_decomposed", "miniunet_refine_conditioned_decomposed_graph"}
+    conditioned = architecture in {"miniunet_refine_conditioned", "miniunet_refine_conditioned_decomposed", "miniunet_refine_conditioned_decomposed_graph"}
+    graph_stats = checkpoint["model_config"].get("graph_normalization")
     physics_input_mode = str(checkpoint["model_config"].get("physics_input_mode", "v1"))
     if physics_input_mode not in {"v1", "none", "gated_v1"}:
         raise SystemExit(f"unsupported checkpoint physics_input_mode: {physics_input_mode}")
 
-    dataset = ChipThermDataset(args.index, target="residual", return_metadata=True)
+    dataset = ChipThermDataset(args.index, target="residual", return_metadata=True, return_graph=graph_enabled)
     dataset_input_channels = int(dataset[0]["x"].shape[0])
     actual_input_channels = dataset_input_channels + (1 if physics_input_mode in {"v1", "gated_v1"} else 0)
     expected_input_channels = int(checkpoint["model_config"].get("input_channels", actual_input_channels))
@@ -70,6 +73,7 @@ def main() -> int:
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
+        collate_fn=chiptherm_collate if graph_enabled else None,
     )
 
     metrics, by_case, runtime_s, hotspot_runtime_s, physics_runtime_s, gate_runtime_s = evaluate(
@@ -83,6 +87,8 @@ def main() -> int:
         decomposed=decomposed,
         conditioned=conditioned,
         physics_input_mode=physics_input_mode,
+        graph_enabled=graph_enabled,
+        graph_stats=graph_stats,
     )
     cnn_runtime_per_sample = runtime_s / max(metrics["num_samples"], 1)
     gate_runtime_per_sample = gate_runtime_s / max(metrics["num_samples"], 1) if gate_runtime_s > 0.0 else None
@@ -161,6 +167,7 @@ def main() -> int:
         "centered_field": metrics.get("centered_field"),
         "mean_bias_removed": metrics.get("mean_bias_removed"),
         "physics_gate": metrics.get("physics_gate"),
+        "graph_correction_abs_mean": metrics.get("graph_correction_abs_mean"),
         "improvement_vs_physics_baseline": improvement,
     }
     (out_dir / "metrics.json").write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -193,6 +200,13 @@ def main() -> int:
         )
         if gate_runtime_per_sample is not None:
             print(f"Estimated gate overhead/sample: {gate_runtime_per_sample:.9f} s")
+    if metrics.get("graph_correction_abs_mean"):
+        graph_summary = metrics["graph_correction_abs_mean"]
+        print(
+            "Graph correction abs mean/std/min/max: "
+            f"{graph_summary['mean']:.3f} / {graph_summary['std']:.3f} / "
+            f"{graph_summary['min']:.3f} / {graph_summary['max']:.3f} K"
+        )
     print(f"CNN final MAE/RMSE: {final_mae:.3f} / {final_rmse:.3f} K")
     print(f"Parameter count: {count_parameters(model)}")
     print(f"Improvement: MAE {improvement['mae_percent']:.2f}% / RMSE {improvement['rmse_percent']:.2f}%")
@@ -213,6 +227,8 @@ def evaluate(
     decomposed: bool = False,
     conditioned: bool = False,
     physics_input_mode: str = "v1",
+    graph_enabled: bool = False,
+    graph_stats: Any | None = None,
 ) -> tuple[dict[str, Any], dict[str, dict[str, dict[str, float]]], float, float | None, float | None, float]:
     residual_acc = MetricAccumulator()
     final_acc = MetricAccumulator()
@@ -222,6 +238,7 @@ def evaluate(
     centered_acc = MetricAccumulator()
     mean_bias_removed_acc = MetricAccumulator()
     gate_acc = ScalarSummaryAccumulator()
+    graph_correction_acc = ScalarSummaryAccumulator()
     gate_rows: list[dict[str, Any]] = []
     has_coarse_prediction = False
     by_case: dict[str, dict[str, MetricAccumulator]] = defaultdict(
@@ -247,6 +264,7 @@ def evaluate(
         metadata_input = build_metadata_input(batch.get("metadata_vector"), stats)
         if metadata_input is not None:
             metadata_input = metadata_input.to(device, non_blocking=True)
+        graph_batch = prepare_graph_batch(batch, graph_enabled, graph_stats, device)
         if getattr(model, "physics_gate", None) is not None and getattr(model, "metadata_encoder", None) is not None and metadata_input is not None:
             synchronize(device)
             gate_start = time.perf_counter()
@@ -260,7 +278,7 @@ def evaluate(
         coarse_norm = None
         alpha = None
         if decomposed:
-            outputs = model(model_input, metadata_input) if conditioned else model(model_input)
+            outputs = call_model(model, model_input, metadata_input, graph_batch, conditioned=conditioned, graph_enabled=graph_enabled)
             pred_temperature = reconstruct_decomposed_temperature(outputs, ambient)
             pred_residual = pred_temperature - physics
             centered_pred = pred_temperature - pred_temperature.mean(dim=(-2, -1), keepdim=True)
@@ -272,6 +290,9 @@ def evaluate(
             alpha = outputs.get("physics_gate_alpha")
             if alpha is not None:
                 gate_acc.update(alpha)
+            graph_correction = outputs.get("graph_correction_field")
+            if graph_correction is not None:
+                graph_correction_acc.update(graph_correction.abs().mean(dim=(-2, -1)))
             coarse_temperature = None
         elif hasattr(model, "forward_components"):
             if conditioned:
@@ -352,6 +373,9 @@ def evaluate(
         metrics["mean_rise"] = mean_acc.compute()
         metrics["centered_field"] = centered_acc.compute()
         metrics["mean_bias_removed"] = mean_bias_removed_acc.compute()
+    graph_summary = graph_correction_acc.compute()
+    if graph_summary:
+        metrics["graph_correction_abs_mean"] = graph_summary
     gate_summary = gate_acc.compute()
     if gate_summary:
         metrics["physics_gate"] = gate_summary
@@ -373,6 +397,37 @@ def reconstruct_decomposed_temperature(outputs: dict[str, torch.Tensor], ambient
     centered = outputs["centered_field"]
     centered = centered - centered.mean(dim=(-2, -1), keepdim=True)
     return ambient[:, None, None] + outputs["mean_rise"][:, None, None] + centered
+
+
+def prepare_graph_batch(
+    batch: dict[str, Any],
+    graph_enabled: bool,
+    graph_stats: Any | None,
+    device: torch.device,
+) -> dict[str, torch.Tensor] | None:
+    if not graph_enabled:
+        return None
+    graph = batch.get("graph")
+    if graph is None:
+        raise ValueError("graph-enabled checkpoint requires graph_path artifacts in the evaluation index")
+    graph = move_graph_to_device(graph, device)
+    return normalize_graph_batch(graph, graph_stats)
+
+
+def call_model(
+    model: nn.Module,
+    model_input: torch.Tensor,
+    metadata_input: torch.Tensor | None,
+    graph_batch: dict[str, torch.Tensor] | None,
+    *,
+    conditioned: bool,
+    graph_enabled: bool,
+) -> Any:
+    if graph_enabled:
+        return model(model_input, metadata_input, graph_batch)
+    if conditioned:
+        return model(model_input, metadata_input)
+    return model(model_input)
 
 
 def append_gate_rows(
