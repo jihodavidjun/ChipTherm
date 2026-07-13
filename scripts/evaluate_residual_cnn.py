@@ -23,7 +23,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from chiptherm.ml.dataset import ChipThermDataset, chiptherm_collate
-from chiptherm.ml.graph_models import move_graph_to_device, normalize_graph_batch
+from chiptherm.ml.graph_models import chiplet_metric_values, move_graph_to_device, normalize_graph_batch
 from chiptherm.ml.models import build_model, count_parameters
 from chiptherm.ml.normalization import NormalizationStats, build_metadata_input, build_model_input, unnormalize_residual
 
@@ -58,9 +58,19 @@ def main() -> int:
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
     architecture = str(checkpoint["model_config"].get("architecture", "miniunet"))
-    graph_enabled = architecture == "miniunet_refine_conditioned_decomposed_graph"
-    decomposed = architecture in {"miniunet_refine_decomposed", "miniunet_refine_conditioned_decomposed", "miniunet_refine_conditioned_decomposed_graph"}
-    conditioned = architecture in {"miniunet_refine_conditioned", "miniunet_refine_conditioned_decomposed", "miniunet_refine_conditioned_decomposed_graph"}
+    graph_enabled = architecture in {"miniunet_refine_conditioned_decomposed_graph", "miniunet_refine_conditioned_decomposed_pairwise"}
+    decomposed = architecture in {
+        "miniunet_refine_decomposed",
+        "miniunet_refine_conditioned_decomposed",
+        "miniunet_refine_conditioned_decomposed_graph",
+        "miniunet_refine_conditioned_decomposed_pairwise",
+    }
+    conditioned = architecture in {
+        "miniunet_refine_conditioned",
+        "miniunet_refine_conditioned_decomposed",
+        "miniunet_refine_conditioned_decomposed_graph",
+        "miniunet_refine_conditioned_decomposed_pairwise",
+    }
     graph_stats = checkpoint["model_config"].get("graph_normalization")
     physics_input_mode = str(checkpoint["model_config"].get("physics_input_mode", "v1"))
     if physics_input_mode not in {"v1", "none", "gated_v1"}:
@@ -175,8 +185,15 @@ def main() -> int:
         "mean_rise": metrics.get("mean_rise"),
         "centered_field": metrics.get("centered_field"),
         "mean_bias_removed": metrics.get("mean_bias_removed"),
+        "chiplet_mean_temperature": metrics.get("chiplet_mean_temperature"),
+        "chiplet_peak_temperature": metrics.get("chiplet_peak_temperature"),
+        "inter_chiplet_delta_T": metrics.get("inter_chiplet_delta_T"),
         "physics_gate": metrics.get("physics_gate"),
         "graph_correction_abs_mean": metrics.get("graph_correction_abs_mean"),
+        "pairwise_k": metrics.get("pairwise_k"),
+        "pairwise_contribution": metrics.get("pairwise_contribution"),
+        "pairwise_self": metrics.get("pairwise_self"),
+        "pairwise_node_correction": metrics.get("pairwise_node_correction"),
         "cnn_only_final_temperature": metrics.get("cnn_only_final_temperature"),
         "cnn_only_centered_field": metrics.get("cnn_only_centered_field"),
         "graph_improvement": metrics.get("graph_improvement"),
@@ -238,6 +255,21 @@ def main() -> int:
             graph_improvement = metrics.get("graph_improvement", {})
             print(f"CNN-only MAE/RMSE: {cnn_only['mae_K']:.3f} / {cnn_only['rmse_K']:.3f} K")
             print(f"Graph MAE improvement: {graph_improvement.get('mae_K', float('nan')):.3f} K")
+    if metrics.get("chiplet_mean_temperature"):
+        chip_mean = metrics["chiplet_mean_temperature"]
+        chip_peak = metrics.get("chiplet_peak_temperature", {})
+        delta = metrics.get("inter_chiplet_delta_T", {})
+        print(f"Chiplet mean-temp MAE: {chip_mean['mae_K']:.3f} K")
+        if chip_peak:
+            print(f"Chiplet peak-temp MAE: {chip_peak['mae_K']:.3f} K")
+        if delta:
+            print(f"Inter-chiplet delta-T MAE: {delta['mean']:.3f} K")
+    if metrics.get("pairwise_k"):
+        print(
+            "Pairwise K mean/std/abs_mean: "
+            f"{metrics['pairwise_k']['mean']:.6f} / {metrics['pairwise_k']['std']:.6f} / "
+            f"{metrics['pairwise_k']['abs_mean']:.6f}"
+        )
     print(f"CNN final MAE/RMSE: {final_mae:.3f} / {final_rmse:.3f} K")
     print(f"Parameter count: {count_parameters(model)}")
     print(f"Improvement: MAE {improvement['mae_percent']:.2f}% / RMSE {improvement['rmse_percent']:.2f}%")
@@ -278,7 +310,15 @@ def evaluate(
     graph_correction_std_acc = ScalarSummaryAccumulator()
     cnn_centered_abs_acc = ScalarSummaryAccumulator()
     final_centered_abs_acc = ScalarSummaryAccumulator()
+    chiplet_mean_acc = ScalarMetricAccumulator()
+    chiplet_peak_acc = ScalarMetricAccumulator()
+    chiplet_delta_acc = ScalarSummaryAccumulator()
+    pairwise_k_acc = ScalarSummaryAccumulator()
+    pairwise_contribution_acc = ScalarSummaryAccumulator()
+    pairwise_self_acc = ScalarSummaryAccumulator()
+    pairwise_node_acc = ScalarSummaryAccumulator()
     graph_rows: list[dict[str, Any]] = []
+    chiplet_rows: list[dict[str, Any]] = []
     gate_rows: list[dict[str, Any]] = []
     has_coarse_prediction = False
     by_case: dict[str, dict[str, MetricAccumulator]] = defaultdict(
@@ -353,6 +393,7 @@ def evaluate(
                 cnn_only_centered = cnn_only_temperature - cnn_only_temperature.mean(dim=(-2, -1), keepdim=True)
                 cnn_only_final_acc.update(cnn_only_temperature, temperature)
                 cnn_only_centered_acc.update(cnn_only_centered, centered_target)
+            update_pairwise_summaries(outputs, pairwise_k_acc, pairwise_contribution_acc, pairwise_self_acc, pairwise_node_acc)
             coarse_temperature = None
         elif hasattr(model, "forward_components"):
             if conditioned:
@@ -392,6 +433,12 @@ def evaluate(
         residual_acc.update(pred_residual, residual)
         final_acc.update(pred_temperature, temperature)
         physics_acc.update(physics, temperature)
+        chiplet_metrics = None
+        if graph_enabled and graph_batch is not None:
+            chiplet_metrics = chiplet_metric_values(pred_temperature, temperature, graph_batch)
+            chiplet_mean_acc.update(chiplet_metrics["pred_mean"], chiplet_metrics["target_mean"])
+            chiplet_peak_acc.update(chiplet_metrics["pred_peak"], chiplet_metrics["target_peak"])
+            chiplet_delta_acc.update(chiplet_metrics["delta_mae"].reshape(1))
         if coarse_temperature is not None:
             coarse_final_acc.update(coarse_temperature, temperature)
         for index, case_id in enumerate(case_ids):
@@ -406,6 +453,9 @@ def evaluate(
                 )
             if coarse_temperature is not None:
                 case_metrics["coarse_final_temperature"].update(coarse_temperature[index : index + 1], temperature[index : index + 1])
+        if chiplet_metrics is not None:
+            append_chiplet_rows(chiplet_rows, sample_uids, case_ids, chiplet_metrics, graph_batch)
+            update_chiplet_case_metrics(by_case, case_ids, chiplet_metrics, graph_batch)
 
         if save_predictions:
             save_batch_predictions(out_dir, sample_uids, case_ids, pred_temperature, pred_residual)
@@ -450,6 +500,12 @@ def evaluate(
         metrics["mean_rise"] = mean_acc.compute()
         metrics["centered_field"] = centered_acc.compute()
         metrics["mean_bias_removed"] = mean_bias_removed_acc.compute()
+    chiplet_mean_summary = chiplet_mean_acc.compute()
+    if chiplet_mean_summary:
+        metrics["chiplet_mean_temperature"] = chiplet_mean_summary
+        metrics["chiplet_peak_temperature"] = chiplet_peak_acc.compute()
+        metrics["inter_chiplet_delta_T"] = chiplet_delta_acc.compute()
+        write_chiplet_outputs(out_dir, metrics, by_case, chiplet_rows)
     cnn_only_summary = cnn_only_final_acc.compute()
     if cnn_only_summary:
         metrics["cnn_only_final_temperature"] = cnn_only_summary
@@ -470,6 +526,12 @@ def evaluate(
         denominator = max(float(metrics["cnn_centered_field_abs_mean"]["mean"]), 1.0e-8)
         metrics["graph_to_cnn_ratio"] = float(metrics["graph_correction_abs_mean"]["mean"] / denominator)
         write_graph_contribution_rows(out_dir / "graph_contribution_by_sample.csv", graph_rows)
+    pairwise_summary = pairwise_k_acc.compute()
+    if pairwise_summary:
+        metrics["pairwise_k"] = pairwise_summary
+        metrics["pairwise_contribution"] = pairwise_contribution_acc.compute()
+        metrics["pairwise_self"] = pairwise_self_acc.compute()
+        metrics["pairwise_node_correction"] = pairwise_node_acc.compute()
     gate_summary = gate_acc.compute()
     if gate_summary:
         metrics["physics_gate"] = gate_summary
@@ -564,6 +626,7 @@ def profile_components(
             measured += 1
         if measured >= profile_batches:
             break
+    pairwise = str(getattr(model, "architecture", "")) == "miniunet_refine_conditioned_decomposed_pairwise"
     return {
         "warmup_batches": warmup_batches,
         "profiled_batches": measured,
@@ -576,7 +639,11 @@ def profile_components(
         },
         "rasterizer_audit": {
             "status": "vectorized over graphs, nodes, and grid cells; uses a small loop over raster-channel chunks to avoid materializing [N, C, H, W].",
-            "gradient_path": "node_raster_head outputs are multiplied by differentiable halo weights, then consumed by convolutional fusion.",
+            "gradient_path": (
+                "pairwise node corrections are multiplied by differentiable halo weights and added directly to the centered field."
+                if pairwise
+                else "node_raster_head outputs are multiplied by differentiable halo weights, then consumed by convolutional fusion."
+            ),
             "optimization_opportunity": "Caching static node-to-grid weights helps repeated fixed-geometry inference; a custom kernel could fuse weight construction and accumulation if PyTorch memory traffic remains limiting.",
         },
     }
@@ -785,6 +852,127 @@ def write_graph_contribution_summary(
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def update_pairwise_summaries(
+    outputs: dict[str, torch.Tensor],
+    k_acc: ScalarSummaryAccumulator,
+    contribution_acc: ScalarSummaryAccumulator,
+    self_acc: ScalarSummaryAccumulator,
+    node_acc: ScalarSummaryAccumulator,
+) -> None:
+    if "pairwise_k_values" not in outputs:
+        return
+    k_acc.update(outputs["pairwise_k_values"])
+    contribution_acc.update(outputs["pairwise_contributions"])
+    self_acc.update(outputs["pairwise_self_corrections"])
+    node_acc.update(outputs["pairwise_node_corrections"])
+
+
+def append_chiplet_rows(
+    rows: list[dict[str, Any]],
+    sample_uids: list[Any],
+    case_ids: list[Any],
+    chiplet_metrics: dict[str, torch.Tensor],
+    graph_batch: dict[str, torch.Tensor],
+) -> None:
+    node_batch = graph_batch["node_batch"].detach().cpu().long()
+    pred_mean = chiplet_metrics["pred_mean"].detach().cpu()
+    target_mean = chiplet_metrics["target_mean"].detach().cpu()
+    pred_peak = chiplet_metrics["pred_peak"].detach().cpu()
+    target_peak = chiplet_metrics["target_peak"].detach().cpu()
+    for graph_index, sample_uid in enumerate(sample_uids):
+        node_indices = torch.nonzero(node_batch == graph_index, as_tuple=False).reshape(-1)
+        if node_indices.numel() == 0:
+            continue
+        mean_error = (pred_mean.index_select(0, node_indices) - target_mean.index_select(0, node_indices)).abs()
+        peak_error = (pred_peak.index_select(0, node_indices) - target_peak.index_select(0, node_indices)).abs()
+        delta_mae = inter_chiplet_delta_mae_for_indices(pred_mean, target_mean, node_indices)
+        rows.append(
+            {
+                "sample_uid": str(sample_uid),
+                "case_id": str(case_ids[graph_index]),
+                "chiplet_count": int(node_indices.numel()),
+                "chiplet_mean_temperature_mae_K": float(mean_error.mean().item()),
+                "chiplet_peak_temperature_mae_K": float(peak_error.mean().item()),
+                "inter_chiplet_delta_T_mae_K": float(delta_mae.item()),
+            }
+        )
+
+
+def update_chiplet_case_metrics(
+    by_case: dict[str, dict[str, Any]],
+    case_ids: list[Any],
+    chiplet_metrics: dict[str, torch.Tensor],
+    graph_batch: dict[str, torch.Tensor],
+) -> None:
+    node_batch = graph_batch["node_batch"].detach().cpu().long()
+    pred_mean = chiplet_metrics["pred_mean"].detach().cpu()
+    target_mean = chiplet_metrics["target_mean"].detach().cpu()
+    pred_peak = chiplet_metrics["pred_peak"].detach().cpu()
+    target_peak = chiplet_metrics["target_peak"].detach().cpu()
+    for graph_index, case_id_value in enumerate(case_ids):
+        case_id = str(case_id_value)
+        accs = by_case[case_id]
+        accs.setdefault("chiplet_mean_temperature", ScalarMetricAccumulator())
+        accs.setdefault("chiplet_peak_temperature", ScalarMetricAccumulator())
+        accs.setdefault("inter_chiplet_delta_T", ScalarSummaryAccumulator())
+        node_indices = torch.nonzero(node_batch == graph_index, as_tuple=False).reshape(-1)
+        if node_indices.numel() == 0:
+            continue
+        accs["chiplet_mean_temperature"].update(pred_mean.index_select(0, node_indices), target_mean.index_select(0, node_indices))
+        accs["chiplet_peak_temperature"].update(pred_peak.index_select(0, node_indices), target_peak.index_select(0, node_indices))
+        if node_indices.numel() >= 2:
+            accs["inter_chiplet_delta_T"].update(inter_chiplet_delta_mae_for_indices(pred_mean, target_mean, node_indices).reshape(1))
+
+
+def inter_chiplet_delta_mae_for_indices(pred_mean: torch.Tensor, target_mean: torch.Tensor, node_indices: torch.Tensor) -> torch.Tensor:
+    if int(node_indices.numel()) < 2:
+        return pred_mean.new_tensor(0.0)
+    pred = pred_mean.index_select(0, node_indices)
+    target = target_mean.index_select(0, node_indices)
+    pairs = torch.triu_indices(int(node_indices.numel()), int(node_indices.numel()), offset=1)
+    pred_delta = pred[pairs[0]] - pred[pairs[1]]
+    target_delta = target[pairs[0]] - target[pairs[1]]
+    return (pred_delta - target_delta).abs().mean()
+
+
+def write_chiplet_outputs(
+    out_dir: Path,
+    metrics: dict[str, Any],
+    by_case: dict[str, dict[str, Any]],
+    rows: list[dict[str, Any]],
+) -> None:
+    summary = {
+        "chiplet_mean_temperature": metrics.get("chiplet_mean_temperature"),
+        "chiplet_peak_temperature": metrics.get("chiplet_peak_temperature"),
+        "inter_chiplet_delta_T": metrics.get("inter_chiplet_delta_T"),
+        "cell_center_convention": "(row/col + 0.5) scaled by package height/width, matching graph rasterizer.",
+        "rectangle_rule": "A grid cell belongs to a chiplet when its center is inside the closed chiplet rectangle [x0, x0+w] x [y0, y0+h].",
+        "empty_mask_handling": "If a tiny chiplet has no cell centers inside its rectangle, the nearest grid cell to the chiplet center is assigned.",
+    }
+    (out_dir / "chiplet_metrics_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    columns = ["case_id", "chiplet_mean_temperature_mae_K", "chiplet_peak_temperature_mae_K", "inter_chiplet_delta_T_mae_K"]
+    with (out_dir / "chiplet_metrics_by_case.csv").open("w", encoding="utf-8", newline="") as fp:
+        writer = csv.DictWriter(fp, fieldnames=columns)
+        writer.writeheader()
+        for case_id, accs in sorted(by_case.items()):
+            chip_mean = accs.get("chiplet_mean_temperature")
+            chip_peak = accs.get("chiplet_peak_temperature")
+            chip_delta = accs.get("inter_chiplet_delta_T")
+            writer.writerow(
+                {
+                    "case_id": case_id,
+                    "chiplet_mean_temperature_mae_K": chip_mean.compute().get("mae_K", "") if chip_mean else "",
+                    "chiplet_peak_temperature_mae_K": chip_peak.compute().get("mae_K", "") if chip_peak else "",
+                    "inter_chiplet_delta_T_mae_K": chip_delta.compute().get("mean", "") if chip_delta else "",
+                }
+            )
+    if rows:
+        with (out_dir / "chiplet_metrics_by_sample.csv").open("w", encoding="utf-8", newline="") as fp:
+            writer = csv.DictWriter(fp, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+
+
 def metadata_feature_value(feature_map: Any, name: str, index: int) -> float | str:
     if not isinstance(feature_map, dict) or name not in feature_map:
         return ""
@@ -968,6 +1156,7 @@ class ScalarSummaryAccumulator:
             "std": float(array.std()),
             "min": float(array.min()),
             "max": float(array.max()),
+            "abs_mean": float(np.abs(array).mean()),
         }
 
 
@@ -1006,6 +1195,9 @@ def write_case_metrics(path: Path, case_metrics: dict[str, dict[str, dict[str, f
         "cnn_hotspot_location_error_cells",
         "coarse_final_mae_K",
         "coarse_final_rmse_K",
+        "chiplet_mean_mae_K",
+        "chiplet_peak_mae_K",
+        "inter_chiplet_delta_mae_K",
         "mae_improvement_percent",
         "rmse_improvement_percent",
     ]
@@ -1017,6 +1209,9 @@ def write_case_metrics(path: Path, case_metrics: dict[str, dict[str, dict[str, f
             final = metrics["cnn_final_temperature"]
             cnn_only = metrics.get("cnn_only_final_temperature", {})
             coarse = metrics.get("coarse_final_temperature", {})
+            chiplet_mean = metrics.get("chiplet_mean_temperature", {})
+            chiplet_peak = metrics.get("chiplet_peak_temperature", {})
+            chiplet_delta = metrics.get("inter_chiplet_delta_T", {})
             writer.writerow(
                 {
                     "case_id": case_id,
@@ -1033,6 +1228,9 @@ def write_case_metrics(path: Path, case_metrics: dict[str, dict[str, dict[str, f
                     "cnn_hotspot_location_error_cells": final["hotspot_location_error_cells"],
                     "coarse_final_mae_K": coarse.get("mae_K", ""),
                     "coarse_final_rmse_K": coarse.get("rmse_K", ""),
+                    "chiplet_mean_mae_K": chiplet_mean.get("mae_K", ""),
+                    "chiplet_peak_mae_K": chiplet_peak.get("mae_K", ""),
+                    "inter_chiplet_delta_mae_K": chiplet_delta.get("mean", ""),
                     "mae_improvement_percent": percent_improvement(physics["mae_K"], final["mae_K"]),
                     "rmse_improvement_percent": percent_improvement(physics["rmse_K"], final["rmse_K"]),
                 }

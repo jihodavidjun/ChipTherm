@@ -24,7 +24,13 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from chiptherm.ml.dataset import ChipThermDataset, chiptherm_collate
-from chiptherm.ml.graph_models import compute_graph_normalization_stats, move_graph_to_device, normalize_graph_batch
+from chiptherm.ml.graph_models import (
+    chiplet_mean_loss,
+    chiplet_metric_values,
+    compute_graph_normalization_stats,
+    move_graph_to_device,
+    normalize_graph_batch,
+)
 from chiptherm.ml.models import build_model, count_parameters
 from chiptherm.ml.normalization import (
     NormalizationStats,
@@ -57,6 +63,7 @@ def main() -> int:
             "miniunet_refine_decomposed",
             "miniunet_refine_conditioned_decomposed",
             "miniunet_refine_conditioned_decomposed_graph",
+            "miniunet_refine_conditioned_decomposed_pairwise",
         ],
     )
     parser.add_argument("--refine-channels", default=32, type=int)
@@ -82,6 +89,9 @@ def main() -> int:
     parser.add_argument("--graph-rasterizer-mode", default="vectorized", choices=["vectorized", "legacy"])
     parser.add_argument("--graph-use-edge-features", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--lambda-graph", default=0.0, type=float)
+    parser.add_argument("--pairwise-hidden-dim", default=96, type=int)
+    parser.add_argument("--pairwise-layers", default=3, type=int)
+    parser.add_argument("--lambda-chiplet-mean", default=0.0, type=float)
     parser.add_argument("--freeze-cnn", action="store_true")
     parser.add_argument("--init-checkpoint", default=None, type=Path, help="Optional checkpoint used to initialize matching model or CNN-submodule weights.")
     parser.add_argument("--lambda-final", default=1.0, type=float)
@@ -114,16 +124,26 @@ def main() -> int:
         raise SystemExit("--physics-gate-regularization must be non-negative")
     if args.lambda_graph < 0.0:
         raise SystemExit("--lambda-graph must be non-negative")
-    is_graph_arch = args.model_architecture == "miniunet_refine_conditioned_decomposed_graph"
+    if args.lambda_chiplet_mean < 0.0:
+        raise SystemExit("--lambda-chiplet-mean must be non-negative")
+    if args.pairwise_hidden_dim <= 0:
+        raise SystemExit("--pairwise-hidden-dim must be positive")
+    if args.pairwise_layers <= 0:
+        raise SystemExit("--pairwise-layers must be positive")
+    is_generic_graph_arch = args.model_architecture == "miniunet_refine_conditioned_decomposed_graph"
+    is_pairwise_arch = args.model_architecture == "miniunet_refine_conditioned_decomposed_pairwise"
+    is_graph_arch = is_generic_graph_arch or is_pairwise_arch
     is_conditioned_arch = args.model_architecture in {
         "miniunet_refine_conditioned",
         "miniunet_refine_conditioned_decomposed",
         "miniunet_refine_conditioned_decomposed_graph",
+        "miniunet_refine_conditioned_decomposed_pairwise",
     }
     is_decomposed_arch = args.model_architecture in {
         "miniunet_refine_decomposed",
         "miniunet_refine_conditioned_decomposed",
         "miniunet_refine_conditioned_decomposed_graph",
+        "miniunet_refine_conditioned_decomposed_pairwise",
     }
     if args.physics_input == "gated_v1" and not is_conditioned_arch:
         raise SystemExit("--physics-input gated_v1 requires a metadata-conditioned architecture")
@@ -213,6 +233,15 @@ def main() -> int:
                 "graph_normalization": graph_stats.to_dict() if graph_stats is not None else None,
             }
         )
+    if is_pairwise_arch:
+        model_config.update(
+            {
+                "pairwise_enabled": True,
+                "pairwise_hidden_dim": args.pairwise_hidden_dim,
+                "pairwise_layers": args.pairwise_layers,
+                "source_power_feature_index": 6,
+            }
+        )
 
     config = {
         "schema_version": 1,
@@ -241,6 +270,9 @@ def main() -> int:
         "graph_rasterizer_mode": args.graph_rasterizer_mode,
         "graph_use_edge_features": args.graph_use_edge_features,
         "lambda_graph": args.lambda_graph,
+        "pairwise_hidden_dim": args.pairwise_hidden_dim,
+        "pairwise_layers": args.pairwise_layers,
+        "lambda_chiplet_mean": args.lambda_chiplet_mean,
         "freeze_cnn": args.freeze_cnn,
         "init_checkpoint": str(args.init_checkpoint.resolve()) if args.init_checkpoint else None,
         "refine_channels": args.refine_channels,
@@ -260,6 +292,7 @@ def main() -> int:
         "target_decomposition": is_decomposed_arch,
         "metadata_conditioning": is_conditioned_arch,
         "graph_enabled": is_graph_arch,
+        "pairwise_enabled": is_pairwise_arch,
         "model": model_config,
         "loss": (
             "SmoothL1Loss on normalized residual plus optional temp_loss_weight * L1(T_pred, HotSpot) / residual_std "
@@ -278,6 +311,9 @@ def main() -> int:
             "physics_gate_hidden_dim": args.physics_gate_hidden_dim,
             "physics_gate_init": args.physics_gate_init,
             "graph_normalization": graph_stats.to_dict() if graph_stats is not None else None,
+            "lambda_chiplet_mean": args.lambda_chiplet_mean,
+            "graph_node_feature_names": list(getattr(train_dataset, "graph_node_feature_names", ()) or []),
+            "graph_edge_feature_names": list(getattr(train_dataset, "graph_edge_feature_names", ()) or []),
         }
     )
     (out_dir / "config.json").write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -326,6 +362,7 @@ def main() -> int:
             graph_enabled=is_graph_arch,
             graph_stats=graph_stats,
             lambda_graph=args.lambda_graph,
+            lambda_chiplet_mean=args.lambda_chiplet_mean,
         )
         val_metrics, val_by_case = evaluate_model(
             model,
@@ -340,6 +377,7 @@ def main() -> int:
             physics_input_mode=args.physics_input,
             graph_enabled=is_graph_arch,
             graph_stats=graph_stats,
+            lambda_chiplet_mean=args.lambda_chiplet_mean,
         )
         train_final_mae_K: float | None = None
         if should_compute_train_mae(epoch, args.epochs, args.train_mae_every):
@@ -356,6 +394,7 @@ def main() -> int:
                 physics_input_mode=args.physics_input,
                 graph_enabled=is_graph_arch,
                 graph_stats=graph_stats,
+                lambda_chiplet_mean=args.lambda_chiplet_mean,
             )
             train_final_mae_K = float(train_metrics["final_temperature"]["mae_K"])
         epoch_runtime_s = time.perf_counter() - epoch_start
@@ -480,6 +519,7 @@ def train_one_epoch(
     graph_enabled: bool = False,
     graph_stats: Any | None = None,
     lambda_graph: float = 0.0,
+    lambda_chiplet_mean: float = 0.0,
 ) -> dict[str, float]:
     model.train()
     total_loss = 0.0
@@ -491,7 +531,12 @@ def train_one_epoch(
     gate_regularization_total = 0.0
     graph_regularization_total = 0.0
     graph_correction_total = 0.0
+    chiplet_mean_loss_total = 0.0
     gate_acc = ScalarSummaryAccumulator()
+    pairwise_k_acc = ScalarSummaryAccumulator()
+    pairwise_contribution_acc = ScalarSummaryAccumulator()
+    pairwise_self_acc = ScalarSummaryAccumulator()
+    pairwise_node_acc = ScalarSummaryAccumulator()
     total_samples = 0
     for batch in loader:
         x = batch["x"].to(device, non_blocking=True)
@@ -519,6 +564,12 @@ def train_one_epoch(
             hotspot_loss_K = pred_temperature.new_tensor(0.0)
             hotspot_loss_scaled = pred_temperature.new_tensor(0.0)
             loss = float(lambda_final) * final_loss + float(lambda_mean) * mean_loss
+            if lambda_chiplet_mean > 0.0:
+                if graph_batch is None:
+                    raise ValueError("--lambda-chiplet-mean requires graph-enabled training data")
+                chiplet_loss = chiplet_mean_loss(pred_temperature, temperature, graph_batch)
+                loss = loss + float(lambda_chiplet_mean) * chiplet_loss
+                chiplet_mean_loss_total += float(chiplet_loss.item()) * batch_size
             alpha = outputs.get("physics_gate_alpha")
             if alpha is not None:
                 gate_acc.update(alpha)
@@ -533,6 +584,7 @@ def train_one_epoch(
                 if lambda_graph > 0.0:
                     loss = loss + float(lambda_graph) * graph_mag
                     graph_regularization_total += float(graph_mag.item()) * batch_size
+            update_pairwise_summaries(outputs, pairwise_k_acc, pairwise_contribution_acc, pairwise_self_acc, pairwise_node_acc)
         else:
             target = normalize_residual(residual, stats).unsqueeze(1)
             pred = call_model(model, model_input, metadata_input, graph_batch, conditioned=conditioned, graph_enabled=graph_enabled)
@@ -578,7 +630,12 @@ def train_one_epoch(
         "gate_regularization": gate_regularization_total / denominator,
         "graph_regularization": graph_regularization_total / denominator,
         "graph_correction_abs_mean": graph_correction_total / denominator,
+        "chiplet_mean_loss_K": chiplet_mean_loss_total / denominator,
         **gate_acc.prefixed("gate_alpha"),
+        **pairwise_k_acc.prefixed("pairwise_k"),
+        **pairwise_contribution_acc.prefixed("pairwise_contribution"),
+        **pairwise_self_acc.prefixed("pairwise_self"),
+        **pairwise_node_acc.prefixed("pairwise_node_correction"),
     }
 
 
@@ -615,6 +672,12 @@ def format_graph_epoch_summary(metrics: dict[str, Any], by_case: dict[str, dict[
         parts.append(f"delta={cnn_only - fused:.3f}K")
     if case02_cnn is not None and case02_fused is not None:
         parts.append(f"case02_delta={case02_cnn - case02_fused:.3f}K")
+    chiplet_mean = metrics.get("chiplet_mean_temperature", {}).get("mae_K")
+    if chiplet_mean is not None:
+        parts.append(f"chiplet_mean={chiplet_mean:.3f}K")
+    pairwise_k = metrics.get("pairwise_k", {}).get("abs_mean")
+    if pairwise_k is not None:
+        parts.append(f"K_abs={pairwise_k:.4f}")
     return " ".join(parts)
 
 
@@ -633,6 +696,7 @@ def evaluate_model(
     physics_input_mode: str = "v1",
     graph_enabled: bool = False,
     graph_stats: Any | None = None,
+    lambda_chiplet_mean: float = 0.0,
 ) -> tuple[dict[str, Any], dict[str, dict[str, float]]]:
     model.eval()
     residual_acc = MetricAccumulator()
@@ -649,11 +713,25 @@ def evaluate_model(
     graph_correction_std_acc = ScalarSummaryAccumulator()
     cnn_centered_abs_acc = ScalarSummaryAccumulator()
     final_centered_abs_acc = ScalarSummaryAccumulator()
+    chiplet_mean_acc = ScalarMetricAccumulator()
+    chiplet_peak_acc = ScalarMetricAccumulator()
+    chiplet_delta_acc = ScalarSummaryAccumulator()
+    pairwise_k_acc = ScalarSummaryAccumulator()
+    pairwise_contribution_acc = ScalarSummaryAccumulator()
+    pairwise_self_acc = ScalarSummaryAccumulator()
+    pairwise_node_acc = ScalarSummaryAccumulator()
     by_case: dict[str, dict[str, MetricAccumulator]] = defaultdict(
         lambda: {
             "residual": MetricAccumulator(),
             "final_temperature": MetricAccumulator(),
             "cnn_only_final_temperature": MetricAccumulator(),
+        }
+    )
+    chiplet_by_case: dict[str, dict[str, ScalarMetricAccumulator | ScalarSummaryAccumulator]] = defaultdict(
+        lambda: {
+            "chiplet_mean_temperature": ScalarMetricAccumulator(),
+            "chiplet_peak_temperature": ScalarMetricAccumulator(),
+            "inter_chiplet_delta_T": ScalarSummaryAccumulator(),
         }
     )
     total_loss = 0.0
@@ -700,6 +778,7 @@ def evaluate_model(
                 cnn_only_centered = cnn_only_temperature - cnn_only_temperature.mean(dim=(-2, -1), keepdim=True)
                 cnn_only_final_acc.update(cnn_only_temperature, temperature)
                 cnn_only_centered_acc.update(cnn_only_centered, centered_target)
+            update_pairwise_summaries(outputs, pairwise_k_acc, pairwise_contribution_acc, pairwise_self_acc, pairwise_node_acc)
         else:
             target_norm = normalize_residual(residual, stats).unsqueeze(1)
             pred_norm = model(model_input, metadata_input) if conditioned else model(model_input)
@@ -713,6 +792,12 @@ def evaluate_model(
         total_samples += batch_size
         residual_acc.update(pred_residual, residual)
         final_acc.update(pred_temperature, temperature)
+        chiplet_metrics = None
+        if graph_enabled and graph_batch is not None:
+            chiplet_metrics = chiplet_metric_values(pred_temperature, temperature, graph_batch)
+            chiplet_mean_acc.update(chiplet_metrics["pred_mean"], chiplet_metrics["target_mean"])
+            chiplet_peak_acc.update(chiplet_metrics["pred_peak"], chiplet_metrics["target_peak"])
+            chiplet_delta_acc.update(chiplet_metrics["delta_mae"].reshape(1))
         for index, case_id in enumerate(case_ids):
             by_case[str(case_id)]["residual"].update(pred_residual[index : index + 1], residual[index : index + 1])
             by_case[str(case_id)]["final_temperature"].update(pred_temperature[index : index + 1], temperature[index : index + 1])
@@ -721,6 +806,8 @@ def evaluate_model(
                     cnn_only_temperature[index : index + 1],
                     temperature[index : index + 1],
                 )
+        if chiplet_metrics is not None:
+            update_chiplet_case_metrics(chiplet_by_case, case_ids, chiplet_metrics, graph_batch)
         if "cnn_only_temperature" in locals():
             del cnn_only_temperature
 
@@ -748,6 +835,17 @@ def evaluate_model(
         metrics["final_centered_field_abs_mean"] = final_centered_abs_acc.compute()
         denominator = max(float(metrics["cnn_centered_field_abs_mean"]["mean"]), 1.0e-8)
         metrics["graph_to_cnn_ratio"] = float(metrics["graph_correction_abs_mean"]["mean"] / denominator)
+    chiplet_mean_summary = chiplet_mean_acc.compute()
+    if chiplet_mean_summary:
+        metrics["chiplet_mean_temperature"] = chiplet_mean_summary
+        metrics["chiplet_peak_temperature"] = chiplet_peak_acc.compute()
+        metrics["inter_chiplet_delta_T"] = chiplet_delta_acc.compute()
+    pairwise_summary = pairwise_k_acc.compute()
+    if pairwise_summary:
+        metrics["pairwise_k"] = pairwise_summary
+        metrics["pairwise_contribution"] = pairwise_contribution_acc.compute()
+        metrics["pairwise_self"] = pairwise_self_acc.compute()
+        metrics["pairwise_node_correction"] = pairwise_node_acc.compute()
     gate_summary = gate_acc.compute()
     if gate_summary:
         metrics["physics_gate"] = gate_summary
@@ -756,6 +854,9 @@ def evaluate_model(
             "residual": accs["residual"].compute(),
             "final_temperature": accs["final_temperature"].compute(),
             "cnn_only_final_temperature": accs["cnn_only_final_temperature"].compute(),
+            "chiplet_mean_temperature": chiplet_by_case[case_id]["chiplet_mean_temperature"].compute(),
+            "chiplet_peak_temperature": chiplet_by_case[case_id]["chiplet_peak_temperature"].compute(),
+            "inter_chiplet_delta_T": chiplet_by_case[case_id]["inter_chiplet_delta_T"].compute(),
         }
         for case_id, accs in sorted(by_case.items())
     }
@@ -804,6 +905,55 @@ def call_model(
     if conditioned:
         return model(model_input, metadata_input)
     return model(model_input)
+
+
+def update_pairwise_summaries(
+    outputs: dict[str, torch.Tensor],
+    k_acc: ScalarSummaryAccumulator,
+    contribution_acc: ScalarSummaryAccumulator,
+    self_acc: ScalarSummaryAccumulator,
+    node_acc: ScalarSummaryAccumulator,
+) -> None:
+    if "pairwise_k_values" not in outputs:
+        return
+    k_acc.update(outputs["pairwise_k_values"])
+    contribution_acc.update(outputs["pairwise_contributions"])
+    self_acc.update(outputs["pairwise_self_corrections"])
+    node_acc.update(outputs["pairwise_node_corrections"])
+
+
+def update_chiplet_case_metrics(
+    by_case: dict[str, dict[str, ScalarMetricAccumulator | ScalarSummaryAccumulator]],
+    case_ids: list[Any],
+    chiplet_metrics: dict[str, torch.Tensor],
+    graph_batch: dict[str, torch.Tensor],
+) -> None:
+    node_batch = graph_batch["node_batch"].detach().cpu().long()
+    pred_mean = chiplet_metrics["pred_mean"].detach().cpu()
+    target_mean = chiplet_metrics["target_mean"].detach().cpu()
+    pred_peak = chiplet_metrics["pred_peak"].detach().cpu()
+    target_peak = chiplet_metrics["target_peak"].detach().cpu()
+    num_graphs = len(case_ids)
+    for graph_index in range(num_graphs):
+        case_id = str(case_ids[graph_index])
+        node_indices = torch.nonzero(node_batch == graph_index, as_tuple=False).reshape(-1)
+        if node_indices.numel() == 0:
+            continue
+        by_case[case_id]["chiplet_mean_temperature"].update(
+            pred_mean.index_select(0, node_indices),
+            target_mean.index_select(0, node_indices),
+        )
+        by_case[case_id]["chiplet_peak_temperature"].update(
+            pred_peak.index_select(0, node_indices),
+            target_peak.index_select(0, node_indices),
+        )
+        if node_indices.numel() >= 2:
+            pred = pred_mean.index_select(0, node_indices)
+            target = target_mean.index_select(0, node_indices)
+            pairs = torch.triu_indices(int(node_indices.numel()), int(node_indices.numel()), offset=1)
+            pred_delta = pred[pairs[0]] - pred[pairs[1]]
+            target_delta = target[pairs[0]] - target[pairs[1]]
+            by_case[case_id]["inter_chiplet_delta_T"].update((pred_delta - target_delta).abs())
 
 
 def hotspot_l1_loss(pred_temperature: torch.Tensor, temperature: torch.Tensor, top_frac: float) -> torch.Tensor:
@@ -906,6 +1056,7 @@ class ScalarSummaryAccumulator:
             "std": float(array.std()),
             "min": float(array.min()),
             "max": float(array.max()),
+            "abs_mean": float(np.abs(array).mean()),
         }
 
     def prefixed(self, prefix: str) -> dict[str, float]:
@@ -1019,6 +1170,11 @@ def init_train_log(path: Path) -> None:
                 "train_gate_alpha_max",
                 "train_graph_regularization",
                 "train_graph_correction_abs_mean",
+                "train_chiplet_mean_loss_K",
+                "train_pairwise_k_abs_mean",
+                "train_pairwise_contribution_abs_mean",
+                "train_pairwise_self_abs_mean",
+                "train_pairwise_node_correction_abs_mean",
                 "train_final_temperature_mae_K",
                 "val_loss",
                 "val_residual_mae_K",
@@ -1042,6 +1198,13 @@ def init_train_log(path: Path) -> None:
                 "val_graph_correction_rms",
                 "val_graph_correction_spatial_std",
                 "val_graph_to_cnn_ratio",
+                "val_chiplet_mean_mae_K",
+                "val_chiplet_peak_mae_K",
+                "val_inter_chiplet_delta_mae_K",
+                "val_pairwise_k_abs_mean",
+                "val_pairwise_contribution_abs_mean",
+                "val_pairwise_self_abs_mean",
+                "val_pairwise_node_correction_abs_mean",
                 "epoch_runtime_s",
                 "is_best",
             ]
@@ -1077,6 +1240,11 @@ def append_train_log(
                 train_losses.get("gate_alpha_max", ""),
                 train_losses.get("graph_regularization", ""),
                 train_losses.get("graph_correction_abs_mean", ""),
+                train_losses.get("chiplet_mean_loss_K", ""),
+                train_losses.get("pairwise_k_abs_mean", ""),
+                train_losses.get("pairwise_contribution_abs_mean", ""),
+                train_losses.get("pairwise_self_abs_mean", ""),
+                train_losses.get("pairwise_node_correction_abs_mean", ""),
                 "" if train_final_mae_K is None else train_final_mae_K,
                 val_metrics["normalized_residual_loss"],
                 val_metrics["residual"]["mae_K"],
@@ -1100,6 +1268,13 @@ def append_train_log(
                 val_metrics.get("graph_correction_rms", {}).get("mean", ""),
                 val_metrics.get("graph_correction_spatial_std", {}).get("mean", ""),
                 val_metrics.get("graph_to_cnn_ratio", ""),
+                val_metrics.get("chiplet_mean_temperature", {}).get("mae_K", ""),
+                val_metrics.get("chiplet_peak_temperature", {}).get("mae_K", ""),
+                val_metrics.get("inter_chiplet_delta_T", {}).get("mean", ""),
+                val_metrics.get("pairwise_k", {}).get("abs_mean", ""),
+                val_metrics.get("pairwise_contribution", {}).get("abs_mean", ""),
+                val_metrics.get("pairwise_self", {}).get("abs_mean", ""),
+                val_metrics.get("pairwise_node_correction", {}).get("abs_mean", ""),
                 epoch_runtime_s,
                 int(is_best),
             ]
@@ -1161,6 +1336,9 @@ def write_case_metrics(path: Path, case_metrics: dict[str, dict[str, dict[str, f
         "final_temperature_mean_signed_error_K",
         "hotspot_temp_error_K",
         "hotspot_location_error_cells",
+        "chiplet_mean_mae_K",
+        "chiplet_peak_mae_K",
+        "inter_chiplet_delta_mae_K",
     ]
     with path.open("w", encoding="utf-8", newline="") as fp:
         writer = csv.DictWriter(fp, fieldnames=columns)
@@ -1169,6 +1347,9 @@ def write_case_metrics(path: Path, case_metrics: dict[str, dict[str, dict[str, f
             final = metrics["final_temperature"]
             residual = metrics["residual"]
             cnn_only = metrics.get("cnn_only_final_temperature", {})
+            chiplet_mean = metrics.get("chiplet_mean_temperature", {})
+            chiplet_peak = metrics.get("chiplet_peak_temperature", {})
+            chiplet_delta = metrics.get("inter_chiplet_delta_T", {})
             writer.writerow(
                 {
                     "case_id": case_id,
@@ -1183,6 +1364,9 @@ def write_case_metrics(path: Path, case_metrics: dict[str, dict[str, dict[str, f
                     "final_temperature_mean_signed_error_K": final["mean_signed_error_K"],
                     "hotspot_temp_error_K": final["hotspot_temp_error_K"],
                     "hotspot_location_error_cells": final["hotspot_location_error_cells"],
+                    "chiplet_mean_mae_K": chiplet_mean.get("mae_K", ""),
+                    "chiplet_peak_mae_K": chiplet_peak.get("mae_K", ""),
+                    "inter_chiplet_delta_mae_K": chiplet_delta.get("mean", ""),
                 }
             )
 

@@ -146,9 +146,22 @@ def architecture_info(model_config: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"unsupported physics_input_mode: {physics_input_mode}")
     return {
         "architecture": architecture,
-        "conditioned": architecture in {"miniunet_refine_conditioned", "miniunet_refine_conditioned_decomposed", "miniunet_refine_conditioned_decomposed_graph"},
-        "decomposed": architecture in {"miniunet_refine_decomposed", "miniunet_refine_conditioned_decomposed", "miniunet_refine_conditioned_decomposed_graph"},
-        "graph_enabled": architecture == "miniunet_refine_conditioned_decomposed_graph",
+        "conditioned": architecture in {
+            "miniunet_refine_conditioned",
+            "miniunet_refine_conditioned_decomposed",
+            "miniunet_refine_conditioned_decomposed_graph",
+            "miniunet_refine_conditioned_decomposed_pairwise",
+        },
+        "decomposed": architecture in {
+            "miniunet_refine_decomposed",
+            "miniunet_refine_conditioned_decomposed",
+            "miniunet_refine_conditioned_decomposed_graph",
+            "miniunet_refine_conditioned_decomposed_pairwise",
+        },
+        "graph_enabled": architecture in {
+            "miniunet_refine_conditioned_decomposed_graph",
+            "miniunet_refine_conditioned_decomposed_pairwise",
+        },
         "graph_normalization": model_config.get("graph_normalization"),
         "metadata_dim": int(model_config.get("metadata_dim", 0) or 0),
         "physics_input_mode": physics_input_mode,

@@ -556,3 +556,235 @@ def rasterize_node_values(
             cache=cache,
         )
     raise ValueError(f"unsupported rasterizer mode: {mode}")
+
+
+def zero_initialize_last_linear(module: nn.Module) -> None:
+    linear_layers = [layer for layer in module.modules() if isinstance(layer, nn.Linear)]
+    if not linear_layers:
+        return
+    final = linear_layers[-1]
+    nn.init.zeros_(final.weight)
+    nn.init.zeros_(final.bias)
+
+
+def make_silu_mlp(input_dim: int, hidden_dim: int, output_dim: int, *, layers: int, zero_last: bool = False) -> nn.Sequential:
+    if layers < 1:
+        raise ValueError("layers must be positive")
+    modules: list[nn.Module] = []
+    current = int(input_dim)
+    for _ in range(max(int(layers) - 1, 0)):
+        modules.extend([nn.Linear(current, int(hidden_dim)), nn.SiLU()])
+        current = int(hidden_dim)
+    modules.append(nn.Linear(current, int(output_dim)))
+    net = nn.Sequential(*modules)
+    if zero_last:
+        zero_initialize_last_linear(net)
+    return net
+
+
+class PairwiseThermalImpedanceOperator(nn.Module):
+    """Explicit source-target chiplet correction operator.
+
+    The operator consumes the normalized graph batch already used by the generic
+    GNN. For every directed edge i -> j it predicts a signed scalar transfer
+    coefficient K_ij, multiplies it by the normalized source power feature, and
+    aggregates contributions at the target node. A separate zero-initialized
+    self term handles local chiplet correction.
+    """
+
+    def __init__(
+        self,
+        node_feature_dim: int,
+        edge_feature_dim: int,
+        metadata_dim: int = 0,
+        hidden_dim: int = 96,
+        layers: int = 3,
+        source_power_feature_index: int = 6,
+    ) -> None:
+        super().__init__()
+        if source_power_feature_index < 0 or source_power_feature_index >= node_feature_dim:
+            raise ValueError("source_power_feature_index is outside the node feature dimension")
+        self.node_feature_dim = int(node_feature_dim)
+        self.edge_feature_dim = int(edge_feature_dim)
+        self.metadata_dim = int(metadata_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.layers = int(layers)
+        self.source_power_feature_index = int(source_power_feature_index)
+        pair_input_dim = self.node_feature_dim * 2 + self.edge_feature_dim + self.metadata_dim
+        self.pairwise_mlp = make_silu_mlp(pair_input_dim, hidden_dim, 1, layers=layers, zero_last=True)
+        self.self_mlp = make_silu_mlp(self.node_feature_dim + self.metadata_dim, hidden_dim, 1, layers=layers, zero_last=True)
+
+    def forward(
+        self,
+        graph: dict[str, torch.Tensor],
+        metadata: torch.Tensor | None = None,
+        *,
+        return_diagnostics: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        node_features = graph["node_features"].float()
+        edge_features = graph["edge_features"].float()
+        edge_index = graph["edge_index"].long()
+        node_batch = graph["node_batch"].long()
+        node_count = int(node_features.shape[0])
+        if metadata is None:
+            metadata_node = node_features.new_zeros((node_count, 0))
+        else:
+            metadata = metadata.float()
+            metadata_node = metadata.index_select(0, node_batch)
+
+        if edge_index.numel() > 0:
+            src = edge_index[0]
+            dst = edge_index[1]
+            metadata_edge = metadata_node.index_select(0, src)
+            pair_input = torch.cat(
+                [
+                    node_features.index_select(0, src),
+                    node_features.index_select(0, dst),
+                    edge_features,
+                    metadata_edge,
+                ],
+                dim=1,
+            )
+            k_values = self.pairwise_mlp(pair_input).squeeze(1)
+            source_power = node_features.index_select(0, src)[:, self.source_power_feature_index]
+            pairwise_contributions = source_power * k_values
+            pairwise_node_sums = node_features.new_zeros(node_count)
+            pairwise_node_sums.index_add_(0, dst, pairwise_contributions)
+        else:
+            k_values = node_features.new_empty((0,))
+            pairwise_contributions = node_features.new_empty((0,))
+            pairwise_node_sums = node_features.new_zeros(node_count)
+
+        self_input = torch.cat([node_features, metadata_node], dim=1)
+        self_corrections = self.self_mlp(self_input).squeeze(1)
+        node_corrections = self_corrections + pairwise_node_sums
+        result = {
+            "node_corrections": node_corrections,
+            "self_corrections": self_corrections,
+            "pairwise_node_sums": pairwise_node_sums,
+            "k_values": k_values,
+            "pairwise_contributions": pairwise_contributions,
+        }
+        if return_diagnostics:
+            result["source_power"] = (
+                node_features.index_select(0, edge_index[0])[:, self.source_power_feature_index]
+                if edge_index.numel() > 0
+                else node_features.new_empty((0,))
+            )
+        return result
+
+
+def chiplet_cell_weights(
+    graph: dict[str, torch.Tensor],
+    *,
+    height: int = 64,
+    width: int = 64,
+    dtype: torch.dtype | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return exact rectangle cell-center masks as float weights.
+
+    Cell centers use the same package-coordinate convention as the graph
+    rasterizer: row/col centers are at (index + 0.5) / grid_size times the
+    package height/width. A cell belongs to a chiplet when its center lies
+    inside the closed chiplet rectangle. If a tiny chiplet would otherwise have
+    no cells, the nearest cell to the chiplet center is assigned to it.
+    """
+
+    rects = graph["chiplet_rects"].float()
+    package_size = graph["package_size"].float()
+    node_batch = graph["node_batch"].long()
+    device = rects.device
+    dtype = dtype or rects.dtype
+    rects = rects.to(dtype=dtype)
+    package_size = package_size.to(dtype=dtype)
+    node_package = package_size.index_select(0, node_batch)
+    rows = torch.arange(height, dtype=dtype, device=device) + 0.5
+    cols = torch.arange(width, dtype=dtype, device=device) + 0.5
+    yy_unit, xx_unit = torch.meshgrid(rows / float(height), cols / float(width), indexing="ij")
+    xx = xx_unit.reshape(1, -1) * node_package[:, 0:1]
+    yy = yy_unit.reshape(1, -1) * node_package[:, 1:2]
+    x0 = rects[:, 0:1]
+    y0 = rects[:, 1:2]
+    x1 = x0 + rects[:, 2:3]
+    y1 = y0 + rects[:, 3:4]
+    inside = (xx >= x0) & (xx <= x1) & (yy >= y0) & (yy <= y1)
+    weights = inside.to(dtype=dtype)
+    counts = weights.sum(dim=1)
+    empty = counts <= 0.0
+    if bool(empty.any()):
+        centers_x = x0[empty] + 0.5 * rects[empty, 2:3]
+        centers_y = y0[empty] + 0.5 * rects[empty, 3:4]
+        node_package_empty = node_package[empty]
+        col_index = torch.clamp((centers_x / node_package_empty[:, 0:1] * float(width)).floor().long(), min=0, max=width - 1)
+        row_index = torch.clamp((centers_y / node_package_empty[:, 1:2] * float(height)).floor().long(), min=0, max=height - 1)
+        flat_index = (row_index * width + col_index).reshape(-1)
+        empty_indices = torch.nonzero(empty, as_tuple=False).reshape(-1)
+        weights[empty_indices] = 0.0
+        weights[empty_indices, flat_index] = 1.0
+        counts = weights.sum(dim=1)
+    return weights.view(-1, height, width), counts.clamp_min(1.0)
+
+
+def chiplet_mean_temperatures(field: torch.Tensor, graph: dict[str, torch.Tensor]) -> torch.Tensor:
+    if field.ndim != 3:
+        raise ValueError(f"field must have shape [B, H, W], got {tuple(field.shape)}")
+    weights, counts = chiplet_cell_weights(graph, height=int(field.shape[-2]), width=int(field.shape[-1]), dtype=field.dtype)
+    node_batch = graph["node_batch"].long()
+    node_fields = field.index_select(0, node_batch)
+    return (node_fields * weights).sum(dim=(-2, -1)) / counts.to(field.dtype)
+
+
+def chiplet_peak_temperatures(field: torch.Tensor, graph: dict[str, torch.Tensor]) -> torch.Tensor:
+    if field.ndim != 3:
+        raise ValueError(f"field must have shape [B, H, W], got {tuple(field.shape)}")
+    weights, _counts = chiplet_cell_weights(graph, height=int(field.shape[-2]), width=int(field.shape[-1]), dtype=field.dtype)
+    node_batch = graph["node_batch"].long()
+    node_fields = field.index_select(0, node_batch)
+    masked = node_fields.masked_fill(weights <= 0.0, -torch.inf)
+    peaks = masked.amax(dim=(-2, -1))
+    return torch.where(torch.isfinite(peaks), peaks, node_fields.reshape(node_fields.shape[0], -1).amax(dim=1))
+
+
+def chiplet_mean_loss(pred: torch.Tensor, target: torch.Tensor, graph: dict[str, torch.Tensor]) -> torch.Tensor:
+    pred_mean = chiplet_mean_temperatures(pred, graph)
+    target_mean = chiplet_mean_temperatures(target, graph)
+    return F.smooth_l1_loss(pred_mean, target_mean)
+
+
+def inter_chiplet_delta_mae(pred_means: torch.Tensor, target_means: torch.Tensor, node_batch: torch.Tensor) -> torch.Tensor:
+    values: list[torch.Tensor] = []
+    num_graphs = int(node_batch.max().item()) + 1 if node_batch.numel() else 0
+    for graph_index in range(num_graphs):
+        indices = torch.nonzero(node_batch == graph_index, as_tuple=False).reshape(-1)
+        if int(indices.numel()) < 2:
+            continue
+        pred = pred_means.index_select(0, indices)
+        target = target_means.index_select(0, indices)
+        pair_indices = torch.triu_indices(int(indices.numel()), int(indices.numel()), offset=1, device=pred.device)
+        pred_delta = pred[pair_indices[0]] - pred[pair_indices[1]]
+        target_delta = target[pair_indices[0]] - target[pair_indices[1]]
+        values.append((pred_delta - target_delta).abs())
+    if not values:
+        return pred_means.new_tensor(0.0)
+    return torch.cat(values).mean()
+
+
+def chiplet_metric_values(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    graph: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    pred_mean = chiplet_mean_temperatures(pred, graph)
+    target_mean = chiplet_mean_temperatures(target, graph)
+    pred_peak = chiplet_peak_temperatures(pred, graph)
+    target_peak = chiplet_peak_temperatures(target, graph)
+    node_batch = graph["node_batch"].long()
+    return {
+        "pred_mean": pred_mean,
+        "target_mean": target_mean,
+        "pred_peak": pred_peak,
+        "target_peak": target_peak,
+        "mean_abs_error": (pred_mean - target_mean).abs(),
+        "peak_abs_error": (pred_peak - target_peak).abs(),
+        "delta_mae": inter_chiplet_delta_mae(pred_mean, target_mean, node_batch),
+    }
