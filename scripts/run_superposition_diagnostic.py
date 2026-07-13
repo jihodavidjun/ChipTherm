@@ -7,12 +7,14 @@ import json
 import math
 import random
 import shutil
+import shlex
 import subprocess
 import sys
 import time
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +32,12 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from chiptherm.ml.encoder import active_power_map
+from chiptherm.parsers import parse_block_temps, parse_layer_grid
+from chiptherm.paths import hotspot_home as resolve_hotspot_home
+from chiptherm.runner import build_hotspot_command, run_hotspot
+from chiptherm.scenario import SimulationInput, load_simulation_input
+from chiptherm.validate import _min_spacing_mm, _validate_layout
+from chiptherm.writers import read_grid_shape, write_flp, write_hotspot_config, write_manifest, write_ptrace
 
 
 @dataclass(frozen=True)
@@ -440,27 +448,202 @@ def run_power_case(
     scenario_dir.mkdir(parents=True, exist_ok=True)
     copy_source_with_power(source_dir, scenario_dir, modified_power)
 
-    command = [sys.executable, str(REPO_ROOT / "scripts/run_one.py"), str(scenario_dir / "scenario.yaml"), "--out-dir", str(output_run_dir)]
-    if hotspot_home is not None:
-        command.extend(["--hotspot-home", str(hotspot_home)])
-    if config_template is not None:
-        command.extend(["--config-template", str(config_template)])
-    command_path = output_run_dir / "diagnostic_command.json"
-    command_path.parent.mkdir(parents=True, exist_ok=True)
-    command_path.write_text(json.dumps({"command": command}, indent=2) + "\n", encoding="utf-8")
-
-    result = subprocess.run(command, check=False, text=True, capture_output=True)
-    (output_run_dir / "diagnostic_stdout.txt").write_text(result.stdout, encoding="utf-8")
-    (output_run_dir / "diagnostic_stderr.txt").write_text(result.stderr, encoding="utf-8")
-    if result.returncode != 0:
-        raise HotSpotRunError(
-            f"HotSpot diagnostic run failed with exit code {result.returncode}; see {output_run_dir}",
-            run_dir=output_run_dir,
-            returncode=result.returncode,
+    try:
+        run_hotspot_without_positive_power_validation(
+            scenario_path=scenario_dir / "scenario.yaml",
+            out_dir=output_run_dir,
+            hotspot_home=hotspot_home,
+            config_template=config_template,
         )
+    except HotSpotRunError:
+        raise
+    except Exception as exc:
+        raise HotSpotRunError(f"diagnostic HotSpot run failed: {exc}", run_dir=output_run_dir) from exc
     if not valid_run_output(temp_path, manifest_path, expected_shape):
         raise HotSpotRunError(f"HotSpot diagnostic run completed but output is invalid: {output_run_dir}", run_dir=output_run_dir)
     return SourceRun(output_run_dir.name, output_run_dir, temp_path, runtime_from_manifest(manifest_path), False)
+
+
+def run_hotspot_without_positive_power_validation(
+    *,
+    scenario_path: Path,
+    out_dir: Path,
+    hotspot_home: Path | None,
+    config_template: Path,
+) -> None:
+    total_start = time.perf_counter()
+    runtime: dict[str, float] = {}
+    source_dir = out_dir / "source"
+    hotspot_dir = out_dir / "hotspot"
+    outputs_dir = out_dir / "outputs"
+    parsed_dir = out_dir / "parsed"
+    for path in (source_dir, hotspot_dir, outputs_dir, parsed_dir):
+        path.mkdir(parents=True, exist_ok=True)
+
+    stage_start = time.perf_counter()
+    sim = load_simulation_input(scenario_path)
+    runtime["load_s"] = time.perf_counter() - stage_start
+
+    stage_start = time.perf_counter()
+    validate_diagnostic_simulation_input(sim)
+    runtime["diagnostic_validate_s"] = time.perf_counter() - stage_start
+
+    stage_start = time.perf_counter()
+    scenario_source_paths = [
+        scenario_path,
+        sim.scenario.layout_path.resolve(),
+        sim.scenario.power_path.resolve(),
+        sim.scenario.package_path.resolve(),
+        sim.scenario.hotspot_path.resolve(),
+    ]
+    if sim.scenario.benchmark_path is not None:
+        scenario_source_paths.append(sim.scenario.benchmark_path.resolve())
+    for source_path in scenario_source_paths:
+        shutil.copyfile(source_path, source_dir / source_path.name)
+
+    flp_path = write_flp(sim.layout, hotspot_dir / "chiplet.flp")
+    ptrace_path = write_ptrace(sim.layout, sim.power, hotspot_dir / "power.ptrace")
+    config_path = write_hotspot_config(config_template, hotspot_dir / "hotspot.config", sim.package, sim.hotspot)
+    rows, cols = read_grid_shape(config_path)
+    runtime["write_inputs_s"] = time.perf_counter() - stage_start
+
+    block_steady_path = outputs_dir / "block.steady"
+    grid_steady_path = outputs_dir / "grid.steady"
+    home = (hotspot_home or resolve_hotspot_home()).resolve()
+    command = build_hotspot_command(
+        hotspot_home=home,
+        config_path=config_path.resolve(),
+        flp_path=flp_path.resolve(),
+        ptrace_path=ptrace_path.resolve(),
+        steady_path=block_steady_path.resolve(),
+        grid_steady_path=grid_steady_path.resolve(),
+    )
+    command_text = shlex.join(command)
+    (out_dir / "command.txt").write_text(command_text + "\n", encoding="utf-8")
+    (out_dir / "diagnostic_command.json").write_text(
+        json.dumps({"command": command, "command_string": command_text}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    stage_start = time.perf_counter()
+    result = run_hotspot(command, cwd=hotspot_dir)
+    runtime["hotspot_s"] = time.perf_counter() - stage_start
+    (outputs_dir / "stdout.txt").write_text(result.stdout, encoding="utf-8")
+    (outputs_dir / "stderr.txt").write_text(result.stderr, encoding="utf-8")
+    (out_dir / "diagnostic_stdout.txt").write_text(result.stdout, encoding="utf-8")
+    (out_dir / "diagnostic_stderr.txt").write_text(result.stderr, encoding="utf-8")
+    if result.returncode != 0:
+        raise HotSpotRunError(
+            f"HotSpot failed with exit code {result.returncode}. See {outputs_dir / 'stderr.txt'}",
+            run_dir=out_dir,
+            returncode=result.returncode,
+        )
+
+    stage_start = time.perf_counter()
+    layer0 = parse_layer_grid(grid_steady_path, layer=0, rows=rows, cols=cols)
+    np.save(parsed_dir / "temp_layer0.npy", layer0)
+    chiplet_names = tuple(chiplet.name for chiplet in sim.layout.chiplets)
+    block_temps = parse_block_temps(block_steady_path, names=chiplet_names)
+    (parsed_dir / "block_temps.json").write_text(json.dumps(block_temps, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    runtime["parse_s"] = time.perf_counter() - stage_start
+    runtime["total_s"] = time.perf_counter() - total_start
+
+    hottest_block, max_block_temp = max(block_temps.items(), key=lambda item: item[1])
+    output_summary = {
+        "temp_layer0_shape": list(layer0.shape),
+        "temp_layer0_min_K": float(layer0.min()),
+        "temp_layer0_max_K": float(layer0.max()),
+        "temp_layer0_mean_K": float(layer0.mean()),
+        "max_block_temperature_K": float(max_block_temp),
+        "hottest_block": hottest_block,
+        "grid_rows": rows,
+        "grid_cols": cols,
+    }
+    write_manifest(
+        out_dir / "manifest.json",
+        {
+            "schema_version": 1,
+            "created_at_utc": datetime.now(timezone.utc).isoformat(),
+            "scenario_name": sim.scenario.name,
+            "runtime": runtime,
+            "diagnostic_validation": "canonical positive-power checks bypassed; names, geometry, finite nonnegative powers, units, and required files still checked",
+            "hotspot": {
+                "home": str(home),
+                "binary": command[0],
+                "command": command,
+                "command_string": command_text,
+                "return_code": result.returncode,
+            },
+            "return_code": result.returncode,
+            "grid": {"rows": rows, "cols": cols},
+            "output_summary": output_summary,
+            "sources": {path.name: sha256_file(path) for path in scenario_source_paths},
+            "generated": {
+                "flp": str(flp_path.relative_to(out_dir)),
+                "ptrace": str(ptrace_path.relative_to(out_dir)),
+                "config": str(config_path.relative_to(out_dir)),
+                "block_steady": str(block_steady_path.relative_to(out_dir)),
+                "grid_steady": str(grid_steady_path.relative_to(out_dir)),
+                "temp_layer0": str((parsed_dir / "temp_layer0.npy").relative_to(out_dir)),
+                "block_temps": str((parsed_dir / "block_temps.json").relative_to(out_dir)),
+            },
+        },
+    )
+
+
+def validate_diagnostic_simulation_input(sim: SimulationInput) -> None:
+    errors: list[str] = []
+    _validate_layout(sim.layout, errors, min_spacing_mm=_min_spacing_mm(sim))
+    if sim.scenario.schema_version != 1:
+        errors.append(f"scenario.schema_version must be 1, got {sim.scenario.schema_version}")
+    if sim.package.schema_version != 1:
+        errors.append(f"package.schema_version must be 1, got {sim.package.schema_version}")
+    if sim.hotspot.schema_version != 1:
+        errors.append(f"hotspot.schema_version must be 1, got {sim.hotspot.schema_version}")
+    if sim.power.schema_version != 1:
+        errors.append(f"power.schema_version must be 1, got {sim.power.schema_version}")
+    if sim.power.units_power != "W":
+        errors.append("power.units.power must be 'W'")
+    if sim.power.mode != "fixed":
+        errors.append("power.mode must be 'fixed'")
+    if sim.power.active_workload != "nominal":
+        errors.append("diagnostic isolated-source runs require active_workload='nominal'")
+    if sim.power.workloads is None or "nominal" not in sim.power.workloads:
+        errors.append("power.workloads.nominal is required")
+
+    layout_names = {chiplet.name for chiplet in sim.layout.chiplets}
+    chiplet_names = set(sim.power.chiplet_watts)
+    nominal = sim.power.workloads.get("nominal", {}) if sim.power.workloads is not None else {}
+    nominal_names = set(nominal)
+    if chiplet_names != layout_names:
+        errors.append(f"top-level power chiplet names must match layout names; missing={sorted(layout_names - chiplet_names)}, extra={sorted(chiplet_names - layout_names)}")
+    if nominal_names != layout_names:
+        errors.append(f"nominal workload names must match layout names; missing={sorted(layout_names - nominal_names)}, extra={sorted(nominal_names - layout_names)}")
+    for name in sorted(layout_names):
+        top_value = sim.power.chiplet_watts.get(name)
+        nominal_value = nominal.get(name)
+        if top_value is None or nominal_value is None:
+            continue
+        if not math.isfinite(top_value) or top_value < 0.0:
+            errors.append(f"power.chiplets.{name} must be finite and nonnegative for diagnostics")
+        if not math.isfinite(nominal_value) or nominal_value < 0.0:
+            errors.append(f"power.workloads.nominal.{name} must be finite and nonnegative for diagnostics")
+        if abs(float(top_value) - float(nominal_value)) > 1.0e-9:
+            errors.append(f"power.chiplets.{name} must match power.workloads.nominal.{name}")
+
+    for option, value in sim.package.options.items():
+        if not math.isfinite(value) or value <= 0.0:
+            errors.append(f"package option {option} must be positive and finite")
+    if sim.hotspot.model_type != "grid":
+        errors.append("hotspot.model_type must be 'grid'")
+    if sim.hotspot.grid_rows <= 0 or sim.hotspot.grid_cols <= 0:
+        errors.append("hotspot grid rows and cols must be positive")
+    if sim.hotspot.grid_map_mode not in {"avg", "min", "max", "center"}:
+        errors.append("hotspot.grid.map_mode must be one of avg/min/max/center")
+    if sim.hotspot.leakage_used:
+        errors.append("diagnostic expects leakage_used=false to test linear power superposition")
+    if errors:
+        raise ValueError("\n".join(errors))
 
 
 def valid_run_output(temp_path: Path, manifest_path: Path, expected_shape: tuple[int, int]) -> bool:
@@ -484,6 +667,7 @@ def runtime_from_manifest(manifest_path: Path) -> float | None:
 
 
 def copy_source_with_power(source_dir: Path, destination: Path, modified_power: dict[str, Any]) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
     for name in ("scenario.yaml", "layout.json", "package.yaml", "hotspot.yaml", "benchmark.yaml"):
         source = source_dir / name
         if source.exists():
@@ -495,13 +679,13 @@ def modified_power_yaml(original: dict[str, Any], chiplet_values: dict[str, floa
     data = json.loads(json.dumps(original))
     values = {str(name): float(value) for name, value in chiplet_values.items()}
     data["mode"] = data.get("mode", "fixed")
+    data["active_workload"] = "nominal"
     data["chiplets"] = dict(values)
-    active = data.get("active_workload")
-    if active is not None and isinstance(data.get("workloads"), dict):
-        workloads = data["workloads"]
-        if active not in workloads:
-            workloads[active] = {}
-        workloads[active] = dict(values)
+    workloads = data.get("workloads")
+    if not isinstance(workloads, dict):
+        workloads = {}
+        data["workloads"] = workloads
+    workloads["nominal"] = dict(values)
     return data
 
 
@@ -975,6 +1159,14 @@ def load_yaml(path: Path) -> dict[str, Any]:
 
 def safe_name(name: str) -> str:
     return "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in name)
+
+
+def sha256_file(path: Path) -> str:
+    digest = sha256()
+    with path.open("rb") as fp:
+        for chunk in iter(lambda: fp.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def relative_to_repo(path: Path) -> str:

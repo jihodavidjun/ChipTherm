@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import yaml
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -69,9 +70,40 @@ def test_modified_power_yaml_sets_active_workload_and_chiplets() -> None:
     }
     modified = mod.modified_power_yaml(original, {"A": 0.0, "B": 7.0})
     assert original["workloads"]["nominal"]["B"] == 2.0
+    assert modified["active_workload"] == "nominal"
     assert modified["chiplets"] == {"A": 0.0, "B": 7.0}
     assert modified["workloads"]["nominal"] == {"A": 0.0, "B": 7.0}
     assert modified["workloads"]["peak"] == {"A": 3.0, "B": 4.0}
+
+
+def test_isolated_source_files_preserve_original_and_nominal_power(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    destination = tmp_path / "diagnostic_source"
+    source_dir.mkdir()
+    for name in ("scenario.yaml", "layout.json", "package.yaml", "hotspot.yaml"):
+        (source_dir / name).write_text(f"{name}: original\n", encoding="utf-8")
+    original_power = {
+        "schema_version": 1,
+        "units": {"power": "W"},
+        "mode": "fixed",
+        "active_workload": "nominal",
+        "workloads": {"nominal": {"CPU0": 50.0, "GPU0": 125.0, "IO0": 5.0}},
+        "chiplets": {"CPU0": 50.0, "GPU0": 125.0, "IO0": 5.0},
+    }
+    (source_dir / "power.yaml").write_text(yaml.safe_dump(original_power, sort_keys=False), encoding="utf-8")
+    original_text = (source_dir / "power.yaml").read_text(encoding="utf-8")
+
+    isolated = mod.isolated_power_map(original_power["chiplets"], "GPU0")
+    modified = mod.modified_power_yaml(original_power, isolated)
+    mod.copy_source_with_power(source_dir, destination, modified)
+
+    assert (source_dir / "power.yaml").read_text(encoding="utf-8") == original_text
+    written = yaml.safe_load((destination / "power.yaml").read_text(encoding="utf-8"))
+    assert written["active_workload"] == "nominal"
+    assert written["chiplets"]["GPU0"] == 125.0
+    assert written["chiplets"]["CPU0"] == 0.0
+    assert written["chiplets"]["IO0"] == 0.0
+    assert written["workloads"]["nominal"] == written["chiplets"]
 
 
 def test_resume_valid_output_detection(tmp_path: Path) -> None:
@@ -142,7 +174,7 @@ def test_output_safety_rejects_canonical_dataset_root() -> None:
 def main() -> int:
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
-            if name == "test_resume_valid_output_detection":
+            if name in {"test_resume_valid_output_detection", "test_isolated_source_files_preserve_original_and_nominal_power"}:
                 import tempfile
 
                 with tempfile.TemporaryDirectory() as tmp:
