@@ -29,8 +29,10 @@ from chiptherm.ml.source_response_dataset import (
     SourceResponseDataset,
     compute_source_response_normalization,
     normalize_source_input,
+    normalize_source_target_unit,
     save_source_response_normalization,
     source_response_collate,
+    unnormalize_source_prediction,
 )
 from chiptherm.ml.source_response_models import (
     build_source_response_model,
@@ -50,7 +52,6 @@ def main() -> int:
     parser.add_argument("--lr", default=1.0e-3, type=float)
     parser.add_argument("--base-channels", default=32, type=int)
     parser.add_argument("--depth", default=3, type=int)
-    parser.add_argument("--output-init-K-per-W", default=1.0e-4, type=float)
     parser.add_argument("--power-floor-W", default=1.0e-6, type=float)
     parser.add_argument("--low-power-warning-W", default=1.0, type=float)
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
@@ -77,7 +78,10 @@ def main() -> int:
         "channel_names": list(train_dataset.channel_names),
         "base_channels": args.base_channels,
         "depth": args.depth,
-        "output_init_K_per_W": args.output_init_K_per_W,
+        "output_mode": "linear_normalized",
+        "target_normalization_mode": stats.target_normalization_mode,
+        "target_unit_mean_K_per_W": stats.target_unit_mean_K_per_W,
+        "target_unit_std_K_per_W": stats.target_unit_std_K_per_W,
         "power_floor_W": args.power_floor_W,
     }
     model = build_source_response_model(model_config).to(device)
@@ -92,7 +96,7 @@ def main() -> int:
         "val_index": str(args.val_index),
         "model_config": model_config,
         "optimizer": "AdamW",
-        "loss": "SmoothL1 on unit response K/W; best checkpoint selected by validation package full-grid MAE",
+        "loss": "SmoothL1 on train-standardized unit response K/W; best checkpoint selected by validation package full-grid MAE",
         "parameter_count": count_parameters(model),
         "args": json_safe(vars(args)),
     }
@@ -121,6 +125,9 @@ def main() -> int:
             f"epoch {epoch:03d} train_loss={train_loss:.6f} "
             f"val_source_K={val_metrics['source_physical']['mae_K']:.4f} "
             f"val_source_K_per_W={val_metrics['source_unit']['mae_K_per_W']:.6f} "
+            f"pred_K_per_W_mean={val_metrics['prediction_stats']['pred_unit_K_per_W']['mean']:.6f} "
+            f"pred_K_per_W_std={val_metrics['prediction_stats']['pred_unit_K_per_W']['std']:.6f} "
+            f"neg_frac={val_metrics['prediction_stats']['negative_unit_response_fraction']:.4f} "
             f"val_package_mae={package_mae:.4f} best={best_val_package_mae:.4f}"
         )
     if best_payload is not None:
@@ -135,10 +142,10 @@ def train_one_epoch(model: nn.Module, loader: DataLoader, stats: Any, criterion:
     count = 0
     for batch in loader:
         x = normalize_source_input(batch["x"].to(device), stats)
-        target = batch["target_unit"].to(device)
+        target = normalize_source_target_unit(batch["target_unit"].to(device), stats)
         optimizer.zero_grad(set_to_none=True)
-        pred = model(x)
-        loss = criterion(pred, target)
+        pred_normalized = model(x)
+        loss = criterion(pred_normalized, target)
         loss.backward()
         optimizer.step()
         total += float(loss.item()) * int(x.shape[0])
@@ -151,16 +158,25 @@ def evaluate_model(model: nn.Module, loader: DataLoader, stats: Any, device: tor
     model.eval()
     source_unit_errors: list[np.ndarray] = []
     source_physical_errors: list[np.ndarray] = []
+    pred_unit_values: list[np.ndarray] = []
+    pred_rise_values: list[np.ndarray] = []
+    negative_count = 0
+    prediction_count = 0
     groups: dict[str, dict[str, Any]] = {}
     for batch in loader:
         x = normalize_source_input(batch["x"].to(device), stats)
         source_power = batch["source_power_W"].to(device)
-        pred_unit = model(x)
+        pred_normalized = model(x)
+        pred_unit = unnormalize_source_prediction(pred_normalized, stats)
         pred_rise = predict_source_rise(pred_unit, source_power)
         target_unit = batch["target_unit"].to(device)
         target_rise = batch["target_rise"].to(device)
         source_unit_errors.append((pred_unit - target_unit).detach().cpu().numpy())
         source_physical_errors.append((pred_rise - target_rise).detach().cpu().numpy())
+        pred_unit_values.append(pred_unit.detach().cpu().numpy().reshape(-1))
+        pred_rise_values.append(pred_rise.detach().cpu().numpy().reshape(-1))
+        negative_count += int((pred_unit < 0.0).sum().item())
+        prediction_count += int(pred_unit.numel())
         pred_np = pred_rise.detach().cpu().numpy()
         target_np = target_rise.detach().cpu().numpy()
         full_np = batch["full_temperature"].detach().cpu().numpy()
@@ -186,7 +202,18 @@ def evaluate_model(model: nn.Module, loader: DataLoader, stats: Any, device: tor
     source_unit = aggregate_error(np.concatenate([e.reshape(-1) for e in source_unit_errors]), suffix="K_per_W")
     source_physical = aggregate_error(np.concatenate([e.reshape(-1) for e in source_physical_errors]), suffix="K")
     package = package_metrics(groups)
-    return {"source_unit": source_unit, "source_physical": source_physical, "package_reconstruction": package["overall"], "package_by_case": package["by_case"]}
+    prediction_stats = {
+        "pred_unit_K_per_W": describe_values(np.concatenate(pred_unit_values), warning=None),
+        "pred_source_rise_K": describe_values(np.concatenate(pred_rise_values), warning=None),
+        "negative_unit_response_fraction": float(negative_count / max(prediction_count, 1)),
+    }
+    return {
+        "source_unit": source_unit,
+        "source_physical": source_physical,
+        "package_reconstruction": package["overall"],
+        "package_by_case": package["by_case"],
+        "prediction_stats": prediction_stats,
+    }
 
 
 def package_metrics(groups: dict[str, dict[str, Any]]) -> dict[str, Any]:
@@ -291,6 +318,8 @@ def describe_source_targets(dataset: SourceResponseDataset, warning: float) -> d
 def describe_values(values: np.ndarray, warning: float | None) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "min": float(np.min(values)),
+        "mean": float(np.mean(values)),
+        "std": float(np.std(values)),
         "p01": float(np.percentile(values, 1)),
         "p05": float(np.percentile(values, 5)),
         "p50": float(np.percentile(values, 50)),
@@ -321,10 +350,32 @@ def make_loader(dataset: SourceResponseDataset, batch_size: int, shuffle: bool, 
 
 def init_log(path: Path) -> None:
     with path.open("w", newline="", encoding="utf-8") as fp:
-        csv.writer(fp).writerow(["epoch", "train_loss", "val_source_mae_K_per_W", "val_source_mae_K", "val_package_mae_K", "val_package_rmse_K", "epoch_runtime_s", "is_best"])
+        csv.writer(fp).writerow(
+            [
+                "epoch",
+                "train_loss_normalized",
+                "val_source_mae_K_per_W",
+                "val_source_mae_K",
+                "val_package_mae_K",
+                "val_package_rmse_K",
+                "pred_K_per_W_mean",
+                "pred_K_per_W_std",
+                "pred_K_per_W_min",
+                "pred_K_per_W_max",
+                "pred_source_rise_K_mean",
+                "pred_source_rise_K_std",
+                "pred_source_rise_K_min",
+                "pred_source_rise_K_max",
+                "negative_prediction_fraction",
+                "epoch_runtime_s",
+                "is_best",
+            ]
+        )
 
 
 def append_log(path: Path, epoch: int, train_loss: float, val_metrics: dict[str, Any], runtime: float, is_best: bool) -> None:
+    pred_unit = val_metrics["prediction_stats"]["pred_unit_K_per_W"]
+    pred_rise = val_metrics["prediction_stats"]["pred_source_rise_K"]
     with path.open("a", newline="", encoding="utf-8") as fp:
         csv.writer(fp).writerow([
             epoch,
@@ -333,6 +384,15 @@ def append_log(path: Path, epoch: int, train_loss: float, val_metrics: dict[str,
             val_metrics["source_physical"]["mae_K"],
             val_metrics["package_reconstruction"]["mae_K"],
             val_metrics["package_reconstruction"]["rmse_K"],
+            pred_unit["mean"],
+            pred_unit["std"],
+            pred_unit["min"],
+            pred_unit["max"],
+            pred_rise["mean"],
+            pred_rise["std"],
+            pred_rise["min"],
+            pred_rise["max"],
+            val_metrics["prediction_stats"]["negative_unit_response_fraction"],
             runtime,
             int(is_best),
         ])

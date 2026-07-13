@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from typing import Any
 
 import torch
@@ -10,14 +9,6 @@ import torch.nn.functional as F
 
 def count_parameters(module: nn.Module) -> int:
     return sum(parameter.numel() for parameter in module.parameters() if parameter.requires_grad)
-
-
-def inverse_softplus(value: float) -> float:
-    if value <= 0.0:
-        raise ValueError("inverse_softplus value must be positive")
-    if value > 20.0:
-        return float(value)
-    return float(math.log(math.expm1(value)))
 
 
 class ConvBlock(nn.Module):
@@ -35,14 +26,14 @@ class ConvBlock(nn.Module):
 
 
 class SourceResponseOperatorV1(nn.Module):
-    """Raster source-response operator that predicts nonnegative unit response K/W."""
+    """Raster source-response operator that predicts standardized unit response K/W."""
 
     def __init__(
         self,
         input_channels: int,
         base_channels: int = 32,
         depth: int = 3,
-        output_init_K_per_W: float = 1.0e-4,
+        output_mode: str = "linear_normalized",
     ) -> None:
         super().__init__()
         if input_channels <= 0:
@@ -51,13 +42,13 @@ class SourceResponseOperatorV1(nn.Module):
             raise ValueError("base_channels must be positive")
         if depth < 2:
             raise ValueError("depth must be at least 2")
-        if output_init_K_per_W <= 0.0:
-            raise ValueError("output_init_K_per_W must be positive")
+        if output_mode != "linear_normalized":
+            raise ValueError(f"unsupported source-response output mode: {output_mode}")
         self.architecture = "source_response_operator_v1"
         self.input_channels = int(input_channels)
         self.base_channels = int(base_channels)
         self.depth = int(depth)
-        self.output_init_K_per_W = float(output_init_K_per_W)
+        self.output_mode = output_mode
 
         channels = [base_channels * (2**index) for index in range(depth)]
         encoders: list[nn.Module] = []
@@ -75,8 +66,6 @@ class SourceResponseOperatorV1(nn.Module):
             current = skip_channels
         self.decoders = nn.ModuleList(decoders)
         self.head = nn.Conv2d(current, 1, kernel_size=1)
-        nn.init.zeros_(self.head.weight)
-        nn.init.constant_(self.head.bias, inverse_softplus(self.output_init_K_per_W))
 
     def forward_raw(self, x: torch.Tensor) -> torch.Tensor:
         skips: list[torch.Tensor] = []
@@ -93,7 +82,7 @@ class SourceResponseOperatorV1(nn.Module):
         return self.head(h).squeeze(1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.softplus(self.forward_raw(x))
+        return self.forward_raw(x)
 
     def config(self) -> dict[str, Any]:
         return {
@@ -101,7 +90,8 @@ class SourceResponseOperatorV1(nn.Module):
             "input_channels": self.input_channels,
             "base_channels": self.base_channels,
             "depth": self.depth,
-            "output_init_K_per_W": self.output_init_K_per_W,
+            "output_mode": self.output_mode,
+            "target_normalization_mode": "standardized_unit_response_K_per_W",
             "parameter_count": count_parameters(self),
         }
 
@@ -114,7 +104,7 @@ def build_source_response_model(config: dict[str, Any]) -> nn.Module:
         input_channels=int(config["input_channels"]),
         base_channels=int(config.get("base_channels", 32)),
         depth=int(config.get("depth", 3)),
-        output_init_K_per_W=float(config.get("output_init_K_per_W", 1.0e-4)),
+        output_mode=str(config.get("output_mode", "linear_normalized")),
     )
 
 

@@ -28,6 +28,7 @@ from chiptherm.ml.source_response_dataset import (
     SourceResponseNormalizationStats,
     normalize_source_input,
     source_response_collate,
+    unnormalize_source_prediction,
 )
 from chiptherm.ml.source_response_models import build_source_response_model, count_parameters, predict_source_rise
 from scripts.run_superposition_diagnostic import chiplet_metrics, field_metrics, load_json
@@ -43,6 +44,7 @@ def main() -> int:
     parser.add_argument("--num-workers", default=0, type=int)
     parser.add_argument("--save-predictions", action="store_true")
     parser.add_argument("--profile-runtime", action="store_true")
+    parser.add_argument("--clamp-unit-response-min", default=None, type=float, help="Optional evaluation-only lower clamp in K/W. Default: disabled.")
     args = parser.parse_args()
 
     device = select_device(args.device)
@@ -56,7 +58,15 @@ def main() -> int:
 
     dataset = SourceResponseDataset(args.source_index, power_floor_W=float(checkpoint["model_config"].get("power_floor_W", stats.power_floor_W)))
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=device.type == "cuda", collate_fn=source_response_collate)
-    results = evaluate(model, loader, stats, device, save_predictions=args.save_predictions, out_dir=out_dir)
+    results = evaluate(
+        model,
+        loader,
+        stats,
+        device,
+        save_predictions=args.save_predictions,
+        out_dir=out_dir,
+        clamp_unit_response_min=args.clamp_unit_response_min,
+    )
     payload = {
         "schema_version": 1,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -67,6 +77,8 @@ def main() -> int:
         "source_level": results["source_level"],
         "package_reconstruction": results["package_reconstruction"],
         "oracle_reconstruction": results["oracle_reconstruction"],
+        "prediction_stats": results["prediction_stats"],
+        "evaluation_options": {"clamp_unit_response_min": args.clamp_unit_response_min},
         "runtime": results["runtime"],
     }
     (out_dir / "metrics.json").write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -77,6 +89,14 @@ def main() -> int:
     print(f"Packages: {results['package_reconstruction']['num_packages']}")
     print(f"Source physical MAE/RMSE: {results['source_level']['physical_mae_K']:.4f} / {results['source_level']['physical_rmse_K']:.4f} K")
     print(f"Package MAE/RMSE: {results['package_reconstruction']['mae_K']:.4f} / {results['package_reconstruction']['rmse_K']:.4f} K")
+    print(
+        "Predicted K/W mean/std/min/max: "
+        f"{results['prediction_stats']['pred_unit_K_per_W']['mean']:.6f} / "
+        f"{results['prediction_stats']['pred_unit_K_per_W']['std']:.6f} / "
+        f"{results['prediction_stats']['pred_unit_K_per_W']['min']:.6f} / "
+        f"{results['prediction_stats']['pred_unit_K_per_W']['max']:.6f}"
+    )
+    print(f"Negative K/W fraction: {results['prediction_stats']['negative_unit_response_fraction_used']:.4f}")
     if args.profile_runtime:
         print(f"Runtime/source: {results['runtime']['seconds_per_source']:.6f} s")
         print(f"Runtime/package: {results['runtime']['seconds_per_package']:.6f} s")
@@ -84,16 +104,34 @@ def main() -> int:
 
 
 @torch.no_grad()
-def evaluate(model: torch.nn.Module, loader: DataLoader, stats: SourceResponseNormalizationStats, device: torch.device, *, save_predictions: bool, out_dir: Path) -> dict[str, Any]:
+def evaluate(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    stats: SourceResponseNormalizationStats,
+    device: torch.device,
+    *,
+    save_predictions: bool,
+    out_dir: Path,
+    clamp_unit_response_min: float | None,
+) -> dict[str, Any]:
     source_records: list[dict[str, Any]] = []
     groups: dict[str, dict[str, Any]] = {}
     source_unit_errors: list[np.ndarray] = []
     source_physical_errors: list[np.ndarray] = []
+    pred_unit_values: list[np.ndarray] = []
+    pred_rise_values: list[np.ndarray] = []
+    negative_count_raw = 0
+    negative_count_used = 0
+    prediction_count = 0
     start = time.perf_counter()
     for batch in loader:
         x = normalize_source_input(batch["x"].to(device), stats)
         power = batch["source_power_W"].to(device)
-        pred_unit = model(x)
+        pred_normalized = model(x)
+        pred_unit_raw = unnormalize_source_prediction(pred_normalized, stats)
+        pred_unit = pred_unit_raw
+        if clamp_unit_response_min is not None:
+            pred_unit = torch.clamp(pred_unit, min=float(clamp_unit_response_min))
         pred_rise = predict_source_rise(pred_unit, power)
         target_unit = batch["target_unit"].to(device)
         target_rise = batch["target_rise"].to(device)
@@ -101,6 +139,11 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, stats: SourceResponseNo
         physical_error = (pred_rise - target_rise).detach().cpu().numpy()
         source_unit_errors.append(unit_error)
         source_physical_errors.append(physical_error)
+        pred_unit_values.append(pred_unit.detach().cpu().numpy().reshape(-1))
+        pred_rise_values.append(pred_rise.detach().cpu().numpy().reshape(-1))
+        negative_count_raw += int((pred_unit_raw < 0.0).sum().item())
+        negative_count_used += int((pred_unit < 0.0).sum().item())
+        prediction_count += int(pred_unit.numel())
         pred_np = pred_rise.detach().cpu().numpy()
         target_np = target_rise.detach().cpu().numpy()
         full_np = batch["full_temperature"].detach().cpu().numpy()
@@ -145,6 +188,12 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, stats: SourceResponseNo
     source_physical = np.concatenate([e.reshape(-1) for e in source_physical_errors])
     package_summary = summarize_package_records(packages, prefix="")
     oracle_summary = summarize_package_records(packages, prefix="oracle_")
+    prediction_stats = {
+        "pred_unit_K_per_W": describe_values(np.concatenate(pred_unit_values)),
+        "pred_source_rise_K": describe_values(np.concatenate(pred_rise_values)),
+        "negative_unit_response_fraction_raw": float(negative_count_raw / max(prediction_count, 1)),
+        "negative_unit_response_fraction_used": float(negative_count_used / max(prediction_count, 1)),
+    }
     return {
         "source_level": {
             "num_sources": len(source_records),
@@ -157,11 +206,26 @@ def evaluate(model: torch.nn.Module, loader: DataLoader, stats: SourceResponseNo
         "oracle_reconstruction": oracle_summary,
         "source_records": source_records,
         "case_records": case_records,
+        "prediction_stats": prediction_stats,
         "runtime": {
             "total_forward_seconds": elapsed,
             "seconds_per_source": elapsed / max(len(source_records), 1),
             "seconds_per_package": elapsed / max(package_summary["num_packages"], 1),
         },
+    }
+
+
+def describe_values(values: np.ndarray) -> dict[str, float]:
+    return {
+        "min": float(np.min(values)),
+        "mean": float(np.mean(values)),
+        "std": float(np.std(values)),
+        "p01": float(np.percentile(values, 1)),
+        "p05": float(np.percentile(values, 5)),
+        "p50": float(np.percentile(values, 50)),
+        "p95": float(np.percentile(values, 95)),
+        "p99": float(np.percentile(values, 99)),
+        "max": float(np.max(values)),
     }
 
 

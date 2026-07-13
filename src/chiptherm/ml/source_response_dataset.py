@@ -67,6 +67,7 @@ class SourceResponseNormalizationStats:
     target_unit_abs_max_K_per_W: float
     power_floor_W: float
     num_sources: int
+    target_normalization_mode: str = "standardized_unit_response_K_per_W"
     notes: str = "Computed from train source-response split only. Binary masks and normalized coordinates are not standardized."
 
     def to_dict(self) -> dict[str, Any]:
@@ -80,6 +81,7 @@ class SourceResponseNormalizationStats:
         payload = dict(data)
         for key in ("channel_names", "channel_means", "channel_stds", "normalized_channel_indices"):
             payload[key] = tuple(payload.get(key, ()))
+        payload.setdefault("target_normalization_mode", "standardized_unit_response_K_per_W")
         return cls(**payload)
 
 
@@ -292,6 +294,16 @@ def normalize_source_input(x: torch.Tensor, stats: SourceResponseNormalizationSt
         std = max(float(stats.channel_stds[int(channel)]), EPSILON)
         result[:, int(channel)] = (result[:, int(channel)] - mean) / std
     return result
+
+
+def normalize_source_target_unit(target_unit_K_per_W: torch.Tensor, stats: SourceResponseNormalizationStats) -> torch.Tensor:
+    std = max(float(stats.target_unit_std_K_per_W), EPSILON)
+    return (target_unit_K_per_W.float() - float(stats.target_unit_mean_K_per_W)) / std
+
+
+def unnormalize_source_prediction(pred_normalized: torch.Tensor, stats: SourceResponseNormalizationStats) -> torch.Tensor:
+    std = max(float(stats.target_unit_std_K_per_W), EPSILON)
+    return pred_normalized.float() * std + float(stats.target_unit_mean_K_per_W)
 
 
 def save_source_response_normalization(stats: SourceResponseNormalizationStats, path: str | Path) -> None:
