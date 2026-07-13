@@ -194,6 +194,8 @@ def main() -> int:
         "pairwise_contribution": metrics.get("pairwise_contribution"),
         "pairwise_self": metrics.get("pairwise_self"),
         "pairwise_node_correction": metrics.get("pairwise_node_correction"),
+        "pairwise_basis_coeff": metrics.get("pairwise_basis_coeff"),
+        "pairwise_basis_weighted_coeff": metrics.get("pairwise_basis_weighted_coeff"),
         "cnn_only_final_temperature": metrics.get("cnn_only_final_temperature"),
         "cnn_only_centered_field": metrics.get("cnn_only_centered_field"),
         "graph_improvement": metrics.get("graph_improvement"),
@@ -270,6 +272,13 @@ def main() -> int:
             f"{metrics['pairwise_k']['mean']:.6f} / {metrics['pairwise_k']['std']:.6f} / "
             f"{metrics['pairwise_k']['abs_mean']:.6f}"
         )
+    if metrics.get("pairwise_basis_coeff"):
+        print(
+            "Pairwise basis coeff mean/std/abs_mean: "
+            f"{metrics['pairwise_basis_coeff']['mean']:.6f} / "
+            f"{metrics['pairwise_basis_coeff']['std']:.6f} / "
+            f"{metrics['pairwise_basis_coeff']['abs_mean']:.6f}"
+        )
     print(f"CNN final MAE/RMSE: {final_mae:.3f} / {final_rmse:.3f} K")
     print(f"Parameter count: {count_parameters(model)}")
     print(f"Improvement: MAE {improvement['mae_percent']:.2f}% / RMSE {improvement['rmse_percent']:.2f}%")
@@ -317,6 +326,8 @@ def evaluate(
     pairwise_contribution_acc = ScalarSummaryAccumulator()
     pairwise_self_acc = ScalarSummaryAccumulator()
     pairwise_node_acc = ScalarSummaryAccumulator()
+    basis_coeff_acc = VectorSummaryAccumulator()
+    basis_weighted_coeff_acc = VectorSummaryAccumulator()
     graph_rows: list[dict[str, Any]] = []
     chiplet_rows: list[dict[str, Any]] = []
     gate_rows: list[dict[str, Any]] = []
@@ -393,7 +404,15 @@ def evaluate(
                 cnn_only_centered = cnn_only_temperature - cnn_only_temperature.mean(dim=(-2, -1), keepdim=True)
                 cnn_only_final_acc.update(cnn_only_temperature, temperature)
                 cnn_only_centered_acc.update(cnn_only_centered, centered_target)
-            update_pairwise_summaries(outputs, pairwise_k_acc, pairwise_contribution_acc, pairwise_self_acc, pairwise_node_acc)
+            update_pairwise_summaries(
+                outputs,
+                pairwise_k_acc,
+                pairwise_contribution_acc,
+                pairwise_self_acc,
+                pairwise_node_acc,
+                basis_coeff_acc,
+                basis_weighted_coeff_acc,
+            )
             coarse_temperature = None
         elif hasattr(model, "forward_components"):
             if conditioned:
@@ -532,6 +551,10 @@ def evaluate(
         metrics["pairwise_contribution"] = pairwise_contribution_acc.compute()
         metrics["pairwise_self"] = pairwise_self_acc.compute()
         metrics["pairwise_node_correction"] = pairwise_node_acc.compute()
+    basis_summary = basis_coeff_acc.compute()
+    if basis_summary:
+        metrics["pairwise_basis_coeff"] = basis_summary
+        metrics["pairwise_basis_weighted_coeff"] = basis_weighted_coeff_acc.compute()
     gate_summary = gate_acc.compute()
     if gate_summary:
         metrics["physics_gate"] = gate_summary
@@ -626,7 +649,11 @@ def profile_components(
             measured += 1
         if measured >= profile_batches:
             break
-    pairwise = str(getattr(model, "architecture", "")) == "miniunet_refine_conditioned_decomposed_pairwise"
+    architecture = str(getattr(model, "architecture", ""))
+    pairwise = architecture in {
+        "miniunet_refine_conditioned_decomposed_pairwise",
+        "miniunet_refine_conditioned_decomposed_pairwise_basis",
+    }
     return {
         "warmup_batches": warmup_batches,
         "profiled_batches": measured,
@@ -641,7 +668,9 @@ def profile_components(
             "status": "vectorized over graphs, nodes, and grid cells; uses a small loop over raster-channel chunks to avoid materializing [N, C, H, W].",
             "gradient_path": (
                 "pairwise node corrections are multiplied by differentiable halo weights and added directly to the centered field."
-                if pairwise
+                if architecture == "miniunet_refine_conditioned_decomposed_pairwise"
+                else "pairwise basis coefficients weight differentiable directional basis maps and are added directly to the centered field."
+                if architecture == "miniunet_refine_conditioned_decomposed_pairwise_basis"
                 else "node_raster_head outputs are multiplied by differentiable halo weights, then consumed by convolutional fusion."
             ),
             "optimization_opportunity": "Caching static node-to-grid weights helps repeated fixed-geometry inference; a custom kernel could fuse weight construction and accumulation if PyTorch memory traffic remains limiting.",
@@ -858,13 +887,19 @@ def update_pairwise_summaries(
     contribution_acc: ScalarSummaryAccumulator,
     self_acc: ScalarSummaryAccumulator,
     node_acc: ScalarSummaryAccumulator,
+    basis_coeff_acc: VectorSummaryAccumulator | None = None,
+    basis_weighted_coeff_acc: VectorSummaryAccumulator | None = None,
 ) -> None:
-    if "pairwise_k_values" not in outputs:
-        return
-    k_acc.update(outputs["pairwise_k_values"])
-    contribution_acc.update(outputs["pairwise_contributions"])
-    self_acc.update(outputs["pairwise_self_corrections"])
-    node_acc.update(outputs["pairwise_node_corrections"])
+    if "pairwise_k_values" in outputs:
+        k_acc.update(outputs["pairwise_k_values"])
+        contribution_acc.update(outputs["pairwise_contributions"])
+        self_acc.update(outputs["pairwise_self_corrections"])
+        node_acc.update(outputs["pairwise_node_corrections"])
+    if "pairwise_basis_coefficients" in outputs:
+        if basis_coeff_acc is not None:
+            basis_coeff_acc.update(outputs["pairwise_basis_coefficients"])
+        if basis_weighted_coeff_acc is not None:
+            basis_weighted_coeff_acc.update(outputs["pairwise_basis_weighted_coefficients"])
 
 
 def append_chiplet_rows(
@@ -1157,6 +1192,69 @@ class ScalarSummaryAccumulator:
             "min": float(array.min()),
             "max": float(array.max()),
             "abs_mean": float(np.abs(array).mean()),
+        }
+
+
+class VectorSummaryAccumulator:
+    def __init__(self) -> None:
+        self.count = 0
+        self.total: torch.Tensor | None = None
+        self.total_abs: torch.Tensor | None = None
+        self.total_sq: torch.Tensor | None = None
+        self.positive: torch.Tensor | None = None
+        self.minimum: torch.Tensor | None = None
+        self.maximum: torch.Tensor | None = None
+
+    def update(self, value: torch.Tensor) -> None:
+        data = value.detach().float().reshape(-1, value.shape[-1]).cpu()
+        if data.numel() == 0:
+            return
+        if self.total is None:
+            dim = int(data.shape[1])
+            self.total = torch.zeros(dim, dtype=torch.float64)
+            self.total_abs = torch.zeros(dim, dtype=torch.float64)
+            self.total_sq = torch.zeros(dim, dtype=torch.float64)
+            self.positive = torch.zeros(dim, dtype=torch.float64)
+            self.minimum = torch.full((dim,), float("inf"), dtype=torch.float64)
+            self.maximum = torch.full((dim,), -float("inf"), dtype=torch.float64)
+        data64 = data.double()
+        self.count += int(data64.shape[0])
+        self.total += data64.sum(dim=0)
+        self.total_abs += data64.abs().sum(dim=0)
+        self.total_sq += (data64 * data64).sum(dim=0)
+        self.positive += (data64 > 0.0).double().sum(dim=0)
+        self.minimum = torch.minimum(self.minimum, data64.min(dim=0).values)
+        self.maximum = torch.maximum(self.maximum, data64.max(dim=0).values)
+
+    def compute(self) -> dict[str, Any]:
+        if self.count == 0 or self.total is None:
+            return {}
+        mean = self.total / float(self.count)
+        abs_mean = self.total_abs / float(self.count)
+        variance = torch.clamp(self.total_sq / float(self.count) - mean * mean, min=0.0)
+        std = torch.sqrt(variance)
+        positive_fraction = self.positive / float(self.count)
+        by_basis = []
+        for index in range(int(mean.numel())):
+            by_basis.append(
+                {
+                    "basis_index": index,
+                    "mean": float(mean[index].item()),
+                    "std": float(std[index].item()),
+                    "abs_mean": float(abs_mean[index].item()),
+                    "min": float(self.minimum[index].item()),
+                    "max": float(self.maximum[index].item()),
+                    "positive_fraction": float(positive_fraction[index].item()),
+                    "negative_fraction": float(1.0 - positive_fraction[index].item()),
+                }
+            )
+        return {
+            "mean": float(mean.mean().item()),
+            "std": float(std.mean().item()),
+            "abs_mean": float(abs_mean.mean().item()),
+            "min": float(self.minimum.min().item()),
+            "max": float(self.maximum.max().item()),
+            "by_basis": by_basis,
         }
 
 

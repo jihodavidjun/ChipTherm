@@ -64,6 +64,7 @@ def main() -> int:
             "miniunet_refine_conditioned_decomposed",
             "miniunet_refine_conditioned_decomposed_graph",
             "miniunet_refine_conditioned_decomposed_pairwise",
+            "miniunet_refine_conditioned_decomposed_pairwise_basis",
         ],
     )
     parser.add_argument("--refine-channels", default=32, type=int)
@@ -91,6 +92,11 @@ def main() -> int:
     parser.add_argument("--lambda-graph", default=0.0, type=float)
     parser.add_argument("--pairwise-hidden-dim", default=96, type=int)
     parser.add_argument("--pairwise-layers", default=3, type=int)
+    parser.add_argument("--pairwise-basis-rank", default=8, type=int)
+    parser.add_argument("--pairwise-basis-hidden-dim", default=96, type=int)
+    parser.add_argument("--pairwise-basis-layers", default=3, type=int)
+    parser.add_argument("--pairwise-basis-halo-decay-mm", default=4.0, type=float)
+    parser.add_argument("--pairwise-basis-edge-chunk-size", default=512, type=int)
     parser.add_argument("--lambda-chiplet-mean", default=0.0, type=float)
     parser.add_argument("--freeze-cnn", action="store_true")
     parser.add_argument("--init-checkpoint", default=None, type=Path, help="Optional checkpoint used to initialize matching model or CNN-submodule weights.")
@@ -130,20 +136,33 @@ def main() -> int:
         raise SystemExit("--pairwise-hidden-dim must be positive")
     if args.pairwise_layers <= 0:
         raise SystemExit("--pairwise-layers must be positive")
+    if not 1 <= args.pairwise_basis_rank <= 8:
+        raise SystemExit("--pairwise-basis-rank must be in [1, 8]")
+    if args.pairwise_basis_hidden_dim <= 0:
+        raise SystemExit("--pairwise-basis-hidden-dim must be positive")
+    if args.pairwise_basis_layers <= 0:
+        raise SystemExit("--pairwise-basis-layers must be positive")
+    if args.pairwise_basis_halo_decay_mm <= 0.0:
+        raise SystemExit("--pairwise-basis-halo-decay-mm must be positive")
+    if args.pairwise_basis_edge_chunk_size <= 0:
+        raise SystemExit("--pairwise-basis-edge-chunk-size must be positive")
     is_generic_graph_arch = args.model_architecture == "miniunet_refine_conditioned_decomposed_graph"
     is_pairwise_arch = args.model_architecture == "miniunet_refine_conditioned_decomposed_pairwise"
-    is_graph_arch = is_generic_graph_arch or is_pairwise_arch
+    is_pairwise_basis_arch = args.model_architecture == "miniunet_refine_conditioned_decomposed_pairwise_basis"
+    is_graph_arch = is_generic_graph_arch or is_pairwise_arch or is_pairwise_basis_arch
     is_conditioned_arch = args.model_architecture in {
         "miniunet_refine_conditioned",
         "miniunet_refine_conditioned_decomposed",
         "miniunet_refine_conditioned_decomposed_graph",
         "miniunet_refine_conditioned_decomposed_pairwise",
+        "miniunet_refine_conditioned_decomposed_pairwise_basis",
     }
     is_decomposed_arch = args.model_architecture in {
         "miniunet_refine_decomposed",
         "miniunet_refine_conditioned_decomposed",
         "miniunet_refine_conditioned_decomposed_graph",
         "miniunet_refine_conditioned_decomposed_pairwise",
+        "miniunet_refine_conditioned_decomposed_pairwise_basis",
     }
     if args.physics_input == "gated_v1" and not is_conditioned_arch:
         raise SystemExit("--physics-input gated_v1 requires a metadata-conditioned architecture")
@@ -242,6 +261,18 @@ def main() -> int:
                 "source_power_feature_index": 6,
             }
         )
+    if is_pairwise_basis_arch:
+        model_config.update(
+            {
+                "pairwise_basis_enabled": True,
+                "pairwise_basis_rank": args.pairwise_basis_rank,
+                "pairwise_basis_hidden_dim": args.pairwise_basis_hidden_dim,
+                "pairwise_basis_layers": args.pairwise_basis_layers,
+                "pairwise_basis_halo_decay_mm": args.pairwise_basis_halo_decay_mm,
+                "pairwise_basis_edge_chunk_size": args.pairwise_basis_edge_chunk_size,
+                "source_power_feature_index": 6,
+            }
+        )
 
     config = {
         "schema_version": 1,
@@ -272,6 +303,11 @@ def main() -> int:
         "lambda_graph": args.lambda_graph,
         "pairwise_hidden_dim": args.pairwise_hidden_dim,
         "pairwise_layers": args.pairwise_layers,
+        "pairwise_basis_rank": args.pairwise_basis_rank,
+        "pairwise_basis_hidden_dim": args.pairwise_basis_hidden_dim,
+        "pairwise_basis_layers": args.pairwise_basis_layers,
+        "pairwise_basis_halo_decay_mm": args.pairwise_basis_halo_decay_mm,
+        "pairwise_basis_edge_chunk_size": args.pairwise_basis_edge_chunk_size,
         "lambda_chiplet_mean": args.lambda_chiplet_mean,
         "freeze_cnn": args.freeze_cnn,
         "init_checkpoint": str(args.init_checkpoint.resolve()) if args.init_checkpoint else None,
@@ -293,6 +329,7 @@ def main() -> int:
         "metadata_conditioning": is_conditioned_arch,
         "graph_enabled": is_graph_arch,
         "pairwise_enabled": is_pairwise_arch,
+        "pairwise_basis_enabled": is_pairwise_basis_arch,
         "model": model_config,
         "loss": (
             "SmoothL1Loss on normalized residual plus optional temp_loss_weight * L1(T_pred, HotSpot) / residual_std "
@@ -537,6 +574,8 @@ def train_one_epoch(
     pairwise_contribution_acc = ScalarSummaryAccumulator()
     pairwise_self_acc = ScalarSummaryAccumulator()
     pairwise_node_acc = ScalarSummaryAccumulator()
+    basis_coeff_acc = VectorSummaryAccumulator()
+    basis_weighted_coeff_acc = VectorSummaryAccumulator()
     total_samples = 0
     for batch in loader:
         x = batch["x"].to(device, non_blocking=True)
@@ -584,7 +623,15 @@ def train_one_epoch(
                 if lambda_graph > 0.0:
                     loss = loss + float(lambda_graph) * graph_mag
                     graph_regularization_total += float(graph_mag.item()) * batch_size
-            update_pairwise_summaries(outputs, pairwise_k_acc, pairwise_contribution_acc, pairwise_self_acc, pairwise_node_acc)
+            update_pairwise_summaries(
+                outputs,
+                pairwise_k_acc,
+                pairwise_contribution_acc,
+                pairwise_self_acc,
+                pairwise_node_acc,
+                basis_coeff_acc,
+                basis_weighted_coeff_acc,
+            )
         else:
             target = normalize_residual(residual, stats).unsqueeze(1)
             pred = call_model(model, model_input, metadata_input, graph_batch, conditioned=conditioned, graph_enabled=graph_enabled)
@@ -636,6 +683,8 @@ def train_one_epoch(
         **pairwise_contribution_acc.prefixed("pairwise_contribution"),
         **pairwise_self_acc.prefixed("pairwise_self"),
         **pairwise_node_acc.prefixed("pairwise_node_correction"),
+        **basis_coeff_acc.prefixed("pairwise_basis_coeff"),
+        **basis_weighted_coeff_acc.prefixed("pairwise_basis_weighted_coeff"),
     }
 
 
@@ -720,6 +769,8 @@ def evaluate_model(
     pairwise_contribution_acc = ScalarSummaryAccumulator()
     pairwise_self_acc = ScalarSummaryAccumulator()
     pairwise_node_acc = ScalarSummaryAccumulator()
+    basis_coeff_acc = VectorSummaryAccumulator()
+    basis_weighted_coeff_acc = VectorSummaryAccumulator()
     by_case: dict[str, dict[str, MetricAccumulator]] = defaultdict(
         lambda: {
             "residual": MetricAccumulator(),
@@ -778,7 +829,15 @@ def evaluate_model(
                 cnn_only_centered = cnn_only_temperature - cnn_only_temperature.mean(dim=(-2, -1), keepdim=True)
                 cnn_only_final_acc.update(cnn_only_temperature, temperature)
                 cnn_only_centered_acc.update(cnn_only_centered, centered_target)
-            update_pairwise_summaries(outputs, pairwise_k_acc, pairwise_contribution_acc, pairwise_self_acc, pairwise_node_acc)
+            update_pairwise_summaries(
+                outputs,
+                pairwise_k_acc,
+                pairwise_contribution_acc,
+                pairwise_self_acc,
+                pairwise_node_acc,
+                basis_coeff_acc,
+                basis_weighted_coeff_acc,
+            )
         else:
             target_norm = normalize_residual(residual, stats).unsqueeze(1)
             pred_norm = model(model_input, metadata_input) if conditioned else model(model_input)
@@ -846,6 +905,10 @@ def evaluate_model(
         metrics["pairwise_contribution"] = pairwise_contribution_acc.compute()
         metrics["pairwise_self"] = pairwise_self_acc.compute()
         metrics["pairwise_node_correction"] = pairwise_node_acc.compute()
+    basis_summary = basis_coeff_acc.compute()
+    if basis_summary:
+        metrics["pairwise_basis_coeff"] = basis_summary
+        metrics["pairwise_basis_weighted_coeff"] = basis_weighted_coeff_acc.compute()
     gate_summary = gate_acc.compute()
     if gate_summary:
         metrics["physics_gate"] = gate_summary
@@ -913,13 +976,19 @@ def update_pairwise_summaries(
     contribution_acc: ScalarSummaryAccumulator,
     self_acc: ScalarSummaryAccumulator,
     node_acc: ScalarSummaryAccumulator,
+    basis_coeff_acc: VectorSummaryAccumulator | None = None,
+    basis_weighted_coeff_acc: VectorSummaryAccumulator | None = None,
 ) -> None:
-    if "pairwise_k_values" not in outputs:
-        return
-    k_acc.update(outputs["pairwise_k_values"])
-    contribution_acc.update(outputs["pairwise_contributions"])
-    self_acc.update(outputs["pairwise_self_corrections"])
-    node_acc.update(outputs["pairwise_node_corrections"])
+    if "pairwise_k_values" in outputs:
+        k_acc.update(outputs["pairwise_k_values"])
+        contribution_acc.update(outputs["pairwise_contributions"])
+        self_acc.update(outputs["pairwise_self_corrections"])
+        node_acc.update(outputs["pairwise_node_corrections"])
+    if "pairwise_basis_coefficients" in outputs:
+        if basis_coeff_acc is not None:
+            basis_coeff_acc.update(outputs["pairwise_basis_coefficients"])
+        if basis_weighted_coeff_acc is not None:
+            basis_weighted_coeff_acc.update(outputs["pairwise_basis_weighted_coefficients"])
 
 
 def update_chiplet_case_metrics(
@@ -1063,6 +1132,81 @@ class ScalarSummaryAccumulator:
         return {f"{prefix}_{key}": value for key, value in self.compute().items()}
 
 
+class VectorSummaryAccumulator:
+    def __init__(self) -> None:
+        self.count = 0
+        self.total: torch.Tensor | None = None
+        self.total_abs: torch.Tensor | None = None
+        self.total_sq: torch.Tensor | None = None
+        self.positive: torch.Tensor | None = None
+        self.minimum: torch.Tensor | None = None
+        self.maximum: torch.Tensor | None = None
+
+    def update(self, value: torch.Tensor) -> None:
+        data = value.detach().float().reshape(-1, value.shape[-1]).cpu()
+        if data.numel() == 0:
+            return
+        if self.total is None:
+            dim = int(data.shape[1])
+            self.total = torch.zeros(dim, dtype=torch.float64)
+            self.total_abs = torch.zeros(dim, dtype=torch.float64)
+            self.total_sq = torch.zeros(dim, dtype=torch.float64)
+            self.positive = torch.zeros(dim, dtype=torch.float64)
+            self.minimum = torch.full((dim,), float("inf"), dtype=torch.float64)
+            self.maximum = torch.full((dim,), -float("inf"), dtype=torch.float64)
+        data64 = data.double()
+        self.count += int(data64.shape[0])
+        self.total += data64.sum(dim=0)
+        self.total_abs += data64.abs().sum(dim=0)
+        self.total_sq += (data64 * data64).sum(dim=0)
+        self.positive += (data64 > 0.0).double().sum(dim=0)
+        self.minimum = torch.minimum(self.minimum, data64.min(dim=0).values)
+        self.maximum = torch.maximum(self.maximum, data64.max(dim=0).values)
+
+    def compute(self) -> dict[str, Any]:
+        if self.count == 0 or self.total is None:
+            return {}
+        mean = self.total / float(self.count)
+        abs_mean = self.total_abs / float(self.count)
+        variance = torch.clamp(self.total_sq / float(self.count) - mean * mean, min=0.0)
+        std = torch.sqrt(variance)
+        positive_fraction = self.positive / float(self.count)
+        by_basis = []
+        for index in range(int(mean.numel())):
+            by_basis.append(
+                {
+                    "basis_index": index,
+                    "mean": float(mean[index].item()),
+                    "std": float(std[index].item()),
+                    "abs_mean": float(abs_mean[index].item()),
+                    "min": float(self.minimum[index].item()),
+                    "max": float(self.maximum[index].item()),
+                    "positive_fraction": float(positive_fraction[index].item()),
+                    "negative_fraction": float(1.0 - positive_fraction[index].item()),
+                }
+            )
+        return {
+            "mean": float(mean.mean().item()),
+            "std": float(std.mean().item()),
+            "abs_mean": float(abs_mean.mean().item()),
+            "min": float(self.minimum.min().item()),
+            "max": float(self.maximum.max().item()),
+            "by_basis": by_basis,
+        }
+
+    def prefixed(self, prefix: str) -> dict[str, float]:
+        summary = self.compute()
+        if not summary:
+            return {}
+        return {
+            f"{prefix}_mean": float(summary["mean"]),
+            f"{prefix}_std": float(summary["std"]),
+            f"{prefix}_abs_mean": float(summary["abs_mean"]),
+            f"{prefix}_min": float(summary["min"]),
+            f"{prefix}_max": float(summary["max"]),
+        }
+
+
 def metadata_values(metadata: dict[str, Any], key: str, batch_size: int) -> list[Any]:
     value = metadata[key]
     if isinstance(value, (list, tuple)):
@@ -1175,6 +1319,8 @@ def init_train_log(path: Path) -> None:
                 "train_pairwise_contribution_abs_mean",
                 "train_pairwise_self_abs_mean",
                 "train_pairwise_node_correction_abs_mean",
+                "train_pairwise_basis_coeff_abs_mean",
+                "train_pairwise_basis_weighted_coeff_abs_mean",
                 "train_final_temperature_mae_K",
                 "val_loss",
                 "val_residual_mae_K",
@@ -1205,6 +1351,8 @@ def init_train_log(path: Path) -> None:
                 "val_pairwise_contribution_abs_mean",
                 "val_pairwise_self_abs_mean",
                 "val_pairwise_node_correction_abs_mean",
+                "val_pairwise_basis_coeff_abs_mean",
+                "val_pairwise_basis_weighted_coeff_abs_mean",
                 "epoch_runtime_s",
                 "is_best",
             ]
@@ -1245,6 +1393,8 @@ def append_train_log(
                 train_losses.get("pairwise_contribution_abs_mean", ""),
                 train_losses.get("pairwise_self_abs_mean", ""),
                 train_losses.get("pairwise_node_correction_abs_mean", ""),
+                train_losses.get("pairwise_basis_coeff_abs_mean", ""),
+                train_losses.get("pairwise_basis_weighted_coeff_abs_mean", ""),
                 "" if train_final_mae_K is None else train_final_mae_K,
                 val_metrics["normalized_residual_loss"],
                 val_metrics["residual"]["mae_K"],
@@ -1275,6 +1425,8 @@ def append_train_log(
                 val_metrics.get("pairwise_contribution", {}).get("abs_mean", ""),
                 val_metrics.get("pairwise_self", {}).get("abs_mean", ""),
                 val_metrics.get("pairwise_node_correction", {}).get("abs_mean", ""),
+                val_metrics.get("pairwise_basis_coeff", {}).get("abs_mean", ""),
+                val_metrics.get("pairwise_basis_weighted_coeff", {}).get("abs_mean", ""),
                 epoch_runtime_s,
                 int(is_best),
             ]

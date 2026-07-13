@@ -7,7 +7,12 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from .graph_models import ChipletMessagePassingGNN, PairwiseThermalImpedanceOperator, rasterize_node_values
+from .graph_models import (
+    ChipletMessagePassingGNN,
+    PairwiseBasisThermalOperator,
+    PairwiseThermalImpedanceOperator,
+    rasterize_node_values,
+)
 
 
 def count_parameters(module: nn.Module) -> int:
@@ -1065,6 +1070,246 @@ class DecomposedMiniUNetWithPairwiseOperator(nn.Module):
         }
 
 
+class DecomposedMiniUNetWithPairwiseBasisOperator(nn.Module):
+    """Frozen decomposed CNN plus explicit low-rank directional pairwise field."""
+
+    def __init__(
+        self,
+        input_channels: int = 14,
+        output_channels: int = 1,
+        base_channels: int = 32,
+        depth: int = 3,
+        refine_channels: int = 32,
+        refine_blocks: int = 4,
+        refinement_channel_indices: tuple[int, ...] | list[int] = (),
+        refinement_channel_names: tuple[str, ...] | list[str] = (),
+        metadata_dim: int = 0,
+        metadata_hidden_dim: int = 64,
+        metadata_embedding_dim: int = 64,
+        physics_input_mode: str = "v1",
+        physics_gate_hidden_dim: int = 32,
+        physics_gate_init: float = 0.9,
+        graph_node_feature_dim: int = 24,
+        graph_edge_feature_dim: int = 15,
+        pairwise_basis_rank: int = 8,
+        pairwise_basis_hidden_dim: int = 96,
+        pairwise_basis_layers: int = 3,
+        pairwise_basis_halo_decay_mm: float = 4.0,
+        pairwise_basis_edge_chunk_size: int = 512,
+        graph_rasterizer_mode: str = "vectorized",
+        freeze_cnn: bool = True,
+        source_power_feature_index: int = 6,
+    ) -> None:
+        super().__init__()
+        self.architecture = "miniunet_refine_conditioned_decomposed_pairwise_basis"
+        self.input_channels = int(input_channels)
+        self.output_channels = int(output_channels)
+        self.base_channels = int(base_channels)
+        self.depth = int(depth)
+        self.refine_channels = int(refine_channels)
+        self.refine_blocks = int(refine_blocks)
+        self.refinement_channel_indices = tuple(int(index) for index in refinement_channel_indices)
+        self.refinement_channel_names = tuple(str(name) for name in refinement_channel_names)
+        self.metadata_dim = int(metadata_dim)
+        self.metadata_hidden_dim = int(metadata_hidden_dim)
+        self.metadata_embedding_dim = int(metadata_embedding_dim)
+        self.physics_input_mode = str(physics_input_mode)
+        self.graph_node_feature_dim = int(graph_node_feature_dim)
+        self.graph_edge_feature_dim = int(graph_edge_feature_dim)
+        self.pairwise_basis_rank = int(pairwise_basis_rank)
+        self.pairwise_basis_hidden_dim = int(pairwise_basis_hidden_dim)
+        self.pairwise_basis_layers = int(pairwise_basis_layers)
+        self.pairwise_basis_halo_decay_mm = float(pairwise_basis_halo_decay_mm)
+        self.pairwise_basis_edge_chunk_size = int(pairwise_basis_edge_chunk_size)
+        self.graph_rasterizer_mode = str(graph_rasterizer_mode)
+        self.freeze_cnn = bool(freeze_cnn)
+        self.source_power_feature_index = int(source_power_feature_index)
+        self.cnn_model = DecomposedMiniUNetWithRefinement(
+            input_channels=input_channels,
+            output_channels=output_channels,
+            base_channels=base_channels,
+            depth=depth,
+            refine_channels=refine_channels,
+            refine_blocks=refine_blocks,
+            refinement_channel_indices=refinement_channel_indices,
+            refinement_channel_names=refinement_channel_names,
+            metadata_dim=metadata_dim,
+            metadata_hidden_dim=metadata_hidden_dim,
+            metadata_embedding_dim=metadata_embedding_dim,
+            conditioned=True,
+            physics_input_mode=physics_input_mode,
+            physics_gate_hidden_dim=physics_gate_hidden_dim,
+            physics_gate_init=physics_gate_init,
+        )
+        self.basis_operator = PairwiseBasisThermalOperator(
+            node_feature_dim=graph_node_feature_dim,
+            edge_feature_dim=graph_edge_feature_dim,
+            metadata_dim=metadata_dim,
+            basis_rank=pairwise_basis_rank,
+            hidden_dim=pairwise_basis_hidden_dim,
+            layers=pairwise_basis_layers,
+            source_power_feature_index=source_power_feature_index,
+            edge_chunk_size=pairwise_basis_edge_chunk_size,
+        )
+        if self.freeze_cnn:
+            for parameter in self.cnn_model.parameters():
+                parameter.requires_grad_(False)
+
+    @property
+    def basis_names(self) -> tuple[str, ...]:
+        return self.basis_operator.basis_names
+
+    def forward_components(
+        self,
+        x: torch.Tensor,
+        metadata: torch.Tensor | None = None,
+        graph: dict[str, torch.Tensor] | None = None,
+        *,
+        return_diagnostics: bool = False,
+        graph_correction_scale: float = 1.0,
+        ambient: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        if graph is None:
+            raise ValueError("pairwise-basis architecture requires graph batch")
+        cnn_outputs = self.cnn_model(x, metadata)
+        basis_outputs = self.basis_operator(
+            graph,
+            metadata,
+            height=int(x.shape[-2]),
+            width=int(x.shape[-1]),
+            halo_decay_mm=self.pairwise_basis_halo_decay_mm,
+            return_diagnostics=return_diagnostics,
+        )
+        operator_map = basis_outputs["field"]
+        operator_map = operator_map - operator_map.mean(dim=(-2, -1), keepdim=True)
+        scaled_correction = operator_map * float(graph_correction_scale)
+        cnn_centered = cnn_outputs["centered_field"]
+        centered_before_projection = cnn_centered + scaled_correction
+        centered = centered_before_projection - centered_before_projection.mean(dim=(-2, -1), keepdim=True)
+        outputs = dict(cnn_outputs)
+        outputs["cnn_centered_field"] = cnn_centered
+        outputs["graph_correction_field"] = operator_map
+        outputs["scaled_graph_correction_field"] = scaled_correction
+        outputs["centered_before_zero_mean"] = centered_before_projection
+        outputs["centered_field"] = centered
+        outputs["pairwise_basis_coefficients"] = basis_outputs["coefficients"]
+        outputs["pairwise_basis_weighted_coefficients"] = basis_outputs["weighted_coefficients"]
+        outputs["pairwise_basis_names"] = self.basis_names
+        outputs["graph_correction_abs_mean"] = operator_map.abs().mean(dim=(-2, -1))
+        outputs["graph_correction_abs_max"] = operator_map.abs().amax(dim=(-2, -1))
+        if return_diagnostics:
+            outputs["final_centered_field"] = centered
+            outputs["source_target_basis_coefficients"] = basis_outputs["coefficients"]
+            if ambient is not None:
+                outputs["final_temperature"] = ambient[:, None, None] + outputs["mean_rise"][:, None, None] + centered
+                outputs["cnn_only_temperature"] = ambient[:, None, None] + outputs["mean_rise"][:, None, None] + cnn_centered
+        return outputs
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        metadata: torch.Tensor | None = None,
+        graph: dict[str, torch.Tensor] | None = None,
+        *,
+        return_diagnostics: bool = False,
+        graph_correction_scale: float = 1.0,
+        ambient: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        return self.forward_components(
+            x,
+            metadata,
+            graph,
+            return_diagnostics=return_diagnostics,
+            graph_correction_scale=graph_correction_scale,
+            ambient=ambient,
+        )
+
+    def forward_profile(
+        self,
+        x: torch.Tensor,
+        metadata: torch.Tensor,
+        graph: dict[str, torch.Tensor],
+        *,
+        synchronize: object | None = None,
+        graph_correction_scale: float = 1.0,
+    ) -> tuple[dict[str, torch.Tensor], dict[str, float]]:
+        timings: dict[str, float] = {}
+
+        def tic() -> float:
+            if synchronize is not None:
+                synchronize()
+            return time.perf_counter()
+
+        def toc(name: str, start: float) -> None:
+            if synchronize is not None:
+                synchronize()
+            timings[name] = timings.get(name, 0.0) + time.perf_counter() - start
+
+        start = tic()
+        cnn_outputs = self.cnn_model(x, metadata)
+        toc("cnn_branch_s", start)
+        start = tic()
+        basis_outputs = self.basis_operator(
+            graph,
+            metadata,
+            height=int(x.shape[-2]),
+            width=int(x.shape[-1]),
+            halo_decay_mm=self.pairwise_basis_halo_decay_mm,
+            return_diagnostics=True,
+        )
+        toc("pairwise_basis_operator_s", start)
+        start = tic()
+        operator_map = basis_outputs["field"] - basis_outputs["field"].mean(dim=(-2, -1), keepdim=True)
+        cnn_centered = cnn_outputs["centered_field"]
+        centered = cnn_centered + operator_map * float(graph_correction_scale)
+        centered = centered - centered.mean(dim=(-2, -1), keepdim=True)
+        outputs = dict(cnn_outputs)
+        outputs["cnn_centered_field"] = cnn_centered
+        outputs["graph_correction_field"] = operator_map
+        outputs["scaled_graph_correction_field"] = operator_map * float(graph_correction_scale)
+        outputs["centered_field"] = centered
+        outputs["pairwise_basis_coefficients"] = basis_outputs["coefficients"]
+        outputs["pairwise_basis_weighted_coefficients"] = basis_outputs["weighted_coefficients"]
+        outputs["pairwise_basis_names"] = self.basis_names
+        toc("fusion_head_s", start)
+        return outputs, timings
+
+    def config(self) -> dict[str, object]:
+        basis_parameters = count_parameters(self.basis_operator)
+        return {
+            "architecture": self.architecture,
+            "input_channels": self.input_channels,
+            "output_channels": self.output_channels,
+            "base_channels": self.base_channels,
+            "depth": self.depth,
+            "refine_channels": self.refine_channels,
+            "refine_blocks": self.refine_blocks,
+            "refinement_channel_indices": list(self.refinement_channel_indices),
+            "refinement_channel_names": list(self.refinement_channel_names),
+            "metadata_dim": self.metadata_dim,
+            "metadata_hidden_dim": self.metadata_hidden_dim,
+            "metadata_embedding_dim": self.metadata_embedding_dim,
+            "conditioned": True,
+            "physics_input_mode": self.physics_input_mode,
+            "graph_enabled": True,
+            "pairwise_basis_enabled": True,
+            "graph_node_feature_dim": self.graph_node_feature_dim,
+            "graph_edge_feature_dim": self.graph_edge_feature_dim,
+            "pairwise_basis_rank": self.pairwise_basis_rank,
+            "pairwise_basis_hidden_dim": self.pairwise_basis_hidden_dim,
+            "pairwise_basis_layers": self.pairwise_basis_layers,
+            "pairwise_basis_halo_decay_mm": self.pairwise_basis_halo_decay_mm,
+            "pairwise_basis_edge_chunk_size": self.pairwise_basis_edge_chunk_size,
+            "pairwise_basis_names": list(self.basis_names),
+            "source_power_feature_index": self.source_power_feature_index,
+            "graph_rasterizer_mode": self.graph_rasterizer_mode,
+            "freeze_cnn": self.freeze_cnn,
+            "cnn_parameter_count": count_parameters(self.cnn_model),
+            "pairwise_basis_parameter_count": basis_parameters,
+            "total_parameters": count_parameters(self),
+        }
+
+
 def build_model(config: dict[str, object]) -> nn.Module:
     architecture = str(config.get("architecture") or config.get("name") or "miniunet").lower()
     if architecture == "miniunet":
@@ -1166,6 +1411,33 @@ def build_model(config: dict[str, object]) -> nn.Module:
             pairwise_hidden_dim=int(config.get("pairwise_hidden_dim", 96)),
             pairwise_layers=int(config.get("pairwise_layers", 3)),
             graph_halo_decay_mm=float(config.get("graph_halo_decay_mm", 4.0)),
+            graph_rasterizer_mode=str(config.get("graph_rasterizer_mode", "vectorized")),
+            freeze_cnn=bool(config.get("freeze_cnn", True)),
+            source_power_feature_index=int(config.get("source_power_feature_index", 6)),
+        )
+    if architecture == "miniunet_refine_conditioned_decomposed_pairwise_basis":
+        return DecomposedMiniUNetWithPairwiseBasisOperator(
+            input_channels=int(config.get("input_channels", 14)),
+            output_channels=int(config.get("output_channels", 1)),
+            base_channels=int(config.get("base_channels", 32)),
+            depth=int(config.get("depth", 3)),
+            refine_channels=int(config.get("refine_channels", 32)),
+            refine_blocks=int(config.get("refine_blocks", 4)),
+            refinement_channel_indices=tuple(int(index) for index in config.get("refinement_channel_indices", ())),
+            refinement_channel_names=tuple(str(name) for name in config.get("refinement_channel_names", ())),
+            metadata_dim=int(config.get("metadata_dim", 0)),
+            metadata_hidden_dim=int(config.get("metadata_hidden_dim", 64)),
+            metadata_embedding_dim=int(config.get("metadata_embedding_dim", 64)),
+            physics_input_mode=str(config.get("physics_input_mode", "v1")),
+            physics_gate_hidden_dim=int(config.get("physics_gate_hidden_dim", 32)),
+            physics_gate_init=float(config.get("physics_gate_init", 0.9)),
+            graph_node_feature_dim=int(config.get("graph_node_feature_dim", 24)),
+            graph_edge_feature_dim=int(config.get("graph_edge_feature_dim", 15)),
+            pairwise_basis_rank=int(config.get("pairwise_basis_rank", 8)),
+            pairwise_basis_hidden_dim=int(config.get("pairwise_basis_hidden_dim", 96)),
+            pairwise_basis_layers=int(config.get("pairwise_basis_layers", 3)),
+            pairwise_basis_halo_decay_mm=float(config.get("pairwise_basis_halo_decay_mm", config.get("graph_halo_decay_mm", 4.0))),
+            pairwise_basis_edge_chunk_size=int(config.get("pairwise_basis_edge_chunk_size", 512)),
             graph_rasterizer_mode=str(config.get("graph_rasterizer_mode", "vectorized")),
             freeze_cnn=bool(config.get("freeze_cnn", True)),
             source_power_feature_index=int(config.get("source_power_feature_index", 6)),

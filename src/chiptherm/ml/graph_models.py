@@ -674,6 +674,230 @@ class PairwiseThermalImpedanceOperator(nn.Module):
         return result
 
 
+PAIRWISE_BASIS_NAMES = (
+    "uniform_halo",
+    "target_local_u",
+    "target_local_v",
+    "source_axis_s",
+    "source_facing_halfspace",
+    "source_opposing_halfspace",
+    "target_center_radial_decay",
+    "boundary_modulated_halo",
+)
+
+
+class PairwiseBasisThermalOperator(nn.Module):
+    """Explicit low-rank source-target spatial correction operator.
+
+    Each directed source-target chiplet edge predicts R coefficients. The
+    coefficients weight deterministic, interpretable target-local basis maps
+    that depend on source direction, target geometry, target edge distance, and
+    package size. No self term or message passing is used in this first version.
+    """
+
+    def __init__(
+        self,
+        node_feature_dim: int,
+        edge_feature_dim: int,
+        metadata_dim: int = 0,
+        basis_rank: int = 8,
+        hidden_dim: int = 96,
+        layers: int = 3,
+        source_power_feature_index: int = 6,
+        edge_chunk_size: int = 512,
+    ) -> None:
+        super().__init__()
+        if basis_rank < 1 or basis_rank > len(PAIRWISE_BASIS_NAMES):
+            raise ValueError(f"basis_rank must be in [1, {len(PAIRWISE_BASIS_NAMES)}]")
+        if source_power_feature_index < 0 or source_power_feature_index >= node_feature_dim:
+            raise ValueError("source_power_feature_index is outside the node feature dimension")
+        self.node_feature_dim = int(node_feature_dim)
+        self.edge_feature_dim = int(edge_feature_dim)
+        self.metadata_dim = int(metadata_dim)
+        self.basis_rank = int(basis_rank)
+        self.hidden_dim = int(hidden_dim)
+        self.layers = int(layers)
+        self.source_power_feature_index = int(source_power_feature_index)
+        self.edge_chunk_size = int(edge_chunk_size)
+        pair_input_dim = self.node_feature_dim * 2 + self.edge_feature_dim + self.metadata_dim
+        self.coefficient_mlp = make_silu_mlp(pair_input_dim, hidden_dim, basis_rank, layers=layers, zero_last=True)
+
+    @property
+    def basis_names(self) -> tuple[str, ...]:
+        return PAIRWISE_BASIS_NAMES[: self.basis_rank]
+
+    def forward(
+        self,
+        graph: dict[str, torch.Tensor],
+        metadata: torch.Tensor | None = None,
+        *,
+        height: int = 64,
+        width: int = 64,
+        halo_decay_mm: float = 4.0,
+        return_diagnostics: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        node_features = graph["node_features"].float()
+        edge_features = graph["edge_features"].float()
+        edge_index = graph["edge_index"].long()
+        node_batch = graph["node_batch"].long()
+        num_graphs = int(graph["num_graphs"].item()) if torch.is_tensor(graph["num_graphs"]) else int(graph["num_graphs"])
+        edge_count = int(edge_features.shape[0])
+        if metadata is None:
+            metadata_node = node_features.new_zeros((node_features.shape[0], 0))
+        else:
+            metadata_node = metadata.float().index_select(0, node_batch)
+        if edge_count > 0:
+            src = edge_index[0]
+            dst = edge_index[1]
+            pair_input = torch.cat(
+                [
+                    node_features.index_select(0, src),
+                    node_features.index_select(0, dst),
+                    edge_features,
+                    metadata_node.index_select(0, src),
+                ],
+                dim=1,
+            )
+            coeff = self.coefficient_mlp(pair_input)
+            source_power = node_features.index_select(0, src)[:, self.source_power_feature_index]
+            weighted_coeff = coeff * source_power[:, None]
+        else:
+            coeff = node_features.new_empty((0, self.basis_rank))
+            weighted_coeff = node_features.new_empty((0, self.basis_rank))
+        field = pairwise_basis_superpose(
+            weighted_coeff,
+            graph,
+            edge_index,
+            basis_rank=self.basis_rank,
+            height=height,
+            width=width,
+            halo_decay_mm=halo_decay_mm,
+            edge_chunk_size=self.edge_chunk_size,
+        )
+        result = {
+            "field": field.view(num_graphs, height, width),
+            "coefficients": coeff,
+            "weighted_coefficients": weighted_coeff,
+        }
+        if return_diagnostics:
+            result["basis_names"] = self.basis_names
+        return result
+
+
+def pairwise_basis_superpose(
+    weighted_coefficients: torch.Tensor,
+    graph: dict[str, torch.Tensor],
+    edge_index: torch.Tensor,
+    *,
+    basis_rank: int,
+    height: int = 64,
+    width: int = 64,
+    halo_decay_mm: float = 4.0,
+    edge_chunk_size: int = 512,
+) -> torch.Tensor:
+    """Sum weighted pairwise basis responses into graph-specific fields.
+
+    This function is vectorized within edge chunks. It intentionally avoids
+    Python loops over individual graphs, nodes, or edges, while keeping peak
+    memory bounded by chunking the [E, R, H*W] basis tensor.
+    """
+
+    package_size = graph["package_size"].float()
+    node_batch = graph["node_batch"].long()
+    num_graphs = int(package_size.shape[0])
+    pixels = int(height) * int(width)
+    output = weighted_coefficients.new_zeros((num_graphs, pixels))
+    if edge_index.numel() == 0:
+        return output
+    src_all = edge_index[0].long()
+    dst_all = edge_index[1].long()
+    rows = torch.arange(height, dtype=weighted_coefficients.dtype, device=weighted_coefficients.device) + 0.5
+    cols = torch.arange(width, dtype=weighted_coefficients.dtype, device=weighted_coefficients.device) + 0.5
+    yy_unit, xx_unit = torch.meshgrid(rows / float(height), cols / float(width), indexing="ij")
+    xx_unit_flat = xx_unit.reshape(1, -1)
+    yy_unit_flat = yy_unit.reshape(1, -1)
+    chunk_size = max(int(edge_chunk_size), 1)
+    for start in range(0, int(weighted_coefficients.shape[0]), chunk_size):
+        end = min(start + chunk_size, int(weighted_coefficients.shape[0]))
+        src = src_all[start:end]
+        dst = dst_all[start:end]
+        graph_index = node_batch.index_select(0, dst)
+        basis = pairwise_basis_chunk(
+            graph,
+            src,
+            dst,
+            graph_index,
+            xx_unit_flat,
+            yy_unit_flat,
+            basis_rank=basis_rank,
+            halo_decay_mm=halo_decay_mm,
+        )
+        contribution = (weighted_coefficients[start:end, :, None] * basis).sum(dim=1)
+        output.index_add_(0, graph_index, contribution)
+    return output
+
+
+def pairwise_basis_chunk(
+    graph: dict[str, torch.Tensor],
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    graph_index: torch.Tensor,
+    xx_unit_flat: torch.Tensor,
+    yy_unit_flat: torch.Tensor,
+    *,
+    basis_rank: int,
+    halo_decay_mm: float,
+) -> torch.Tensor:
+    rects = graph["chiplet_rects"].float().to(dtype=xx_unit_flat.dtype, device=xx_unit_flat.device)
+    package_size = graph["package_size"].float().to(dtype=xx_unit_flat.dtype, device=xx_unit_flat.device)
+    src_rect = rects.index_select(0, src)
+    dst_rect = rects.index_select(0, dst)
+    pkg = package_size.index_select(0, graph_index)
+    xx = xx_unit_flat * pkg[:, 0:1]
+    yy = yy_unit_flat * pkg[:, 1:2]
+    x0 = dst_rect[:, 0:1]
+    y0 = dst_rect[:, 1:2]
+    w = dst_rect[:, 2:3].clamp_min(EPSILON)
+    h = dst_rect[:, 3:4].clamp_min(EPSILON)
+    x1 = x0 + w
+    y1 = y0 + h
+    cx = x0 + 0.5 * w
+    cy = y0 + 0.5 * h
+    src_cx = src_rect[:, 0:1] + 0.5 * src_rect[:, 2:3]
+    src_cy = src_rect[:, 1:2] + 0.5 * src_rect[:, 3:4]
+    direction_x = src_cx - cx
+    direction_y = src_cy - cy
+    direction_norm = torch.sqrt(direction_x * direction_x + direction_y * direction_y + EPSILON)
+    direction_x = direction_x / direction_norm
+    direction_y = direction_y / direction_norm
+    dx_rect = torch.clamp(torch.maximum(x0 - xx, xx - x1), min=0.0)
+    dy_rect = torch.clamp(torch.maximum(y0 - yy, yy - y1), min=0.0)
+    distance_to_rect = torch.sqrt(dx_rect * dx_rect + dy_rect * dy_rect + EPSILON)
+    halo = torch.exp(-distance_to_rect / max(float(halo_decay_mm), EPSILON))
+    u = torch.clamp((xx - cx) / (0.5 * w), min=-2.0, max=2.0)
+    v = torch.clamp((yy - cy) / (0.5 * h), min=-2.0, max=2.0)
+    source_axis = torch.clamp(u * direction_x + v * direction_y, min=-2.0, max=2.0)
+    radial = torch.sqrt(u * u + v * v + EPSILON)
+    radial_decay = torch.exp(-0.5 * radial * radial)
+    min_edge = torch.minimum(
+        torch.minimum(x0, pkg[:, 0:1] - x1),
+        torch.minimum(y0, pkg[:, 1:2] - y1),
+    ).clamp_min(0.0)
+    edge_scale = (0.25 * torch.minimum(pkg[:, 0:1], pkg[:, 1:2])).clamp_min(EPSILON)
+    boundary_factor = 1.0 - torch.clamp(min_edge / edge_scale, min=0.0, max=1.0)
+    terms = [
+        halo,
+        u * halo,
+        v * halo,
+        source_axis * halo,
+        torch.relu(source_axis) * halo,
+        torch.relu(-source_axis) * halo,
+        radial_decay * halo,
+        boundary_factor * halo,
+    ]
+    return torch.stack(terms[:basis_rank], dim=1)
+
+
 def chiplet_cell_weights(
     graph: dict[str, torch.Tensor],
     *,

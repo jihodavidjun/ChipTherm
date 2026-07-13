@@ -11,10 +11,13 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from chiptherm.ml.graph_models import (  # noqa: E402
+    PairwiseBasisThermalOperator,
     PairwiseThermalImpedanceOperator,
     chiplet_mean_temperatures,
     chiplet_metric_values,
     chiplet_peak_temperatures,
+    pairwise_basis_chunk,
+    pairwise_basis_superpose,
 )
 from chiptherm.ml.models import build_model  # noqa: E402
 
@@ -127,3 +130,118 @@ def test_pairwise_model_zero_correction_matches_cnn_centered_field() -> None:
     out = model(x, metadata, graph)
     assert torch.allclose(out["graph_correction_field"], torch.zeros_like(out["graph_correction_field"]), atol=1.0e-6)
     assert torch.allclose(out["centered_field"], out["cnn_centered_field"], atol=1.0e-6)
+
+
+def test_pairwise_basis_coefficient_shape_and_zero_init() -> None:
+    graph = synthetic_graph()
+    operator = PairwiseBasisThermalOperator(8, 3, metadata_dim=2, basis_rank=8, hidden_dim=8, layers=2)
+    out = operator(graph, torch.randn(2, 2), height=8, width=8)
+    assert out["coefficients"].shape == (4, 8)
+    assert out["field"].shape == (2, 8, 8)
+    assert torch.allclose(out["coefficients"], torch.zeros_like(out["coefficients"]))
+    assert torch.allclose(out["field"], torch.zeros_like(out["field"]))
+
+
+def source_left_target_right_graph() -> dict[str, torch.Tensor]:
+    return {
+        "node_features": torch.zeros(2, 8),
+        "edge_index": torch.tensor([[0], [1]], dtype=torch.long),
+        "edge_features": torch.zeros(1, 3),
+        "chiplet_rects": torch.tensor([[0.0, 1.0, 1.0, 2.0], [3.0, 1.0, 2.0, 2.0]], dtype=torch.float32),
+        "package_size": torch.tensor([[6.0, 4.0]], dtype=torch.float32),
+        "node_batch": torch.tensor([0, 0], dtype=torch.long),
+        "num_graphs": torch.tensor(1, dtype=torch.long),
+    }
+
+
+def test_source_facing_basis_orients_horizontally() -> None:
+    graph = source_left_target_right_graph()
+    rows = torch.arange(4, dtype=torch.float32) + 0.5
+    cols = torch.arange(6, dtype=torch.float32) + 0.5
+    yy, xx = torch.meshgrid(rows / 4.0, cols / 6.0, indexing="ij")
+    basis = pairwise_basis_chunk(
+        graph,
+        torch.tensor([0]),
+        torch.tensor([1]),
+        torch.tensor([0]),
+        xx.reshape(1, -1),
+        yy.reshape(1, -1),
+        basis_rank=8,
+        halo_decay_mm=4.0,
+    ).view(1, 8, 4, 6)
+    facing = basis[0, 4]
+    opposing = basis[0, 5]
+    assert facing[:, 3].mean() > facing[:, 4].mean()
+    assert opposing[:, 4].mean() > opposing[:, 3].mean()
+
+
+def test_pairwise_basis_superpose_has_no_cross_graph_leakage() -> None:
+    graph = synthetic_graph()
+    coeff = torch.zeros(4, 1)
+    coeff[0, 0] = 1.0
+    field = pairwise_basis_superpose(coeff, graph, graph["edge_index"], basis_rank=1, height=8, width=8)
+    assert field.shape == (2, 64)
+    assert field[0].abs().sum() > 0.0
+    assert field[1].abs().sum() == 0.0
+
+
+def test_pairwise_basis_model_zero_mean_and_gradients() -> None:
+    config = {
+        "architecture": "miniunet_refine_conditioned_decomposed_pairwise_basis",
+        "input_channels": 3,
+        "base_channels": 4,
+        "depth": 2,
+        "refine_channels": 4,
+        "refine_blocks": 1,
+        "refinement_channel_indices": [0, 1],
+        "metadata_dim": 2,
+        "metadata_hidden_dim": 4,
+        "metadata_embedding_dim": 4,
+        "graph_node_feature_dim": 8,
+        "graph_edge_feature_dim": 3,
+        "pairwise_basis_rank": 4,
+        "pairwise_basis_hidden_dim": 8,
+        "pairwise_basis_layers": 2,
+        "pairwise_basis_edge_chunk_size": 2,
+        "freeze_cnn": True,
+    }
+    model = build_model(config)
+    graph = synthetic_graph()
+    set_final_bias(model.basis_operator.coefficient_mlp, 0.1)
+    x = torch.randn(2, 3, 16, 16)
+    metadata = torch.randn(2, 2)
+    out = model(x, metadata, graph)
+    assert torch.allclose(out["graph_correction_field"].mean(dim=(-2, -1)), torch.zeros(2), atol=1.0e-6)
+    loss = (out["centered_field"] ** 2).mean()
+    loss.backward()
+    grad_sum = sum(
+        float(parameter.grad.abs().sum().item())
+        for name, parameter in model.named_parameters()
+        if name.startswith("basis_operator") and parameter.grad is not None
+    )
+    assert grad_sum > 0.0
+
+
+def test_pairwise_basis_checkpoint_save_load() -> None:
+    config = {
+        "architecture": "miniunet_refine_conditioned_decomposed_pairwise_basis",
+        "input_channels": 3,
+        "base_channels": 4,
+        "depth": 2,
+        "refine_channels": 4,
+        "refine_blocks": 1,
+        "refinement_channel_indices": [0, 1],
+        "metadata_dim": 2,
+        "metadata_hidden_dim": 4,
+        "metadata_embedding_dim": 4,
+        "graph_node_feature_dim": 8,
+        "graph_edge_feature_dim": 3,
+        "pairwise_basis_rank": 4,
+        "pairwise_basis_hidden_dim": 8,
+        "pairwise_basis_layers": 2,
+        "freeze_cnn": True,
+    }
+    model = build_model(config)
+    reloaded = build_model(model.config())
+    reloaded.load_state_dict(model.state_dict())
+    assert reloaded.config()["architecture"] == "miniunet_refine_conditioned_decomposed_pairwise_basis"
