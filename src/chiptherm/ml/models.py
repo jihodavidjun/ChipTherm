@@ -595,6 +595,7 @@ class DecomposedMiniUNetWithGraph(nn.Module):
         graph_raster_channels: int = 16,
         graph_halo_decay_mm: float = 4.0,
         graph_use_edge_features: bool = True,
+        graph_rasterizer_mode: str = "vectorized",
         freeze_cnn: bool = False,
     ) -> None:
         super().__init__()
@@ -620,6 +621,7 @@ class DecomposedMiniUNetWithGraph(nn.Module):
         self.graph_raster_channels = int(graph_raster_channels)
         self.graph_halo_decay_mm = float(graph_halo_decay_mm)
         self.graph_use_edge_features = bool(graph_use_edge_features)
+        self.graph_rasterizer_mode = str(graph_rasterizer_mode)
         self.freeze_cnn = bool(freeze_cnn)
         self.cnn_model = DecomposedMiniUNetWithRefinement(
             input_channels=input_channels,
@@ -686,6 +688,7 @@ class DecomposedMiniUNetWithGraph(nn.Module):
             height=int(x.shape[-2]),
             width=int(x.shape[-1]),
             halo_decay_mm=self.graph_halo_decay_mm,
+            mode=self.graph_rasterizer_mode,
         )
         cnn_centered = cnn_outputs["centered_field"]
         correction = self.fusion_head(torch.cat([cnn_centered.unsqueeze(1), graph_maps], dim=1)).squeeze(1)
@@ -767,6 +770,7 @@ class DecomposedMiniUNetWithGraph(nn.Module):
             height=int(x.shape[-2]),
             width=int(x.shape[-1]),
             halo_decay_mm=self.graph_halo_decay_mm,
+            mode=self.graph_rasterizer_mode,
         )
         toc("graph_rasterization_s", start)
         start = tic()
@@ -816,6 +820,7 @@ class DecomposedMiniUNetWithGraph(nn.Module):
             "graph_raster_channels": self.graph_raster_channels,
             "graph_halo_decay_mm": self.graph_halo_decay_mm,
             "graph_use_edge_features": self.graph_use_edge_features,
+            "graph_rasterizer_mode": self.graph_rasterizer_mode,
             "freeze_cnn": self.freeze_cnn,
             "cnn_parameter_count": count_parameters(self.cnn_model),
             "graph_parameter_count": graph_parameters,
@@ -901,6 +906,7 @@ def build_model(config: dict[str, object]) -> nn.Module:
             graph_raster_channels=int(config.get("graph_raster_channels", 16)),
             graph_halo_decay_mm=float(config.get("graph_halo_decay_mm", 4.0)),
             graph_use_edge_features=bool(config.get("graph_use_edge_features", True)),
+            graph_rasterizer_mode=str(config.get("graph_rasterizer_mode", "vectorized")),
             freeze_cnn=bool(config.get("freeze_cnn", False)),
         )
     raise ValueError(f"unsupported model architecture: {architecture}")

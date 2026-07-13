@@ -79,6 +79,7 @@ def main() -> int:
     parser.add_argument("--graph-message-aggregation", default="sum", choices=["sum", "mean"])
     parser.add_argument("--graph-raster-channels", default=16, type=int)
     parser.add_argument("--graph-halo-decay-mm", default=4.0, type=float)
+    parser.add_argument("--graph-rasterizer-mode", default="vectorized", choices=["vectorized", "legacy"])
     parser.add_argument("--graph-use-edge-features", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--lambda-graph", default=0.0, type=float)
     parser.add_argument("--freeze-cnn", action="store_true")
@@ -204,6 +205,7 @@ def main() -> int:
                 "graph_message_aggregation": args.graph_message_aggregation,
                 "graph_raster_channels": args.graph_raster_channels,
                 "graph_halo_decay_mm": args.graph_halo_decay_mm,
+                "graph_rasterizer_mode": args.graph_rasterizer_mode,
                 "graph_use_edge_features": args.graph_use_edge_features,
                 "freeze_cnn": args.freeze_cnn,
                 "graph_node_feature_names": list(getattr(train_dataset, "graph_node_feature_names", ()) or []),
@@ -236,6 +238,7 @@ def main() -> int:
         "graph_message_aggregation": args.graph_message_aggregation,
         "graph_raster_channels": args.graph_raster_channels,
         "graph_halo_decay_mm": args.graph_halo_decay_mm,
+        "graph_rasterizer_mode": args.graph_rasterizer_mode,
         "graph_use_edge_features": args.graph_use_edge_features,
         "lambda_graph": args.lambda_graph,
         "freeze_cnn": args.freeze_cnn,

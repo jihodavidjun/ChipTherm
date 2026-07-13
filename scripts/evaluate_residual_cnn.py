@@ -41,6 +41,7 @@ def main() -> int:
     parser.add_argument("--profile-components", action="store_true")
     parser.add_argument("--disable-graph-correction", action="store_true")
     parser.add_argument("--graph-correction-scale", default=1.0, type=float)
+    parser.add_argument("--graph-rasterizer-mode", default=None, choices=["vectorized", "legacy"])
     args = parser.parse_args()
     if args.disable_graph_correction:
         args.graph_correction_scale = 0.0
@@ -52,6 +53,8 @@ def main() -> int:
     checkpoint = load_checkpoint(args.checkpoint, device)
     stats = NormalizationStats(**checkpoint["normalization"])
     model = build_model(checkpoint["model_config"]).to(device)
+    if args.graph_rasterizer_mode is not None and hasattr(model, "graph_rasterizer_mode"):
+        model.graph_rasterizer_mode = args.graph_rasterizer_mode
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
     architecture = str(checkpoint["model_config"].get("architecture", "miniunet"))
@@ -572,9 +575,9 @@ def profile_components(
             "maximum_directed_edges_per_batch": max_edges,
         },
         "rasterizer_audit": {
-            "status": "partially vectorized, Python-loop dominated over graphs and chiplet nodes; no Python loop over individual grid cells.",
+            "status": "vectorized over graphs, nodes, and grid cells; uses a small loop over raster-channel chunks to avoid materializing [N, C, H, W].",
             "gradient_path": "node_raster_head outputs are multiplied by differentiable halo weights, then consumed by convolutional fusion.",
-            "optimization_opportunity": "Vectorizing rasterization across nodes/graphs or caching static halo weights should reduce graph overhead substantially.",
+            "optimization_opportunity": "Caching static node-to-grid weights helps repeated fixed-geometry inference; a custom kernel could fuse weight construction and accumulation if PyTorch memory traffic remains limiting.",
         },
     }
 

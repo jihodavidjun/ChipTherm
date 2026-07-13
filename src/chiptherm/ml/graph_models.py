@@ -85,6 +85,27 @@ class GraphNormalizationStats:
         return cls(**payload)
 
 
+@dataclass(frozen=True)
+class GeometryRasterCache:
+    """Static node-to-grid weights for repeated inference with unchanged geometry."""
+
+    raster_weights: torch.Tensor
+    node_batch: torch.Tensor
+    num_graphs: int
+    height: int
+    width: int
+    halo_decay_mm: float
+    cache_key: str
+
+    @property
+    def device(self) -> torch.device:
+        return self.raster_weights.device
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.raster_weights.dtype
+
+
 class RunningMoments:
     def __init__(self, dim: int) -> None:
         self.dim = int(dim)
@@ -334,7 +355,7 @@ class ChipletMessagePassingGNN(nn.Module):
         }, timings
 
 
-def rasterize_node_values(
+def rasterize_node_values_legacy(
     node_values: torch.Tensor,
     graph: dict[str, torch.Tensor],
     *,
@@ -370,3 +391,168 @@ def rasterize_node_values(
             weight = torch.exp(-distance / decay)
             maps[graph_index] += node_values[node_index, :, None, None] * weight[None, :, :]
     return maps
+
+
+def rasterize_node_values_vectorized(
+    node_values: torch.Tensor,
+    graph: dict[str, torch.Tensor],
+    *,
+    height: int = 64,
+    width: int = 64,
+    halo_decay_mm: float = 4.0,
+    channel_chunk_size: int = 4,
+    cache: GeometryRasterCache | None = None,
+) -> torch.Tensor:
+    """Vectorized equivalent of :func:`rasterize_node_values_legacy`.
+
+    Shapes:
+      node_values: [N, C]
+      raster_weights: [N, H*W]
+      output: [B, C, H, W]
+
+    The implementation intentionally preserves the legacy distance formula,
+    including the small ``+ EPSILON`` inside sqrt, so in-rectangle weights are
+    very slightly below one rather than exactly one.
+    """
+    if node_values.ndim != 2:
+        raise ValueError(f"node_values must have shape [N, C], got {tuple(node_values.shape)}")
+    node_batch = graph["node_batch"].long()
+    package_size = graph["package_size"].float()
+    num_graphs = int(package_size.shape[0])
+    channels = int(node_values.shape[1])
+    pixels = int(height) * int(width)
+    if cache is not None:
+        validate_raster_cache(cache, graph, height=height, width=width, halo_decay_mm=halo_decay_mm)
+        weights = cache.raster_weights.to(device=node_values.device, dtype=node_values.dtype)
+        node_batch = cache.node_batch.to(device=node_values.device)
+        num_graphs = int(cache.num_graphs)
+    else:
+        weights = compute_node_raster_weights(graph, height=height, width=width, halo_decay_mm=halo_decay_mm, dtype=node_values.dtype)
+    maps_flat = node_values.new_zeros((num_graphs, channels, pixels))
+    chunk = max(int(channel_chunk_size), 1)
+    for start in range(0, channels, chunk):
+        end = min(start + chunk, channels)
+        contribution = weights[:, None, :] * node_values[:, start:end, None]
+        maps_flat[:, start:end, :].index_add_(0, node_batch, contribution)
+    return maps_flat.view(num_graphs, channels, height, width)
+
+
+def compute_node_raster_weights(
+    graph: dict[str, torch.Tensor],
+    *,
+    height: int = 64,
+    width: int = 64,
+    halo_decay_mm: float = 4.0,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    rects = graph["chiplet_rects"].float()
+    package_size = graph["package_size"].float()
+    node_batch = graph["node_batch"].long()
+    device = rects.device
+    dtype = dtype or rects.dtype
+    rects = rects.to(dtype=dtype)
+    package_size = package_size.to(dtype=dtype)
+    node_package = package_size.index_select(0, node_batch)
+    rows = torch.arange(height, dtype=dtype, device=device) + 0.5
+    cols = torch.arange(width, dtype=dtype, device=device) + 0.5
+    yy_unit, xx_unit = torch.meshgrid(rows / float(height), cols / float(width), indexing="ij")
+    xx_unit_flat = xx_unit.reshape(1, -1)
+    yy_unit_flat = yy_unit.reshape(1, -1)
+    xx = xx_unit_flat * node_package[:, 0:1]
+    yy = yy_unit_flat * node_package[:, 1:2]
+    x0 = rects[:, 0:1]
+    y0 = rects[:, 1:2]
+    x1 = x0 + rects[:, 2:3]
+    y1 = y0 + rects[:, 3:4]
+    dx = torch.clamp(torch.maximum(x0 - xx, xx - x1), min=0.0)
+    dy = torch.clamp(torch.maximum(y0 - yy, yy - y1), min=0.0)
+    distance = torch.sqrt(dx * dx + dy * dy + EPSILON)
+    return torch.exp(-distance / max(float(halo_decay_mm), EPSILON))
+
+
+def build_geometry_raster_cache(
+    graph: dict[str, torch.Tensor],
+    *,
+    height: int = 64,
+    width: int = 64,
+    halo_decay_mm: float = 4.0,
+    dtype: torch.dtype = torch.float32,
+    cache_key: str | None = None,
+) -> GeometryRasterCache:
+    weights = compute_node_raster_weights(graph, height=height, width=width, halo_decay_mm=halo_decay_mm, dtype=dtype)
+    return GeometryRasterCache(
+        raster_weights=weights,
+        node_batch=graph["node_batch"].long().clone(),
+        num_graphs=int(graph["package_size"].shape[0]),
+        height=int(height),
+        width=int(width),
+        halo_decay_mm=float(halo_decay_mm),
+        cache_key=cache_key or geometry_cache_key(graph, height=height, width=width, halo_decay_mm=halo_decay_mm),
+    )
+
+
+def validate_raster_cache(
+    cache: GeometryRasterCache,
+    graph: dict[str, torch.Tensor],
+    *,
+    height: int,
+    width: int,
+    halo_decay_mm: float,
+) -> None:
+    if cache.height != int(height) or cache.width != int(width):
+        raise ValueError("raster cache grid shape does not match requested rasterization")
+    if abs(cache.halo_decay_mm - float(halo_decay_mm)) > 1.0e-12:
+        raise ValueError("raster cache halo_decay_mm does not match requested rasterization")
+    if cache.num_graphs != int(graph["package_size"].shape[0]):
+        raise ValueError("raster cache graph count does not match graph batch")
+    if cache.node_batch.shape != graph["node_batch"].shape:
+        raise ValueError("raster cache node_batch shape does not match graph batch")
+    if not torch.equal(cache.node_batch.cpu(), graph["node_batch"].long().cpu()):
+        raise ValueError("raster cache node-to-graph assignment does not match graph batch")
+
+
+def geometry_cache_key(
+    graph: dict[str, torch.Tensor],
+    *,
+    height: int,
+    width: int,
+    halo_decay_mm: float,
+) -> str:
+    rects = graph["chiplet_rects"].detach().cpu().contiguous()
+    package_size = graph["package_size"].detach().cpu().contiguous()
+    node_batch = graph["node_batch"].detach().cpu().contiguous()
+    values = (
+        tuple(rects.reshape(-1).tolist()),
+        tuple(package_size.reshape(-1).tolist()),
+        tuple(int(value) for value in node_batch.reshape(-1).tolist()),
+        int(height),
+        int(width),
+        float(halo_decay_mm),
+    )
+    return str(hash(values))
+
+
+def rasterize_node_values(
+    node_values: torch.Tensor,
+    graph: dict[str, torch.Tensor],
+    *,
+    height: int = 64,
+    width: int = 64,
+    halo_decay_mm: float = 4.0,
+    mode: str = "vectorized",
+    channel_chunk_size: int = 4,
+    cache: GeometryRasterCache | None = None,
+) -> torch.Tensor:
+    if mode == "legacy":
+        return rasterize_node_values_legacy(node_values, graph, height=height, width=width, halo_decay_mm=halo_decay_mm)
+    if mode == "vectorized":
+        return rasterize_node_values_vectorized(
+            node_values,
+            graph,
+            height=height,
+            width=width,
+            halo_decay_mm=halo_decay_mm,
+            channel_chunk_size=channel_chunk_size,
+            cache=cache,
+        )
+    raise ValueError(f"unsupported rasterizer mode: {mode}")
