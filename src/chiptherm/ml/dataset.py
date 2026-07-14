@@ -53,10 +53,12 @@ class ChipThermDataset(Dataset):
 
         x = self._load_tensor(row["x_path"], expected_ndim=3)
         temperature = self._load_tensor(row["y_path"], expected_ndim=2)
-        physics = self._load_tensor(row["prediction_path"], expected_ndim=2)
-        residual_path = self._resolve_path(row["residual_path"])
-        if residual_path.exists():
-            residual = self._load_tensor(row["residual_path"], expected_ndim=2)
+        physics_path_value = self._prediction_path_for_row(row)
+        physics = self._load_tensor(physics_path_value, expected_ndim=2)
+        residual_path_value = self._residual_path_for_row(row)
+        residual_path = self._resolve_path(residual_path_value) if residual_path_value else None
+        if residual_path is not None and residual_path.exists():
+            residual = self._load_tensor(residual_path_value, expected_ndim=2)
         else:
             residual = temperature - physics
 
@@ -216,8 +218,12 @@ class ChipThermDataset(Dataset):
             "y_path": row["y_path"],
             "prediction_path": row["prediction_path"],
             "residual_path": row["residual_path"],
+            "effective_prediction_path": self._prediction_path_for_row(row),
+            "effective_residual_path": self._residual_path_for_row(row),
             "ambient_K": self._ambient_for_row(row),
         }
+        if row.get("source_superposition_base_path"):
+            payload["source_superposition_base_path"] = row["source_superposition_base_path"]
         if self.metadata_feature_names:
             payload["metadata_features"] = {
                 name: float(self.metadata_feature_rows[row["sample_uid"]][name])
@@ -240,6 +246,23 @@ class ChipThermDataset(Dataset):
         if self.metadata_feature_rows and "ambient_K" in self.metadata_feature_rows.get(row["sample_uid"], {}):
             return float(self.metadata_feature_rows[row["sample_uid"]]["ambient_K"])
         return 318.15
+
+    def _prediction_path_for_row(self, row: dict[str, str]) -> str:
+        mode = row.get("source_base_mode") or row.get("base_mode") or row.get("physics_input_mode")
+        if mode == "source_superposition_v1":
+            value = row.get("source_superposition_base_path") or row.get("source_base_path")
+            if not value:
+                raise ValueError(
+                    f"row {row.get('sample_uid')} declares source_superposition_v1 but has no source base path"
+                )
+            return value
+        return row["prediction_path"]
+
+    def _residual_path_for_row(self, row: dict[str, str]) -> str | None:
+        mode = row.get("source_base_mode") or row.get("base_mode") or row.get("physics_input_mode")
+        if mode == "source_superposition_v1":
+            return row.get("source_superposition_residual_path") or row.get("source_base_residual_path")
+        return row.get("residual_path")
 
     def _graph_for_row(self, row: dict[str, str]) -> dict[str, torch.Tensor] | None:
         path = self._graph_path_for_row(row)
