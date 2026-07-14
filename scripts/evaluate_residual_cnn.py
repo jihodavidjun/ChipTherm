@@ -28,6 +28,16 @@ from chiptherm.ml.models import build_model, count_parameters
 from chiptherm.ml.normalization import NormalizationStats, build_metadata_input, build_model_input, unnormalize_residual
 
 
+def physics_input_channel_count(mode: str) -> int:
+    if mode in {"v1", "gated_v1", "source_superposition_v1"}:
+        return 1
+    if mode == "source_superposition_plus_physics_v1":
+        return 2
+    if mode == "none":
+        return 0
+    raise ValueError(f"unsupported physics input mode: {mode}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Evaluate a trained ChipTherm residual CNN.")
     parser.add_argument("--checkpoint", required=True, type=Path)
@@ -73,12 +83,18 @@ def main() -> int:
     }
     graph_stats = checkpoint["model_config"].get("graph_normalization")
     physics_input_mode = str(checkpoint["model_config"].get("physics_input_mode", "v1"))
-    if physics_input_mode not in {"v1", "none", "gated_v1", "source_superposition_v1"}:
+    if physics_input_mode not in {
+        "v1",
+        "none",
+        "gated_v1",
+        "source_superposition_v1",
+        "source_superposition_plus_physics_v1",
+    }:
         raise SystemExit(f"unsupported checkpoint physics_input_mode: {physics_input_mode}")
 
     dataset = ChipThermDataset(args.index, target="residual", return_metadata=True, return_graph=graph_enabled)
     dataset_input_channels = int(dataset[0]["x"].shape[0])
-    actual_input_channels = dataset_input_channels + (1 if physics_input_mode in {"v1", "gated_v1", "source_superposition_v1"} else 0)
+    actual_input_channels = dataset_input_channels + physics_input_channel_count(physics_input_mode)
     expected_input_channels = int(checkpoint["model_config"].get("input_channels", actual_input_channels))
     if actual_input_channels != expected_input_channels:
         raise SystemExit(
@@ -131,7 +147,7 @@ def main() -> int:
                 " End-to-end timing equals CNN-side timing because checkpoint physics_input_mode=none; "
                 "physics_v1 is loaded only for reference metrics."
             )
-        elif physics_input_mode == "source_superposition_v1":
+        elif physics_input_mode in {"source_superposition_v1", "source_superposition_plus_physics_v1"}:
             end_to_end_runtime_per_sample = cnn_runtime_per_sample
             end_to_end_speedup = (
                 hotspot_runtime_s / end_to_end_runtime_per_sample
@@ -140,7 +156,8 @@ def main() -> int:
             )
             timing_note += (
                 " End-to-end timing here is cached-source-base runtime only; "
-                "uncached source-response package inference must be added separately."
+                "uncached source-response package inference must be added separately. "
+                "For source_superposition_plus_physics_v1, physics-v1 is a preloaded auxiliary channel only."
             )
         elif physics_runtime_s is None:
             timing_note += " End-to-end timing requested, but physics_runtime_s metadata was unavailable."
@@ -290,6 +307,9 @@ def main() -> int:
             f"{metrics['pairwise_basis_coeff']['std']:.6f} / "
             f"{metrics['pairwise_basis_coeff']['abs_mean']:.6f}"
         )
+    if metrics.get("physics_v1_auxiliary"):
+        aux = metrics["physics_v1_auxiliary"]
+        print(f"Physics-v1 auxiliary raw MAE/RMSE: {aux['mae_K']:.3f} / {aux['rmse_K']:.3f} K")
     print(f"CNN final MAE/RMSE: {final_mae:.3f} / {final_rmse:.3f} K")
     print(f"Parameter count: {count_parameters(model)}")
     print(f"Improvement: MAE {improvement['mae_percent']:.2f}% / RMSE {improvement['rmse_percent']:.2f}%")
@@ -318,6 +338,7 @@ def evaluate(
     final_acc = MetricAccumulator()
     cnn_only_final_acc = MetricAccumulator()
     physics_acc = MetricAccumulator()
+    physics_v1_acc = MetricAccumulator()
     coarse_final_acc = MetricAccumulator()
     mean_acc = ScalarMetricAccumulator()
     centered_acc = MetricAccumulator()
@@ -349,6 +370,7 @@ def evaluate(
             "cnn_final_temperature": MetricAccumulator(),
             "cnn_only_final_temperature": MetricAccumulator(),
             "physics_baseline": MetricAccumulator(),
+            "physics_v1_auxiliary": MetricAccumulator(),
             "coarse_final_temperature": MetricAccumulator(),
         }
     )
@@ -361,6 +383,9 @@ def evaluate(
     for batch in loader:
         x = batch["x"].to(device, non_blocking=True)
         physics = batch["physics"].to(device, non_blocking=True)
+        physics_v1 = batch.get("physics_v1")
+        if physics_v1 is not None:
+            physics_v1 = physics_v1.to(device, non_blocking=True)
         residual = batch["residual"].to(device, non_blocking=True)
         temperature = batch["temperature"].to(device, non_blocking=True)
         ambient = batch["ambient_K"].to(device, non_blocking=True).float()
@@ -377,7 +402,13 @@ def evaluate(
 
         synchronize(device)
         start = time.perf_counter()
-        model_input = build_model_input(x, physics, stats, physics_input_mode=physics_input_mode)
+        model_input = build_model_input(
+            x,
+            physics,
+            stats,
+            physics_input_mode=physics_input_mode,
+            physics_v1=physics_v1,
+        )
         coarse_norm = None
         alpha = None
         if decomposed:
@@ -463,6 +494,8 @@ def evaluate(
         residual_acc.update(pred_residual, residual)
         final_acc.update(pred_temperature, temperature)
         physics_acc.update(physics, temperature)
+        if physics_v1 is not None:
+            physics_v1_acc.update(physics_v1, temperature)
         chiplet_metrics = None
         if graph_enabled and graph_batch is not None:
             chiplet_metrics = chiplet_metric_values(pred_temperature, temperature, graph_batch)
@@ -476,6 +509,8 @@ def evaluate(
             case_metrics["cnn_residual"].update(pred_residual[index : index + 1], residual[index : index + 1])
             case_metrics["cnn_final_temperature"].update(pred_temperature[index : index + 1], temperature[index : index + 1])
             case_metrics["physics_baseline"].update(physics[index : index + 1], temperature[index : index + 1])
+            if physics_v1 is not None:
+                case_metrics["physics_v1_auxiliary"].update(physics_v1[index : index + 1], temperature[index : index + 1])
             if decomposed and "cnn_only_temperature" in locals():
                 case_metrics["cnn_only_final_temperature"].update(
                     cnn_only_temperature[index : index + 1],
@@ -524,6 +559,9 @@ def evaluate(
         "cnn_final_temperature": final_acc.compute(),
         "physics_baseline": physics_acc.compute(),
     }
+    physics_v1_summary = physics_v1_acc.compute()
+    if physics_v1_summary:
+        metrics["physics_v1_auxiliary"] = physics_v1_summary
     if has_coarse_prediction:
         metrics["coarse_final_temperature"] = coarse_final_acc.compute()
     if decomposed:
@@ -623,13 +661,22 @@ def profile_components(
         prep_start = time.perf_counter()
         x = batch["x"].to(device, non_blocking=True)
         physics = batch["physics"].to(device, non_blocking=True)
+        physics_v1 = batch.get("physics_v1")
+        if physics_v1 is not None:
+            physics_v1 = physics_v1.to(device, non_blocking=True)
         metadata_input = build_metadata_input(batch.get("metadata_vector"), stats)
         if metadata_input is None and conditioned:
             raise ValueError("conditioned graph model requires metadata")
         if metadata_input is not None:
             metadata_input = metadata_input.to(device, non_blocking=True)
         graph_batch = prepare_graph_batch(batch, True, graph_stats, device)
-        model_input = build_model_input(x, physics, stats, physics_input_mode=physics_input_mode)
+        model_input = build_model_input(
+            x,
+            physics,
+            stats,
+            physics_input_mode=physics_input_mode,
+            physics_v1=physics_v1,
+        )
         sync()
         prep_time = time.perf_counter() - prep_start
         graph = graph_batch or {}
@@ -1293,6 +1340,8 @@ def write_case_metrics(path: Path, case_metrics: dict[str, dict[str, dict[str, f
         "case_id",
         "physics_mae_K",
         "physics_rmse_K",
+        "physics_v1_auxiliary_mae_K",
+        "physics_v1_auxiliary_rmse_K",
         "cnn_final_mae_K",
         "cnn_final_rmse_K",
         "cnn_only_final_mae_K",
@@ -1315,6 +1364,7 @@ def write_case_metrics(path: Path, case_metrics: dict[str, dict[str, dict[str, f
         writer.writeheader()
         for case_id, metrics in sorted(case_metrics.items()):
             physics = metrics["physics_baseline"]
+            physics_v1 = metrics.get("physics_v1_auxiliary", {})
             final = metrics["cnn_final_temperature"]
             cnn_only = metrics.get("cnn_only_final_temperature", {})
             coarse = metrics.get("coarse_final_temperature", {})
@@ -1326,6 +1376,8 @@ def write_case_metrics(path: Path, case_metrics: dict[str, dict[str, dict[str, f
                     "case_id": case_id,
                     "physics_mae_K": physics["mae_K"],
                     "physics_rmse_K": physics["rmse_K"],
+                    "physics_v1_auxiliary_mae_K": physics_v1.get("mae_K", ""),
+                    "physics_v1_auxiliary_rmse_K": physics_v1.get("rmse_K", ""),
                     "cnn_final_mae_K": final["mae_K"],
                     "cnn_final_rmse_K": final["rmse_K"],
                     "cnn_only_final_mae_K": cnn_only.get("mae_K", ""),

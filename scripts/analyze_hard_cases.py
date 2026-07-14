@@ -264,9 +264,18 @@ def predict_split(
         for batch in loader:
             x = batch["x"].to(device, non_blocking=True)
             physics = batch["physics"].to(device, non_blocking=True)
+            physics_v1 = batch.get("physics_v1")
+            if physics_v1 is not None:
+                physics_v1 = physics_v1.to(device, non_blocking=True)
             temperature = batch["temperature"].to(device, non_blocking=True)
             ambient = batch["ambient_K"].to(device, non_blocking=True).float()
-            model_input = build_model_input(x, physics, stats, physics_input_mode=physics_input_mode)
+            model_input = build_model_input(
+                x,
+                physics,
+                stats,
+                physics_input_mode=physics_input_mode,
+                physics_v1=physics_v1,
+            )
             metadata_input = build_metadata_input(batch.get("metadata_vector"), stats)
             if metadata_input is not None:
                 metadata_input = metadata_input.to(device, non_blocking=True)

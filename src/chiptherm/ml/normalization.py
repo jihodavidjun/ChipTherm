@@ -31,6 +31,8 @@ class NormalizationStats:
     metadata_feature_names: tuple[str, ...] = ()
     metadata_means: tuple[float, ...] = ()
     metadata_stds: tuple[float, ...] = ()
+    auxiliary_physics_v1_mean: float | None = None
+    auxiliary_physics_v1_std: float | None = None
     notes: str = "Computed from train split only. Masks and normalized coordinate channels are not normalized."
 
     def to_dict(self) -> dict[str, Any]:
@@ -55,6 +57,8 @@ def compute_normalization_stats(
     power_acc = RunningMoments()
     physics_acc = RunningMoments()
     residual_acc = RunningMoments()
+    auxiliary_physics_v1_acc = RunningMoments()
+    saw_auxiliary_physics_v1 = False
     metadata_accs: list[RunningMoments] | None = None
     metadata_feature_names: tuple[str, ...] = ()
     context_accs: list[RunningMoments] | None = None
@@ -64,6 +68,7 @@ def compute_normalization_stats(
     for batch in loader:
         x = batch["x"].float()
         physics = batch["physics"].float()
+        auxiliary_physics_v1 = batch.get("physics_v1")
         residual = batch["residual"].float()
         metadata_vector = batch.get("metadata_vector")
         if input_channels is None:
@@ -79,6 +84,9 @@ def compute_normalization_stats(
             for offset, acc in enumerate(context_accs, start=8):
                 acc.update(x[:, offset])
         physics_acc.update(physics)
+        if auxiliary_physics_v1 is not None:
+            auxiliary_physics_v1_acc.update(auxiliary_physics_v1.float())
+            saw_auxiliary_physics_v1 = True
         residual_acc.update(residual)
         if metadata_vector is not None and metadata_accs is not None:
             for index, acc in enumerate(metadata_accs):
@@ -107,6 +115,8 @@ def compute_normalization_stats(
         metadata_feature_names=metadata_feature_names,
         metadata_means=tuple(acc.mean for acc in metadata_accs),
         metadata_stds=tuple(acc.std for acc in metadata_accs),
+        auxiliary_physics_v1_mean=auxiliary_physics_v1_acc.mean if saw_auxiliary_physics_v1 else None,
+        auxiliary_physics_v1_std=auxiliary_physics_v1_acc.std if saw_auxiliary_physics_v1 else None,
     )
 
 
@@ -158,8 +168,15 @@ def build_model_input(
     stats: NormalizationStats,
     *,
     physics_input_mode: str = "v1",
+    physics_v1: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    if physics_input_mode not in {"v1", "none", "gated_v1", "source_superposition_v1"}:
+    if physics_input_mode not in {
+        "v1",
+        "none",
+        "gated_v1",
+        "source_superposition_v1",
+        "source_superposition_plus_physics_v1",
+    }:
         raise ValueError(f"unsupported physics_input_mode: {physics_input_mode}")
     x_norm = x.float().clone()
     x_norm[:, 0] = normalize_tensor(x_norm[:, 0], stats.power_density_mean, stats.power_density_std)
@@ -169,7 +186,18 @@ def build_model_input(
     if physics_input_mode == "none":
         return x_norm
     physics_norm = normalize_tensor(physics.float(), stats.physics_mean, stats.physics_std).unsqueeze(1)
-    return torch.cat([x_norm, physics_norm], dim=1)
+    if physics_input_mode != "source_superposition_plus_physics_v1":
+        return torch.cat([x_norm, physics_norm], dim=1)
+    if physics_v1 is None:
+        raise ValueError("physics_input_mode=source_superposition_plus_physics_v1 requires physics_v1 tensor")
+    if stats.auxiliary_physics_v1_mean is None or stats.auxiliary_physics_v1_std is None:
+        raise ValueError("normalization stats are missing auxiliary physics-v1 mean/std")
+    physics_v1_norm = normalize_tensor(
+        physics_v1.float(),
+        float(stats.auxiliary_physics_v1_mean),
+        float(stats.auxiliary_physics_v1_std),
+    ).unsqueeze(1)
+    return torch.cat([x_norm, physics_norm, physics_v1_norm], dim=1)
 
 
 def build_metadata_input(metadata_vector: torch.Tensor | None, stats: NormalizationStats) -> torch.Tensor | None:

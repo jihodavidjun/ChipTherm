@@ -142,7 +142,13 @@ def main() -> int:
 def architecture_info(model_config: dict[str, Any]) -> dict[str, Any]:
     architecture = str(model_config.get("architecture", "miniunet"))
     physics_input_mode = str(model_config.get("physics_input_mode", "v1"))
-    if physics_input_mode not in {"v1", "none", "gated_v1", "source_superposition_v1"}:
+    if physics_input_mode not in {
+        "v1",
+        "none",
+        "gated_v1",
+        "source_superposition_v1",
+        "source_superposition_plus_physics_v1",
+    }:
         raise ValueError(f"unsupported physics_input_mode: {physics_input_mode}")
     return {
         "architecture": architecture,
@@ -197,9 +203,18 @@ def analyze(
     for batch in loader:
         x = batch["x"].to(device, non_blocking=True)
         physics = batch["physics"].to(device, non_blocking=True)
+        physics_v1 = batch.get("physics_v1")
+        if physics_v1 is not None:
+            physics_v1 = physics_v1.to(device, non_blocking=True)
         temperature = batch["temperature"].to(device, non_blocking=True)
         ambient = batch["ambient_K"].to(device, non_blocking=True).float()
-        model_input = build_model_input(x, physics, stats, physics_input_mode=str(model_info.get("physics_input_mode", "v1")))
+        model_input = build_model_input(
+            x,
+            physics,
+            stats,
+            physics_input_mode=str(model_info.get("physics_input_mode", "v1")),
+            physics_v1=physics_v1,
+        )
         metadata_input = build_metadata_input(batch.get("metadata_vector"), stats)
         if metadata_input is not None:
             metadata_input = metadata_input.to(device, non_blocking=True)
@@ -662,9 +677,18 @@ def write_sample_panels(
         sample = dataset[int(record["dataset_index"])]
         x = sample["x"].unsqueeze(0).to(device)
         physics = sample["physics"].unsqueeze(0).to(device)
+        physics_v1 = sample.get("physics_v1")
+        if physics_v1 is not None:
+            physics_v1 = physics_v1.unsqueeze(0).to(device)
         ambient = sample["ambient_K"].view(1).to(device)
         y = sample["temperature"].cpu().numpy()
-        model_input = build_model_input(x, physics, stats, physics_input_mode=str(model_info.get("physics_input_mode", "v1")))
+        model_input = build_model_input(
+            x,
+            physics,
+            stats,
+            physics_input_mode=str(model_info.get("physics_input_mode", "v1")),
+            physics_v1=physics_v1,
+        )
         metadata_input = None
         if "metadata_vector" in sample:
             metadata_input = build_metadata_input(sample["metadata_vector"].unsqueeze(0), stats)

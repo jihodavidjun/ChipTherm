@@ -43,6 +43,16 @@ from chiptherm.ml.normalization import (
 )
 
 
+def physics_input_channel_count(mode: str) -> int:
+    if mode in {"v1", "gated_v1", "source_superposition_v1"}:
+        return 1
+    if mode == "source_superposition_plus_physics_v1":
+        return 2
+    if mode == "none":
+        return 0
+    raise ValueError(f"unsupported physics input mode: {mode}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Train ChipTherm residual mini-UNet.")
     parser.add_argument("--train-index", default=REPO_ROOT / "data/runs/benchmarks/dataset_v1/train_index.csv", type=Path)
@@ -75,8 +85,8 @@ def main() -> int:
     parser.add_argument(
         "--physics-input",
         default="v1",
-        choices=["v1", "none", "gated_v1", "source_superposition_v1"],
-        help="Spatial base input mode. 'v1' appends normalized physics_v1; 'source_superposition_v1' appends normalized source-superposition base from prediction_path; 'none' uses normalized X only; 'gated_v1' metadata-gates normalized physics_v1.",
+        choices=["v1", "none", "gated_v1", "source_superposition_v1", "source_superposition_plus_physics_v1"],
+        help="Spatial base input mode. 'v1' appends normalized physics_v1; 'source_superposition_v1' appends normalized source-superposition base; 'source_superposition_plus_physics_v1' appends source-superposition base plus preserved physics_v1 as an auxiliary channel; 'none' uses normalized X only; 'gated_v1' metadata-gates normalized physics_v1.",
     )
     parser.add_argument("--physics-gate-hidden-dim", default=32, type=int)
     parser.add_argument("--physics-gate-init", default=0.9, type=float)
@@ -178,7 +188,7 @@ def main() -> int:
     train_dataset = ChipThermDataset(args.train_index, target="residual", return_metadata=True, return_graph=is_graph_arch)
     val_dataset = ChipThermDataset(args.val_index, target="residual", return_metadata=True, return_graph=is_graph_arch)
     dataset_input_channels = int(train_dataset[0]["x"].shape[0])
-    model_input_channels = dataset_input_channels + (1 if args.physics_input in {"v1", "gated_v1", "source_superposition_v1"} else 0)
+    model_input_channels = dataset_input_channels + physics_input_channel_count(args.physics_input)
     train_loader = make_loader(train_dataset, args.batch_size, shuffle=True, num_workers=args.num_workers, device=device, graph_enabled=is_graph_arch)
     train_eval_loader = make_loader(train_dataset, args.batch_size, shuffle=False, num_workers=args.num_workers, device=device, graph_enabled=is_graph_arch)
     val_loader = make_loader(val_dataset, args.batch_size, shuffle=False, num_workers=args.num_workers, device=device, graph_enabled=is_graph_arch)
@@ -580,6 +590,9 @@ def train_one_epoch(
     for batch in loader:
         x = batch["x"].to(device, non_blocking=True)
         physics = batch["physics"].to(device, non_blocking=True)
+        physics_v1 = batch.get("physics_v1")
+        if physics_v1 is not None:
+            physics_v1 = physics_v1.to(device, non_blocking=True)
         residual = batch["residual"].to(device, non_blocking=True)
         temperature = batch["temperature"].to(device, non_blocking=True)
         ambient = batch["ambient_K"].to(device, non_blocking=True).float()
@@ -587,7 +600,13 @@ def train_one_epoch(
         if metadata_input is not None:
             metadata_input = metadata_input.to(device, non_blocking=True)
         graph_batch = prepare_graph_batch(batch, graph_enabled, graph_stats, device)
-        model_input = build_model_input(x, physics, stats, physics_input_mode=physics_input_mode)
+        model_input = build_model_input(
+            x,
+            physics,
+            stats,
+            physics_input_mode=physics_input_mode,
+            physics_v1=physics_v1,
+        )
         batch_size = int(x.shape[0])
 
         optimizer.zero_grad(set_to_none=True)
@@ -791,6 +810,9 @@ def evaluate_model(
     for batch in loader:
         x = batch["x"].to(device, non_blocking=True)
         physics = batch["physics"].to(device, non_blocking=True)
+        physics_v1 = batch.get("physics_v1")
+        if physics_v1 is not None:
+            physics_v1 = physics_v1.to(device, non_blocking=True)
         residual = batch["residual"].to(device, non_blocking=True)
         temperature = batch["temperature"].to(device, non_blocking=True)
         ambient = batch["ambient_K"].to(device, non_blocking=True).float()
@@ -798,7 +820,13 @@ def evaluate_model(
         if metadata_input is not None:
             metadata_input = metadata_input.to(device, non_blocking=True)
         graph_batch = prepare_graph_batch(batch, graph_enabled, graph_stats, device)
-        model_input = build_model_input(x, physics, stats, physics_input_mode=physics_input_mode)
+        model_input = build_model_input(
+            x,
+            physics,
+            stats,
+            physics_input_mode=physics_input_mode,
+            physics_v1=physics_v1,
+        )
         if decomposed:
             outputs = call_model(model, model_input, metadata_input, graph_batch, conditioned=conditioned, graph_enabled=graph_enabled)
             pred_temperature = reconstruct_decomposed_temperature(outputs, ambient)

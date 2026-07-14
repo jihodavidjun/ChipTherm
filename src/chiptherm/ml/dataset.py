@@ -71,6 +71,9 @@ class ChipThermDataset(Dataset):
             "residual": residual,
             "ambient_K": torch.tensor(self._ambient_for_row(row), dtype=torch.float32),
         }
+        physics_v1_path_value = self._physics_v1_path_for_row(row)
+        if physics_v1_path_value is not None:
+            sample["physics_v1"] = self._load_tensor(physics_v1_path_value, expected_ndim=2)
         metadata_vector = self._metadata_vector_for_row(row)
         if metadata_vector is not None:
             sample["metadata_vector"] = metadata_vector
@@ -263,6 +266,12 @@ class ChipThermDataset(Dataset):
         if mode == "source_superposition_v1":
             return row.get("source_superposition_residual_path") or row.get("source_base_residual_path")
         return row.get("residual_path")
+
+    def _physics_v1_path_for_row(self, row: dict[str, str]) -> str | None:
+        mode = row.get("source_base_mode") or row.get("base_mode") or row.get("physics_input_mode")
+        if mode == "source_superposition_v1":
+            return row.get("prediction_path")
+        return None
 
     def _graph_for_row(self, row: dict[str, str]) -> dict[str, torch.Tensor] | None:
         path = self._graph_path_for_row(row)
