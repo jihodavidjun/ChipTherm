@@ -95,6 +95,7 @@ def run_package_analysis(args: argparse.Namespace, device: torch.device) -> list
     model.eval()
     graph_enabled = str(config.get("architecture", "")) in {
         "miniunet_refine_conditioned_decomposed_graph",
+        "miniunet_refine_conditioned_decomposed_global_graph",
         "miniunet_refine_conditioned_decomposed_pairwise",
         "miniunet_refine_conditioned_decomposed_pairwise_basis",
     }

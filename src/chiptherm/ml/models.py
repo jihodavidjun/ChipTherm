@@ -578,6 +578,268 @@ class DecomposedMiniUNetWithRefinement(nn.Module):
         }
 
 
+class GlobalCenteredFieldBranch(nn.Module):
+    """Explicit low-resolution, zero-mean package-scale correction branch."""
+
+    def __init__(
+        self,
+        input_channels: int,
+        channel_indices: tuple[int, ...] | list[int],
+        channel_names: tuple[str, ...] | list[str] = (),
+        hidden_channels: int = 32,
+        blocks: int = 3,
+        pool_size: int = 8,
+    ) -> None:
+        super().__init__()
+        indices = tuple(int(index) for index in channel_indices)
+        if not indices:
+            raise ValueError("GlobalCenteredFieldBranch requires at least one input channel")
+        if min(indices) < 0 or max(indices) >= int(input_channels):
+            raise ValueError(f"global branch indices {indices} out of range for {input_channels} input channels")
+        if hidden_channels <= 0:
+            raise ValueError("global branch hidden_channels must be positive")
+        if blocks < 0:
+            raise ValueError("global branch blocks must be non-negative")
+        if pool_size <= 1:
+            raise ValueError("global branch pool_size must be greater than one")
+        self.input_channels = int(input_channels)
+        self.channel_indices = indices
+        self.channel_names = tuple(str(name) for name in channel_names)
+        self.hidden_channels = int(hidden_channels)
+        self.blocks = int(blocks)
+        self.pool_size = int(pool_size)
+        self.pool = nn.AdaptiveAvgPool2d((self.pool_size, self.pool_size))
+        self.input_projection = nn.Sequential(
+            nn.Conv2d(len(indices), self.hidden_channels, kernel_size=3, padding=1),
+            nn.SiLU(),
+        )
+        self.residual_blocks = nn.Sequential(
+            *[RefinementResidualBlock(self.hidden_channels) for _ in range(self.blocks)]
+        )
+        self.output_projection = nn.Conv2d(self.hidden_channels, 1, kernel_size=3, padding=1)
+        nn.init.zeros_(self.output_projection.weight)
+        nn.init.zeros_(self.output_projection.bias)
+
+    def forward(self, x: torch.Tensor, *, scale: float = 1.0) -> torch.Tensor:
+        selected = x[:, list(self.channel_indices), :, :]
+        pooled = self.pool(selected)
+        h = self.input_projection(pooled)
+        h = self.residual_blocks(h)
+        coarse = self.output_projection(h)
+        upsampled = F.interpolate(coarse, size=x.shape[-2:], mode="bilinear", align_corners=False).squeeze(1)
+        centered = upsampled - upsampled.mean(dim=(-2, -1), keepdim=True)
+        return centered * float(scale)
+
+    def config(self) -> dict[str, object]:
+        return {
+            "global_branch_input_channels": self.input_channels,
+            "global_branch_channel_indices": list(self.channel_indices),
+            "global_branch_channel_names": list(self.channel_names),
+            "global_branch_hidden_channels": self.hidden_channels,
+            "global_branch_blocks": self.blocks,
+            "global_branch_pool_size": self.pool_size,
+            "global_branch_zero_initialized": True,
+            "global_branch_parameters": count_parameters(self),
+        }
+
+
+def low_frequency_energy_fraction(field: torch.Tensor, pool_size: int = 8) -> torch.Tensor:
+    """Cheap per-sample low-frequency energy proxy from pooled/re-expanded fields."""
+
+    if field.ndim != 3:
+        raise ValueError(f"expected [B,H,W] field, got shape {tuple(field.shape)}")
+    pooled = F.adaptive_avg_pool2d(field.unsqueeze(1), (pool_size, pool_size))
+    low = F.interpolate(pooled, size=field.shape[-2:], mode="bilinear", align_corners=False).squeeze(1)
+    total = torch.mean(field * field, dim=(-2, -1))
+    low_energy = torch.mean(low * low, dim=(-2, -1))
+    return low_energy / (total + 1.0e-12)
+
+
+class DecomposedMiniUNetWithGlobalBranch(nn.Module):
+    """Conditioned decomposed CNN plus an explicit low-frequency centered-field branch."""
+
+    def __init__(
+        self,
+        input_channels: int = 34,
+        output_channels: int = 1,
+        base_channels: int = 32,
+        depth: int = 3,
+        refine_channels: int = 32,
+        refine_blocks: int = 4,
+        refinement_channel_indices: tuple[int, ...] | list[int] = (),
+        refinement_channel_names: tuple[str, ...] | list[str] = (),
+        metadata_dim: int = 0,
+        metadata_hidden_dim: int = 64,
+        metadata_embedding_dim: int = 64,
+        physics_input_mode: str = "source_superposition_v1",
+        physics_gate_hidden_dim: int = 32,
+        physics_gate_init: float = 0.9,
+        global_branch_channel_indices: tuple[int, ...] | list[int] = (),
+        global_branch_channel_names: tuple[str, ...] | list[str] = (),
+        global_hidden_channels: int = 32,
+        global_blocks: int = 3,
+        global_pool_size: int = 8,
+    ) -> None:
+        super().__init__()
+        self.architecture = "miniunet_refine_conditioned_decomposed_global"
+        self.input_channels = int(input_channels)
+        self.output_channels = int(output_channels)
+        self.base_channels = int(base_channels)
+        self.depth = int(depth)
+        self.refine_channels = int(refine_channels)
+        self.refine_blocks = int(refine_blocks)
+        self.refinement_channel_indices = tuple(int(index) for index in refinement_channel_indices)
+        self.refinement_channel_names = tuple(str(name) for name in refinement_channel_names)
+        self.metadata_dim = int(metadata_dim)
+        self.metadata_hidden_dim = int(metadata_hidden_dim)
+        self.metadata_embedding_dim = int(metadata_embedding_dim)
+        self.physics_input_mode = str(physics_input_mode)
+        self.global_hidden_channels = int(global_hidden_channels)
+        self.global_blocks = int(global_blocks)
+        self.global_pool_size = int(global_pool_size)
+        self.cnn_model = DecomposedMiniUNetWithRefinement(
+            input_channels=input_channels,
+            output_channels=output_channels,
+            base_channels=base_channels,
+            depth=depth,
+            refine_channels=refine_channels,
+            refine_blocks=refine_blocks,
+            refinement_channel_indices=refinement_channel_indices,
+            refinement_channel_names=refinement_channel_names,
+            metadata_dim=metadata_dim,
+            metadata_hidden_dim=metadata_hidden_dim,
+            metadata_embedding_dim=metadata_embedding_dim,
+            conditioned=True,
+            physics_input_mode=physics_input_mode,
+            physics_gate_hidden_dim=physics_gate_hidden_dim,
+            physics_gate_init=physics_gate_init,
+        )
+        self.global_branch = GlobalCenteredFieldBranch(
+            input_channels=input_channels,
+            channel_indices=global_branch_channel_indices,
+            channel_names=global_branch_channel_names,
+            hidden_channels=global_hidden_channels,
+            blocks=global_blocks,
+            pool_size=global_pool_size,
+        )
+
+    def forward_components(
+        self,
+        x: torch.Tensor,
+        metadata: torch.Tensor | None = None,
+        *,
+        return_diagnostics: bool = False,
+        global_correction_scale: float = 1.0,
+        ambient: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        local_outputs = self.cnn_model(x, metadata)
+        local_centered = local_outputs["centered_field"]
+        global_centered = self.global_branch(x, scale=global_correction_scale)
+        combined_before_projection = local_centered + global_centered
+        combined = combined_before_projection - combined_before_projection.mean(dim=(-2, -1), keepdim=True)
+        outputs = dict(local_outputs)
+        outputs["local_centered_field"] = local_centered
+        outputs["global_centered_field"] = global_centered
+        outputs["global_correction_field"] = global_centered
+        outputs["centered_before_zero_mean"] = combined_before_projection
+        outputs["centered_field"] = combined
+        outputs["global_correction_abs_mean"] = global_centered.abs().mean(dim=(-2, -1))
+        outputs["global_correction_abs_max"] = global_centered.abs().amax(dim=(-2, -1))
+        outputs["global_correction_rms"] = torch.sqrt(torch.mean(global_centered * global_centered, dim=(-2, -1)))
+        outputs["global_correction_spatial_std"] = global_centered.std(dim=(-2, -1))
+        outputs["global_correction_low_frequency_energy"] = low_frequency_energy_fraction(
+            global_centered,
+            pool_size=self.global_pool_size,
+        )
+        outputs["global_scale"] = global_centered.new_full((global_centered.shape[0],), float(global_correction_scale))
+        if return_diagnostics and ambient is not None:
+            outputs["final_temperature"] = ambient[:, None, None] + outputs["mean_rise"][:, None, None] + combined
+            outputs["local_only_temperature"] = ambient[:, None, None] + outputs["mean_rise"][:, None, None] + local_centered
+        return outputs
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        metadata: torch.Tensor | None = None,
+        *,
+        return_diagnostics: bool = False,
+        global_correction_scale: float = 1.0,
+        ambient: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        return self.forward_components(
+            x,
+            metadata,
+            return_diagnostics=return_diagnostics,
+            global_correction_scale=global_correction_scale,
+            ambient=ambient,
+        )
+
+    def forward_profile(
+        self,
+        x: torch.Tensor,
+        metadata: torch.Tensor,
+        graph: dict[str, torch.Tensor] | None = None,
+        *,
+        synchronize: object | None = None,
+        graph_correction_scale: float = 1.0,
+        global_correction_scale: float = 1.0,
+    ) -> tuple[dict[str, torch.Tensor], dict[str, float]]:
+        del graph, graph_correction_scale
+        timings: dict[str, float] = {}
+
+        def tic() -> float:
+            if synchronize is not None:
+                synchronize()
+            return time.perf_counter()
+
+        def toc(name: str, start: float) -> None:
+            if synchronize is not None:
+                synchronize()
+            timings[name] = timings.get(name, 0.0) + time.perf_counter() - start
+
+        start = tic()
+        local_outputs = self.cnn_model(x, metadata)
+        toc("local_cnn_branch_s", start)
+        start = tic()
+        global_centered = self.global_branch(x, scale=global_correction_scale)
+        toc("global_branch_s", start)
+        start = tic()
+        local_centered = local_outputs["centered_field"]
+        centered = local_centered + global_centered
+        centered = centered - centered.mean(dim=(-2, -1), keepdim=True)
+        outputs = dict(local_outputs)
+        outputs["local_centered_field"] = local_centered
+        outputs["global_centered_field"] = global_centered
+        outputs["global_correction_field"] = global_centered
+        outputs["centered_field"] = centered
+        toc("global_fusion_s", start)
+        return outputs, timings
+
+    def config(self) -> dict[str, object]:
+        global_config = self.global_branch.config()
+        return {
+            "architecture": self.architecture,
+            "input_channels": self.input_channels,
+            "output_channels": self.output_channels,
+            "base_channels": self.base_channels,
+            "depth": self.depth,
+            "refine_channels": self.refine_channels,
+            "refine_blocks": self.refine_blocks,
+            "refinement_channel_indices": list(self.refinement_channel_indices),
+            "refinement_channel_names": list(self.refinement_channel_names),
+            "metadata_dim": self.metadata_dim,
+            "metadata_hidden_dim": self.metadata_hidden_dim,
+            "metadata_embedding_dim": self.metadata_embedding_dim,
+            "conditioned": True,
+            "physics_input_mode": self.physics_input_mode,
+            "global_branch_enabled": True,
+            "cnn_parameter_count": count_parameters(self.cnn_model),
+            "global_branch_parameter_count": count_parameters(self.global_branch),
+            "total_parameters": count_parameters(self),
+            **global_config,
+        }
+
+
 class DecomposedMiniUNetWithGraph(nn.Module):
     """Conditioned decomposed CNN with a parallel chiplet interaction GNN."""
 
@@ -608,9 +870,15 @@ class DecomposedMiniUNetWithGraph(nn.Module):
         graph_use_edge_features: bool = True,
         graph_rasterizer_mode: str = "vectorized",
         freeze_cnn: bool = False,
+        architecture: str = "miniunet_refine_conditioned_decomposed_graph",
+        global_branch_channel_indices: tuple[int, ...] | list[int] = (),
+        global_branch_channel_names: tuple[str, ...] | list[str] = (),
+        global_hidden_channels: int = 32,
+        global_blocks: int = 3,
+        global_pool_size: int = 8,
     ) -> None:
         super().__init__()
-        self.architecture = "miniunet_refine_conditioned_decomposed_graph"
+        self.architecture = str(architecture)
         self.input_channels = input_channels
         self.output_channels = output_channels
         self.base_channels = base_channels
@@ -634,23 +902,47 @@ class DecomposedMiniUNetWithGraph(nn.Module):
         self.graph_use_edge_features = bool(graph_use_edge_features)
         self.graph_rasterizer_mode = str(graph_rasterizer_mode)
         self.freeze_cnn = bool(freeze_cnn)
-        self.cnn_model = DecomposedMiniUNetWithRefinement(
-            input_channels=input_channels,
-            output_channels=output_channels,
-            base_channels=base_channels,
-            depth=depth,
-            refine_channels=refine_channels,
-            refine_blocks=refine_blocks,
-            refinement_channel_indices=refinement_channel_indices,
-            refinement_channel_names=refinement_channel_names,
-            metadata_dim=metadata_dim,
-            metadata_hidden_dim=metadata_hidden_dim,
-            metadata_embedding_dim=metadata_embedding_dim,
-            conditioned=True,
-            physics_input_mode=physics_input_mode,
-            physics_gate_hidden_dim=physics_gate_hidden_dim,
-            physics_gate_init=physics_gate_init,
-        )
+        self.global_branch_enabled = self.architecture == "miniunet_refine_conditioned_decomposed_global_graph"
+        if self.global_branch_enabled:
+            self.cnn_model = DecomposedMiniUNetWithGlobalBranch(
+                input_channels=input_channels,
+                output_channels=output_channels,
+                base_channels=base_channels,
+                depth=depth,
+                refine_channels=refine_channels,
+                refine_blocks=refine_blocks,
+                refinement_channel_indices=refinement_channel_indices,
+                refinement_channel_names=refinement_channel_names,
+                metadata_dim=metadata_dim,
+                metadata_hidden_dim=metadata_hidden_dim,
+                metadata_embedding_dim=metadata_embedding_dim,
+                physics_input_mode=physics_input_mode,
+                physics_gate_hidden_dim=physics_gate_hidden_dim,
+                physics_gate_init=physics_gate_init,
+                global_branch_channel_indices=global_branch_channel_indices,
+                global_branch_channel_names=global_branch_channel_names,
+                global_hidden_channels=global_hidden_channels,
+                global_blocks=global_blocks,
+                global_pool_size=global_pool_size,
+            )
+        else:
+            self.cnn_model = DecomposedMiniUNetWithRefinement(
+                input_channels=input_channels,
+                output_channels=output_channels,
+                base_channels=base_channels,
+                depth=depth,
+                refine_channels=refine_channels,
+                refine_blocks=refine_blocks,
+                refinement_channel_indices=refinement_channel_indices,
+                refinement_channel_names=refinement_channel_names,
+                metadata_dim=metadata_dim,
+                metadata_hidden_dim=metadata_hidden_dim,
+                metadata_embedding_dim=metadata_embedding_dim,
+                conditioned=True,
+                physics_input_mode=physics_input_mode,
+                physics_gate_hidden_dim=physics_gate_hidden_dim,
+                physics_gate_init=physics_gate_init,
+            )
         self.graph_model = ChipletMessagePassingGNN(
             node_feature_dim=graph_node_feature_dim,
             edge_feature_dim=graph_edge_feature_dim,
@@ -687,11 +979,15 @@ class DecomposedMiniUNetWithGraph(nn.Module):
         *,
         return_diagnostics: bool = False,
         graph_correction_scale: float = 1.0,
+        global_correction_scale: float = 1.0,
         ambient: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         if graph is None:
             raise ValueError("graph architecture requires graph batch")
-        cnn_outputs = self.cnn_model(x, metadata)
+        if self.global_branch_enabled:
+            cnn_outputs = self.cnn_model(x, metadata, global_correction_scale=global_correction_scale)
+        else:
+            cnn_outputs = self.cnn_model(x, metadata)
         graph_outputs = self.graph_model(graph, return_diagnostics=return_diagnostics)
         graph_maps = rasterize_node_values(
             graph_outputs["node_raster_values"],
@@ -737,6 +1033,7 @@ class DecomposedMiniUNetWithGraph(nn.Module):
         *,
         return_diagnostics: bool = False,
         graph_correction_scale: float = 1.0,
+        global_correction_scale: float = 1.0,
         ambient: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         return self.forward_components(
@@ -745,6 +1042,7 @@ class DecomposedMiniUNetWithGraph(nn.Module):
             graph,
             return_diagnostics=return_diagnostics,
             graph_correction_scale=graph_correction_scale,
+            global_correction_scale=global_correction_scale,
             ambient=ambient,
         )
 
@@ -756,6 +1054,7 @@ class DecomposedMiniUNetWithGraph(nn.Module):
         *,
         synchronize: object | None = None,
         graph_correction_scale: float = 1.0,
+        global_correction_scale: float = 1.0,
     ) -> tuple[dict[str, torch.Tensor], dict[str, float]]:
         timings: dict[str, float] = {}
 
@@ -770,7 +1069,10 @@ class DecomposedMiniUNetWithGraph(nn.Module):
             timings[name] = timings.get(name, 0.0) + time.perf_counter() - start
 
         start = tic()
-        cnn_outputs = self.cnn_model(x, metadata)
+        if self.global_branch_enabled:
+            cnn_outputs = self.cnn_model(x, metadata, global_correction_scale=global_correction_scale)
+        else:
+            cnn_outputs = self.cnn_model(x, metadata)
         toc("cnn_branch_s", start)
         graph_outputs, graph_timings = self.graph_model.forward_profile(graph, synchronize=synchronize)
         timings.update(graph_timings)
@@ -806,7 +1108,7 @@ class DecomposedMiniUNetWithGraph(nn.Module):
     def config(self) -> dict[str, object]:
         graph_parameters = count_parameters(self.graph_model)
         fusion_parameters = count_parameters(self.fusion_head) + count_parameters(self.graph_mean_head)
-        return {
+        payload = {
             "architecture": self.architecture,
             "input_channels": self.input_channels,
             "output_channels": self.output_channels,
@@ -822,6 +1124,7 @@ class DecomposedMiniUNetWithGraph(nn.Module):
             "conditioned": True,
             "physics_input_mode": self.physics_input_mode,
             "graph_enabled": True,
+            "global_branch_enabled": self.global_branch_enabled,
             "graph_node_feature_dim": self.graph_node_feature_dim,
             "graph_edge_feature_dim": self.graph_edge_feature_dim,
             "graph_hidden_dim": self.graph_hidden_dim,
@@ -834,10 +1137,16 @@ class DecomposedMiniUNetWithGraph(nn.Module):
             "graph_rasterizer_mode": self.graph_rasterizer_mode,
             "freeze_cnn": self.freeze_cnn,
             "cnn_parameter_count": count_parameters(self.cnn_model),
+            "global_branch_parameter_count": count_parameters(getattr(self.cnn_model, "global_branch", None))
+            if self.global_branch_enabled
+            else 0,
             "graph_parameter_count": graph_parameters,
             "fusion_parameter_count": fusion_parameters,
             "total_parameters": count_parameters(self),
         }
+        if self.global_branch_enabled and hasattr(self.cnn_model, "global_branch"):
+            payload.update(self.cnn_model.global_branch.config())
+        return payload
 
 
 class DecomposedMiniUNetWithPairwiseOperator(nn.Module):
@@ -1368,7 +1677,32 @@ def build_model(config: dict[str, object]) -> nn.Module:
             physics_gate_hidden_dim=int(config.get("physics_gate_hidden_dim", 32)),
             physics_gate_init=float(config.get("physics_gate_init", 0.9)),
         )
-    if architecture == "miniunet_refine_conditioned_decomposed_graph":
+    if architecture == "miniunet_refine_conditioned_decomposed_global":
+        return DecomposedMiniUNetWithGlobalBranch(
+            input_channels=int(config.get("input_channels", 34)),
+            output_channels=int(config.get("output_channels", 1)),
+            base_channels=int(config.get("base_channels", 32)),
+            depth=int(config.get("depth", 3)),
+            refine_channels=int(config.get("refine_channels", 32)),
+            refine_blocks=int(config.get("refine_blocks", 4)),
+            refinement_channel_indices=tuple(int(index) for index in config.get("refinement_channel_indices", ())),
+            refinement_channel_names=tuple(str(name) for name in config.get("refinement_channel_names", ())),
+            metadata_dim=int(config.get("metadata_dim", 0)),
+            metadata_hidden_dim=int(config.get("metadata_hidden_dim", 64)),
+            metadata_embedding_dim=int(config.get("metadata_embedding_dim", 64)),
+            physics_input_mode=str(config.get("physics_input_mode", "source_superposition_v1")),
+            physics_gate_hidden_dim=int(config.get("physics_gate_hidden_dim", 32)),
+            physics_gate_init=float(config.get("physics_gate_init", 0.9)),
+            global_branch_channel_indices=tuple(int(index) for index in config.get("global_branch_channel_indices", ())),
+            global_branch_channel_names=tuple(str(name) for name in config.get("global_branch_channel_names", ())),
+            global_hidden_channels=int(config.get("global_hidden_channels", config.get("global_branch_hidden_channels", 32))),
+            global_blocks=int(config.get("global_blocks", config.get("global_branch_blocks", 3))),
+            global_pool_size=int(config.get("global_pool_size", config.get("global_branch_pool_size", 8))),
+        )
+    if architecture in {
+        "miniunet_refine_conditioned_decomposed_graph",
+        "miniunet_refine_conditioned_decomposed_global_graph",
+    }:
         return DecomposedMiniUNetWithGraph(
             input_channels=int(config.get("input_channels", 34)),
             output_channels=int(config.get("output_channels", 1)),
@@ -1395,6 +1729,12 @@ def build_model(config: dict[str, object]) -> nn.Module:
             graph_use_edge_features=bool(config.get("graph_use_edge_features", True)),
             graph_rasterizer_mode=str(config.get("graph_rasterizer_mode", "vectorized")),
             freeze_cnn=bool(config.get("freeze_cnn", False)),
+            architecture=architecture,
+            global_branch_channel_indices=tuple(int(index) for index in config.get("global_branch_channel_indices", ())),
+            global_branch_channel_names=tuple(str(name) for name in config.get("global_branch_channel_names", ())),
+            global_hidden_channels=int(config.get("global_hidden_channels", config.get("global_branch_hidden_channels", 32))),
+            global_blocks=int(config.get("global_blocks", config.get("global_branch_blocks", 3))),
+            global_pool_size=int(config.get("global_pool_size", config.get("global_branch_pool_size", 8))),
         )
     if architecture == "miniunet_refine_conditioned_decomposed_pairwise":
         return DecomposedMiniUNetWithPairwiseOperator(

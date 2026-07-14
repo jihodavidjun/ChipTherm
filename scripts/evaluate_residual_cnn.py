@@ -51,10 +51,14 @@ def main() -> int:
     parser.add_argument("--profile-components", action="store_true")
     parser.add_argument("--disable-graph-correction", action="store_true")
     parser.add_argument("--graph-correction-scale", default=1.0, type=float)
+    parser.add_argument("--disable-global-correction", action="store_true")
+    parser.add_argument("--global-correction-scale", default=1.0, type=float)
     parser.add_argument("--graph-rasterizer-mode", default=None, choices=["vectorized", "legacy"])
     args = parser.parse_args()
     if args.disable_graph_correction:
         args.graph_correction_scale = 0.0
+    if args.disable_global_correction:
+        args.global_correction_scale = 0.0
 
     device = select_device(args.device)
     out_dir = args.out_dir.resolve()
@@ -68,18 +72,29 @@ def main() -> int:
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
     architecture = str(checkpoint["model_config"].get("architecture", "miniunet"))
-    graph_enabled = architecture in {"miniunet_refine_conditioned_decomposed_graph", "miniunet_refine_conditioned_decomposed_pairwise"}
+    graph_enabled = architecture in {
+        "miniunet_refine_conditioned_decomposed_graph",
+        "miniunet_refine_conditioned_decomposed_global_graph",
+        "miniunet_refine_conditioned_decomposed_pairwise",
+        "miniunet_refine_conditioned_decomposed_pairwise_basis",
+    }
     decomposed = architecture in {
         "miniunet_refine_decomposed",
         "miniunet_refine_conditioned_decomposed",
+        "miniunet_refine_conditioned_decomposed_global",
         "miniunet_refine_conditioned_decomposed_graph",
+        "miniunet_refine_conditioned_decomposed_global_graph",
         "miniunet_refine_conditioned_decomposed_pairwise",
+        "miniunet_refine_conditioned_decomposed_pairwise_basis",
     }
     conditioned = architecture in {
         "miniunet_refine_conditioned",
         "miniunet_refine_conditioned_decomposed",
+        "miniunet_refine_conditioned_decomposed_global",
         "miniunet_refine_conditioned_decomposed_graph",
+        "miniunet_refine_conditioned_decomposed_global_graph",
         "miniunet_refine_conditioned_decomposed_pairwise",
+        "miniunet_refine_conditioned_decomposed_pairwise_basis",
     }
     graph_stats = checkpoint["model_config"].get("graph_normalization")
     physics_input_mode = str(checkpoint["model_config"].get("physics_input_mode", "v1"))
@@ -124,6 +139,7 @@ def main() -> int:
         graph_enabled=graph_enabled,
         graph_stats=graph_stats,
         graph_correction_scale=args.graph_correction_scale,
+        global_correction_scale=args.global_correction_scale,
     )
     cnn_runtime_per_sample = runtime_s / max(metrics["num_samples"], 1)
     gate_runtime_per_sample = gate_runtime_s / max(metrics["num_samples"], 1) if gate_runtime_s > 0.0 else None
@@ -218,6 +234,11 @@ def main() -> int:
         "inter_chiplet_delta_T": metrics.get("inter_chiplet_delta_T"),
         "physics_gate": metrics.get("physics_gate"),
         "graph_correction_abs_mean": metrics.get("graph_correction_abs_mean"),
+        "global_correction_abs_mean": metrics.get("global_correction_abs_mean"),
+        "global_correction_abs_max": metrics.get("global_correction_abs_max"),
+        "global_correction_rms": metrics.get("global_correction_rms"),
+        "global_correction_spatial_std": metrics.get("global_correction_spatial_std"),
+        "global_correction_low_frequency_energy": metrics.get("global_correction_low_frequency_energy"),
         "pairwise_k": metrics.get("pairwise_k"),
         "pairwise_contribution": metrics.get("pairwise_contribution"),
         "pairwise_self": metrics.get("pairwise_self"),
@@ -240,6 +261,7 @@ def main() -> int:
             physics_input_mode=physics_input_mode,
             graph_stats=graph_stats,
             graph_correction_scale=args.graph_correction_scale,
+            global_correction_scale=args.global_correction_scale,
         )
         payload["component_runtime"] = component_profile
         (out_dir / "component_runtime.json").write_text(json.dumps(component_profile, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -285,6 +307,13 @@ def main() -> int:
             graph_improvement = metrics.get("graph_improvement", {})
             print(f"CNN-only MAE/RMSE: {cnn_only['mae_K']:.3f} / {cnn_only['rmse_K']:.3f} K")
             print(f"Graph MAE improvement: {graph_improvement.get('mae_K', float('nan')):.3f} K")
+    if metrics.get("global_correction_abs_mean"):
+        global_summary = metrics["global_correction_abs_mean"]
+        print(
+            "Global correction abs mean/std/min/max: "
+            f"{global_summary['mean']:.3f} / {global_summary['std']:.3f} / "
+            f"{global_summary['min']:.3f} / {global_summary['max']:.3f} K"
+        )
     if metrics.get("chiplet_mean_temperature"):
         chip_mean = metrics["chiplet_mean_temperature"]
         chip_peak = metrics.get("chiplet_peak_temperature", {})
@@ -333,6 +362,7 @@ def evaluate(
     graph_enabled: bool = False,
     graph_stats: Any | None = None,
     graph_correction_scale: float = 1.0,
+    global_correction_scale: float = 1.0,
 ) -> tuple[dict[str, Any], dict[str, dict[str, dict[str, float]]], float, float | None, float | None, float]:
     residual_acc = MetricAccumulator()
     final_acc = MetricAccumulator()
@@ -349,6 +379,11 @@ def evaluate(
     graph_correction_max_acc = ScalarSummaryAccumulator()
     graph_correction_rms_acc = ScalarSummaryAccumulator()
     graph_correction_std_acc = ScalarSummaryAccumulator()
+    global_correction_acc = ScalarSummaryAccumulator()
+    global_correction_max_acc = ScalarSummaryAccumulator()
+    global_correction_rms_acc = ScalarSummaryAccumulator()
+    global_correction_std_acc = ScalarSummaryAccumulator()
+    global_correction_low_freq_acc = ScalarSummaryAccumulator()
     cnn_centered_abs_acc = ScalarSummaryAccumulator()
     final_centered_abs_acc = ScalarSummaryAccumulator()
     chiplet_mean_acc = ScalarMetricAccumulator()
@@ -420,6 +455,7 @@ def evaluate(
                 conditioned=conditioned,
                 graph_enabled=graph_enabled,
                 graph_correction_scale=graph_correction_scale,
+                global_correction_scale=global_correction_scale,
             )
             pred_temperature = reconstruct_decomposed_temperature(outputs, ambient)
             pred_residual = pred_temperature - physics
@@ -446,6 +482,15 @@ def evaluate(
                 cnn_only_centered = cnn_only_temperature - cnn_only_temperature.mean(dim=(-2, -1), keepdim=True)
                 cnn_only_final_acc.update(cnn_only_temperature, temperature)
                 cnn_only_centered_acc.update(cnn_only_centered, centered_target)
+            global_correction = outputs.get("global_correction_field")
+            if global_correction is not None:
+                global_abs = global_correction.abs()
+                global_correction_acc.update(global_abs.mean(dim=(-2, -1)))
+                global_correction_max_acc.update(global_abs.amax(dim=(-2, -1)))
+                global_correction_rms_acc.update(torch.sqrt(torch.mean(global_correction * global_correction, dim=(-2, -1))))
+                global_correction_std_acc.update(global_correction.std(dim=(-2, -1)))
+                if "global_correction_low_frequency_energy" in outputs:
+                    global_correction_low_freq_acc.update(outputs["global_correction_low_frequency_energy"])
             update_pairwise_summaries(
                 outputs,
                 pairwise_k_acc,
@@ -594,6 +639,15 @@ def evaluate(
         denominator = max(float(metrics["cnn_centered_field_abs_mean"]["mean"]), 1.0e-8)
         metrics["graph_to_cnn_ratio"] = float(metrics["graph_correction_abs_mean"]["mean"] / denominator)
         write_graph_contribution_rows(out_dir / "graph_contribution_by_sample.csv", graph_rows)
+    global_summary = global_correction_acc.compute()
+    if global_summary:
+        metrics["global_correction_abs_mean"] = global_summary
+        metrics["global_correction_abs_max"] = global_correction_max_acc.compute()
+        metrics["global_correction_rms"] = global_correction_rms_acc.compute()
+        metrics["global_correction_spatial_std"] = global_correction_std_acc.compute()
+        low_freq_summary = global_correction_low_freq_acc.compute()
+        if low_freq_summary:
+            metrics["global_correction_low_frequency_energy"] = low_freq_summary
     pairwise_summary = pairwise_k_acc.compute()
     if pairwise_summary:
         metrics["pairwise_k"] = pairwise_summary
@@ -641,6 +695,7 @@ def profile_components(
     physics_input_mode: str,
     graph_stats: Any | None,
     graph_correction_scale: float,
+    global_correction_scale: float = 1.0,
     warmup_batches: int = 2,
     profile_batches: int = 20,
 ) -> dict[str, Any]:
@@ -696,6 +751,7 @@ def profile_components(
             graph_batch,
             synchronize=sync,
             graph_correction_scale=graph_correction_scale,
+            global_correction_scale=global_correction_scale,
         )
         sync()
         total_time = time.perf_counter() - forward_start
@@ -771,6 +827,7 @@ def call_model(
     conditioned: bool,
     graph_enabled: bool,
     graph_correction_scale: float = 1.0,
+    global_correction_scale: float = 1.0,
 ) -> Any:
     if graph_enabled:
         return model(
@@ -779,8 +836,16 @@ def call_model(
             graph_batch,
             return_diagnostics=True,
             graph_correction_scale=graph_correction_scale,
+            global_correction_scale=global_correction_scale,
         )
     if conditioned:
+        if hasattr(model, "global_branch"):
+            return model(
+                model_input,
+                metadata_input,
+                return_diagnostics=True,
+                global_correction_scale=global_correction_scale,
+            )
         return model(model_input, metadata_input)
     return model(model_input)
 

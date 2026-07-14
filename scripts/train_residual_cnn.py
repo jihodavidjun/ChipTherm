@@ -72,7 +72,9 @@ def main() -> int:
             "miniunet_refine_conditioned",
             "miniunet_refine_decomposed",
             "miniunet_refine_conditioned_decomposed",
+            "miniunet_refine_conditioned_decomposed_global",
             "miniunet_refine_conditioned_decomposed_graph",
+            "miniunet_refine_conditioned_decomposed_global_graph",
             "miniunet_refine_conditioned_decomposed_pairwise",
             "miniunet_refine_conditioned_decomposed_pairwise_basis",
         ],
@@ -100,6 +102,15 @@ def main() -> int:
     parser.add_argument("--graph-rasterizer-mode", default="vectorized", choices=["vectorized", "legacy"])
     parser.add_argument("--graph-use-edge-features", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--lambda-graph", default=0.0, type=float)
+    parser.add_argument("--global-hidden-channels", default=32, type=int)
+    parser.add_argument("--global-blocks", default=3, type=int)
+    parser.add_argument("--global-pool-size", default=8, type=int)
+    parser.add_argument(
+        "--global-branch-channels",
+        nargs="*",
+        default=None,
+        help="Optional explicit global branch channel names or integer model-input indices. Defaults to a compact physical subset.",
+    )
     parser.add_argument("--pairwise-hidden-dim", default=96, type=int)
     parser.add_argument("--pairwise-layers", default=3, type=int)
     parser.add_argument("--pairwise-basis-rank", default=8, type=int)
@@ -140,6 +151,12 @@ def main() -> int:
         raise SystemExit("--physics-gate-regularization must be non-negative")
     if args.lambda_graph < 0.0:
         raise SystemExit("--lambda-graph must be non-negative")
+    if args.global_hidden_channels <= 0:
+        raise SystemExit("--global-hidden-channels must be positive")
+    if args.global_blocks < 0:
+        raise SystemExit("--global-blocks must be non-negative")
+    if args.global_pool_size <= 1:
+        raise SystemExit("--global-pool-size must be greater than one")
     if args.lambda_chiplet_mean < 0.0:
         raise SystemExit("--lambda-chiplet-mean must be non-negative")
     if args.pairwise_hidden_dim <= 0:
@@ -156,21 +173,32 @@ def main() -> int:
         raise SystemExit("--pairwise-basis-halo-decay-mm must be positive")
     if args.pairwise_basis_edge_chunk_size <= 0:
         raise SystemExit("--pairwise-basis-edge-chunk-size must be positive")
-    is_generic_graph_arch = args.model_architecture == "miniunet_refine_conditioned_decomposed_graph"
+    is_global_arch = args.model_architecture in {
+        "miniunet_refine_conditioned_decomposed_global",
+        "miniunet_refine_conditioned_decomposed_global_graph",
+    }
+    is_generic_graph_arch = args.model_architecture in {
+        "miniunet_refine_conditioned_decomposed_graph",
+        "miniunet_refine_conditioned_decomposed_global_graph",
+    }
     is_pairwise_arch = args.model_architecture == "miniunet_refine_conditioned_decomposed_pairwise"
     is_pairwise_basis_arch = args.model_architecture == "miniunet_refine_conditioned_decomposed_pairwise_basis"
     is_graph_arch = is_generic_graph_arch or is_pairwise_arch or is_pairwise_basis_arch
     is_conditioned_arch = args.model_architecture in {
         "miniunet_refine_conditioned",
         "miniunet_refine_conditioned_decomposed",
+        "miniunet_refine_conditioned_decomposed_global",
         "miniunet_refine_conditioned_decomposed_graph",
+        "miniunet_refine_conditioned_decomposed_global_graph",
         "miniunet_refine_conditioned_decomposed_pairwise",
         "miniunet_refine_conditioned_decomposed_pairwise_basis",
     }
     is_decomposed_arch = args.model_architecture in {
         "miniunet_refine_decomposed",
         "miniunet_refine_conditioned_decomposed",
+        "miniunet_refine_conditioned_decomposed_global",
         "miniunet_refine_conditioned_decomposed_graph",
+        "miniunet_refine_conditioned_decomposed_global_graph",
         "miniunet_refine_conditioned_decomposed_pairwise",
         "miniunet_refine_conditioned_decomposed_pairwise_basis",
     }
@@ -207,6 +235,13 @@ def main() -> int:
         dataset_input_channels,
         stats,
         enabled=args.model_architecture != "miniunet",
+    )
+    global_channel_indices, global_channel_names = global_branch_channels_for_dataset(
+        dataset_input_channels,
+        stats,
+        physics_input_mode=args.physics_input,
+        enabled=is_global_arch,
+        requested=args.global_branch_channels,
     )
     model_config: dict[str, Any] = {
         "architecture": args.model_architecture,
@@ -283,6 +318,17 @@ def main() -> int:
                 "source_power_feature_index": 6,
             }
         )
+    if is_global_arch:
+        model_config.update(
+            {
+                "global_branch_enabled": True,
+                "global_branch_channel_indices": list(global_channel_indices),
+                "global_branch_channel_names": list(global_channel_names),
+                "global_hidden_channels": args.global_hidden_channels,
+                "global_blocks": args.global_blocks,
+                "global_pool_size": args.global_pool_size,
+            }
+        )
 
     config = {
         "schema_version": 1,
@@ -311,6 +357,10 @@ def main() -> int:
         "graph_rasterizer_mode": args.graph_rasterizer_mode,
         "graph_use_edge_features": args.graph_use_edge_features,
         "lambda_graph": args.lambda_graph,
+        "global_hidden_channels": args.global_hidden_channels,
+        "global_blocks": args.global_blocks,
+        "global_pool_size": args.global_pool_size,
+        "global_branch_channels": args.global_branch_channels,
         "pairwise_hidden_dim": args.pairwise_hidden_dim,
         "pairwise_layers": args.pairwise_layers,
         "pairwise_basis_rank": args.pairwise_basis_rank,
@@ -338,6 +388,7 @@ def main() -> int:
         "target_decomposition": is_decomposed_arch,
         "metadata_conditioning": is_conditioned_arch,
         "graph_enabled": is_graph_arch,
+        "global_branch_enabled": is_global_arch,
         "pairwise_enabled": is_pairwise_arch,
         "pairwise_basis_enabled": is_pairwise_basis_arch,
         "model": model_config,
@@ -363,6 +414,17 @@ def main() -> int:
             "graph_edge_feature_names": list(getattr(train_dataset, "graph_edge_feature_names", ()) or []),
         }
     )
+    if is_global_arch:
+        config["model"].update(
+            {
+                "global_branch_enabled": True,
+                "global_branch_channel_indices": list(global_channel_indices),
+                "global_branch_channel_names": list(global_channel_names),
+                "global_hidden_channels": args.global_hidden_channels,
+                "global_blocks": args.global_blocks,
+                "global_pool_size": args.global_pool_size,
+            }
+        )
     (out_dir / "config.json").write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     save_normalization_stats(stats, out_dir / "normalization.json")
 
@@ -377,6 +439,9 @@ def main() -> int:
     if args.model_architecture == "miniunet_refine":
         print(f"Refinement channels: {list(refinement_channel_indices)}")
         print(f"Refinement channel names: {', '.join(refinement_channel_names)}")
+    if is_global_arch:
+        print(f"Global branch channels: {list(global_channel_indices)}")
+        print(f"Global branch channel names: {', '.join(global_channel_names)}")
     if init_summary:
         print(f"Initialized from {args.init_checkpoint}: {init_summary}")
     print(f"Trainable parameters: {count_parameters(model)}")
@@ -544,6 +609,74 @@ def dataset_channel_names(dataset_input_channels: int, stats: NormalizationStats
     return names
 
 
+def model_input_channel_names(dataset_input_channels: int, stats: NormalizationStats, physics_input_mode: str) -> list[str]:
+    names = dataset_channel_names(dataset_input_channels, stats)
+    if physics_input_mode == "source_superposition_v1":
+        names.append("source_superposition_base_K")
+    elif physics_input_mode == "source_superposition_plus_physics_v1":
+        names.extend(["source_superposition_base_K", "physics_v1_temperature_K"])
+    elif physics_input_mode in {"v1", "gated_v1"}:
+        names.append("physics_v1_temperature_K")
+    elif physics_input_mode == "none":
+        pass
+    else:
+        raise ValueError(f"unsupported physics_input_mode: {physics_input_mode}")
+    return names
+
+
+def global_branch_channels_for_dataset(
+    dataset_input_channels: int,
+    stats: NormalizationStats,
+    *,
+    physics_input_mode: str,
+    enabled: bool,
+    requested: list[str] | None,
+) -> tuple[tuple[int, ...], tuple[str, ...]]:
+    if not enabled:
+        return (), ()
+    names = model_input_channel_names(dataset_input_channels, stats, physics_input_mode)
+    selected: list[int] = []
+    if requested:
+        name_to_index = {name: index for index, name in enumerate(names)}
+        for item in requested:
+            if str(item).isdigit():
+                index = int(item)
+            else:
+                if item not in name_to_index:
+                    raise SystemExit(f"unknown --global-branch-channels item {item!r}; available names include {names}")
+                index = name_to_index[item]
+            if index < 0 or index >= len(names):
+                raise SystemExit(f"global branch channel index {index} out of range for {len(names)} model input channels")
+            if index not in selected:
+                selected.append(index)
+    else:
+        for index, name in enumerate(names):
+            if is_global_branch_channel(name):
+                selected.append(index)
+        if physics_input_mode == "source_superposition_plus_physics_v1":
+            physics_v1_index = len(names) - 1
+            if physics_v1_index in selected:
+                selected.remove(physics_v1_index)
+    if not selected:
+        raise SystemExit("global branch could not identify any compact physical input channels")
+    return tuple(selected), tuple(names[index] for index in selected)
+
+
+def is_global_branch_channel(name: str) -> bool:
+    return name in {
+        "power_density_W_per_mm2",
+        "occupancy_mask",
+        "normalized_x_coordinate",
+        "normalized_y_coordinate",
+        "minimum_distance_to_package_edge_mm",
+        "finite_source_L2mm",
+        "finite_source_L4mm",
+        "enclosed_power_R8mm_W",
+        "enclosed_power_R16mm_W",
+        "source_superposition_base_K",
+    }
+
+
 def train_one_epoch(
     model: nn.Module,
     loader: DataLoader[dict[str, Any]],
@@ -578,6 +711,7 @@ def train_one_epoch(
     gate_regularization_total = 0.0
     graph_regularization_total = 0.0
     graph_correction_total = 0.0
+    global_correction_total = 0.0
     chiplet_mean_loss_total = 0.0
     gate_acc = ScalarSummaryAccumulator()
     pairwise_k_acc = ScalarSummaryAccumulator()
@@ -642,6 +776,9 @@ def train_one_epoch(
                 if lambda_graph > 0.0:
                     loss = loss + float(lambda_graph) * graph_mag
                     graph_regularization_total += float(graph_mag.item()) * batch_size
+            global_correction = outputs.get("global_correction_field")
+            if global_correction is not None:
+                global_correction_total += float(torch.mean(torch.abs(global_correction)).item()) * batch_size
             update_pairwise_summaries(
                 outputs,
                 pairwise_k_acc,
@@ -696,6 +833,7 @@ def train_one_epoch(
         "gate_regularization": gate_regularization_total / denominator,
         "graph_regularization": graph_regularization_total / denominator,
         "graph_correction_abs_mean": graph_correction_total / denominator,
+        "global_correction_abs_mean": global_correction_total / denominator,
         "chiplet_mean_loss_K": chiplet_mean_loss_total / denominator,
         **gate_acc.prefixed("gate_alpha"),
         **pairwise_k_acc.prefixed("pairwise_k"),
@@ -724,16 +862,20 @@ def format_gate_summary(summary: dict[str, float] | None) -> str:
 
 
 def format_graph_epoch_summary(metrics: dict[str, Any], by_case: dict[str, dict[str, dict[str, float]]]) -> str:
-    if "graph_correction_abs_mean" not in metrics:
-        return "graph=n/a"
-    graph_abs = metrics["graph_correction_abs_mean"]["mean"]
+    if "graph_correction_abs_mean" not in metrics and "global_correction_abs_mean" not in metrics:
+        return "graph/global=n/a"
+    graph_abs = metrics.get("graph_correction_abs_mean", {}).get("mean", float("nan"))
     graph_ratio = metrics.get("graph_to_cnn_ratio", float("nan"))
     cnn_only = metrics.get("cnn_only_final_temperature", {}).get("mae_K")
     fused = metrics.get("final_temperature", {}).get("mae_K")
     case02 = by_case.get("case02", {})
     case02_cnn = case02.get("cnn_only_final_temperature", {}).get("mae_K")
     case02_fused = case02.get("final_temperature", {}).get("mae_K")
-    parts = [f"graph_abs={graph_abs:.3f}", f"graph_ratio={graph_ratio:.3f}"]
+    parts = []
+    if "global_correction_abs_mean" in metrics:
+        parts.append(f"global_abs={metrics['global_correction_abs_mean']['mean']:.3f}")
+    if "graph_correction_abs_mean" in metrics:
+        parts.extend([f"graph_abs={graph_abs:.3f}", f"graph_ratio={graph_ratio:.3f}"])
     if cnn_only is not None and fused is not None:
         parts.append(f"cnn_only={cnn_only:.3f}K")
         parts.append(f"fused={fused:.3f}K")
@@ -779,6 +921,11 @@ def evaluate_model(
     graph_correction_max_acc = ScalarSummaryAccumulator()
     graph_correction_rms_acc = ScalarSummaryAccumulator()
     graph_correction_std_acc = ScalarSummaryAccumulator()
+    global_correction_acc = ScalarSummaryAccumulator()
+    global_correction_max_acc = ScalarSummaryAccumulator()
+    global_correction_rms_acc = ScalarSummaryAccumulator()
+    global_correction_std_acc = ScalarSummaryAccumulator()
+    global_correction_low_freq_acc = ScalarSummaryAccumulator()
     cnn_centered_abs_acc = ScalarSummaryAccumulator()
     final_centered_abs_acc = ScalarSummaryAccumulator()
     chiplet_mean_acc = ScalarMetricAccumulator()
@@ -857,6 +1004,15 @@ def evaluate_model(
                 cnn_only_centered = cnn_only_temperature - cnn_only_temperature.mean(dim=(-2, -1), keepdim=True)
                 cnn_only_final_acc.update(cnn_only_temperature, temperature)
                 cnn_only_centered_acc.update(cnn_only_centered, centered_target)
+            global_correction = outputs.get("global_correction_field")
+            if global_correction is not None:
+                global_abs = global_correction.abs()
+                global_correction_acc.update(global_abs.mean(dim=(-2, -1)))
+                global_correction_max_acc.update(global_abs.amax(dim=(-2, -1)))
+                global_correction_rms_acc.update(torch.sqrt(torch.mean(global_correction * global_correction, dim=(-2, -1))))
+                global_correction_std_acc.update(global_correction.std(dim=(-2, -1)))
+                if "global_correction_low_frequency_energy" in outputs:
+                    global_correction_low_freq_acc.update(outputs["global_correction_low_frequency_energy"])
             update_pairwise_summaries(
                 outputs,
                 pairwise_k_acc,
@@ -922,6 +1078,15 @@ def evaluate_model(
         metrics["final_centered_field_abs_mean"] = final_centered_abs_acc.compute()
         denominator = max(float(metrics["cnn_centered_field_abs_mean"]["mean"]), 1.0e-8)
         metrics["graph_to_cnn_ratio"] = float(metrics["graph_correction_abs_mean"]["mean"] / denominator)
+    global_summary = global_correction_acc.compute()
+    if global_summary:
+        metrics["global_correction_abs_mean"] = global_summary
+        metrics["global_correction_abs_max"] = global_correction_max_acc.compute()
+        metrics["global_correction_rms"] = global_correction_rms_acc.compute()
+        metrics["global_correction_spatial_std"] = global_correction_std_acc.compute()
+        low_freq_summary = global_correction_low_freq_acc.compute()
+        if low_freq_summary:
+            metrics["global_correction_low_frequency_energy"] = low_freq_summary
     chiplet_mean_summary = chiplet_mean_acc.compute()
     if chiplet_mean_summary:
         metrics["chiplet_mean_temperature"] = chiplet_mean_summary
@@ -1342,6 +1507,7 @@ def init_train_log(path: Path) -> None:
                 "train_gate_alpha_max",
                 "train_graph_regularization",
                 "train_graph_correction_abs_mean",
+                "train_global_correction_abs_mean",
                 "train_chiplet_mean_loss_K",
                 "train_pairwise_k_abs_mean",
                 "train_pairwise_contribution_abs_mean",
@@ -1372,6 +1538,11 @@ def init_train_log(path: Path) -> None:
                 "val_graph_correction_rms",
                 "val_graph_correction_spatial_std",
                 "val_graph_to_cnn_ratio",
+                "val_global_correction_abs_mean",
+                "val_global_correction_abs_max",
+                "val_global_correction_rms",
+                "val_global_correction_spatial_std",
+                "val_global_correction_low_frequency_energy",
                 "val_chiplet_mean_mae_K",
                 "val_chiplet_peak_mae_K",
                 "val_inter_chiplet_delta_mae_K",
@@ -1416,6 +1587,7 @@ def append_train_log(
                 train_losses.get("gate_alpha_max", ""),
                 train_losses.get("graph_regularization", ""),
                 train_losses.get("graph_correction_abs_mean", ""),
+                train_losses.get("global_correction_abs_mean", ""),
                 train_losses.get("chiplet_mean_loss_K", ""),
                 train_losses.get("pairwise_k_abs_mean", ""),
                 train_losses.get("pairwise_contribution_abs_mean", ""),
@@ -1446,6 +1618,11 @@ def append_train_log(
                 val_metrics.get("graph_correction_rms", {}).get("mean", ""),
                 val_metrics.get("graph_correction_spatial_std", {}).get("mean", ""),
                 val_metrics.get("graph_to_cnn_ratio", ""),
+                val_metrics.get("global_correction_abs_mean", {}).get("mean", ""),
+                val_metrics.get("global_correction_abs_max", {}).get("mean", ""),
+                val_metrics.get("global_correction_rms", {}).get("mean", ""),
+                val_metrics.get("global_correction_spatial_std", {}).get("mean", ""),
+                val_metrics.get("global_correction_low_frequency_energy", {}).get("mean", ""),
                 val_metrics.get("chiplet_mean_temperature", {}).get("mae_K", ""),
                 val_metrics.get("chiplet_peak_temperature", {}).get("mae_K", ""),
                 val_metrics.get("inter_chiplet_delta_T", {}).get("mean", ""),

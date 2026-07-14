@@ -93,13 +93,16 @@ class IntegratedChipThermModel:
         self.residual_architecture = str(self.residual_config.get("architecture", ""))
         self.graph_enabled = self.residual_architecture in {
             "miniunet_refine_conditioned_decomposed_graph",
+            "miniunet_refine_conditioned_decomposed_global_graph",
             "miniunet_refine_conditioned_decomposed_pairwise",
             "miniunet_refine_conditioned_decomposed_pairwise_basis",
         }
         self.conditioned = self.residual_architecture in {
             "miniunet_refine_conditioned",
             "miniunet_refine_conditioned_decomposed",
+            "miniunet_refine_conditioned_decomposed_global",
             "miniunet_refine_conditioned_decomposed_graph",
+            "miniunet_refine_conditioned_decomposed_global_graph",
             "miniunet_refine_conditioned_decomposed_pairwise",
             "miniunet_refine_conditioned_decomposed_pairwise_basis",
         }
