@@ -643,6 +643,219 @@ class GlobalCenteredFieldBranch(nn.Module):
         }
 
 
+class FusionResidualDeltaBlock(nn.Module):
+    """Small residual delta block with zero-initialized output for identity fusion."""
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.act = nn.SiLU()
+        nn.init.zeros_(self.conv2.weight)
+        nn.init.zeros_(self.conv2.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv2(self.act(self.conv1(x)))
+
+
+class GlobalFeatureFusionBlock(nn.Module):
+    """Inject package-scale global features into a local decoder feature map."""
+
+    def __init__(self, local_channels: int, global_channels: int) -> None:
+        super().__init__()
+        self.local_channels = int(local_channels)
+        self.global_channels = int(global_channels)
+        self.mix = nn.Sequential(
+            nn.Conv2d(self.local_channels + self.global_channels, self.local_channels, kernel_size=1),
+            nn.SiLU(),
+        )
+        self.delta = FusionResidualDeltaBlock(self.local_channels)
+
+    def forward(self, local: torch.Tensor, global_feature: torch.Tensor, *, enabled: bool = True) -> torch.Tensor:
+        if not enabled:
+            return local
+        if global_feature.shape[-2:] != local.shape[-2:]:
+            global_feature = F.interpolate(global_feature, size=local.shape[-2:], mode="bilinear", align_corners=False)
+        h = self.mix(torch.cat([local, global_feature], dim=1))
+        return local + self.delta(h)
+
+
+class GlobalContextFeatureEncoder(nn.Module):
+    """Aggressively pooled global context branch that emits decoder-scale features."""
+
+    def __init__(
+        self,
+        input_channels: int,
+        channel_indices: tuple[int, ...] | list[int],
+        channel_names: tuple[str, ...] | list[str] = (),
+        hidden_channels: int = 32,
+        output_channels_by_scale: dict[str, int] | None = None,
+        pool_size: int = 8,
+        context_blocks: int = 3,
+    ) -> None:
+        super().__init__()
+        indices = tuple(int(index) for index in channel_indices)
+        if not indices:
+            raise ValueError("GlobalContextFeatureEncoder requires at least one input channel")
+        if min(indices) < 0 or max(indices) >= int(input_channels):
+            raise ValueError(f"global feature indices {indices} out of range for {input_channels} input channels")
+        if hidden_channels <= 0:
+            raise ValueError("global feature hidden_channels must be positive")
+        if pool_size != 8:
+            raise ValueError("feature-fusion global encoder currently expects pool_size=8 for 64x64 inputs")
+        if context_blocks < 0:
+            raise ValueError("global feature context_blocks must be non-negative")
+        output_channels_by_scale = output_channels_by_scale or {}
+        for scale in ("16", "32", "64"):
+            if scale not in output_channels_by_scale:
+                raise ValueError(f"missing output channel count for global fusion scale {scale}")
+        self.input_channels = int(input_channels)
+        self.channel_indices = indices
+        self.channel_names = tuple(str(name) for name in channel_names)
+        self.hidden_channels = int(hidden_channels)
+        self.pool_size = int(pool_size)
+        self.context_blocks = int(context_blocks)
+        self.output_channels_by_scale = {str(key): int(value) for key, value in output_channels_by_scale.items()}
+        self.stem = nn.Sequential(
+            nn.Conv2d(len(indices), hidden_channels, kernel_size=3, padding=1),
+            nn.SiLU(),
+        )
+        self.down32 = nn.Sequential(
+            nn.Conv2d(hidden_channels, hidden_channels * 2, kernel_size=3, stride=2, padding=1),
+            nn.SiLU(),
+        )
+        self.down16 = nn.Sequential(
+            nn.Conv2d(hidden_channels * 2, hidden_channels * 4, kernel_size=3, stride=2, padding=1),
+            nn.SiLU(),
+        )
+        self.down8 = nn.Sequential(
+            nn.Conv2d(hidden_channels * 4, hidden_channels * 4, kernel_size=3, stride=2, padding=1),
+            nn.SiLU(),
+        )
+        self.context = nn.Sequential(*[RefinementResidualBlock(hidden_channels * 4) for _ in range(context_blocks)])
+        self.proj16 = nn.Conv2d(hidden_channels * 4, self.output_channels_by_scale["16"], kernel_size=1)
+        self.proj32 = nn.Conv2d(hidden_channels * 4, self.output_channels_by_scale["32"], kernel_size=1)
+        self.proj64 = nn.Conv2d(hidden_channels * 4, self.output_channels_by_scale["64"], kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        selected = x[:, list(self.channel_indices), :, :]
+        h64 = self.stem(selected)
+        h32 = self.down32(h64)
+        h16 = self.down16(h32)
+        h8 = self.context(self.down8(h16))
+        return {
+            "16": self.proj16(F.interpolate(h8, size=(16, 16), mode="bilinear", align_corners=False)),
+            "32": self.proj32(F.interpolate(h8, size=(32, 32), mode="bilinear", align_corners=False)),
+            "64": self.proj64(F.interpolate(h8, size=(64, 64), mode="bilinear", align_corners=False)),
+            "8": h8,
+        }
+
+    def config(self) -> dict[str, object]:
+        return {
+            "global_branch_input_channels": self.input_channels,
+            "global_branch_channel_indices": list(self.channel_indices),
+            "global_branch_channel_names": list(self.channel_names),
+            "global_branch_hidden_channels": self.hidden_channels,
+            "global_branch_pool_size": self.pool_size,
+            "global_branch_context_blocks": self.context_blocks,
+            "global_branch_output_channels_by_scale": dict(self.output_channels_by_scale),
+            "global_encoder_parameters": count_parameters(self),
+        }
+
+
+class FeatureFusionFiLMMiniUNet(nn.Module):
+    """MiniUNet decoder with package-scale global features fused at 16/32/64."""
+
+    def __init__(
+        self,
+        input_channels: int,
+        output_channels: int = 1,
+        base_channels: int = 32,
+        depth: int = 3,
+        metadata_embedding_dim: int = 64,
+        global_branch_channel_indices: tuple[int, ...] | list[int] = (),
+        global_branch_channel_names: tuple[str, ...] | list[str] = (),
+        global_hidden_channels: int = 32,
+        global_pool_size: int = 8,
+        global_context_blocks: int = 3,
+    ) -> None:
+        super().__init__()
+        if depth != 3:
+            raise ValueError("feature-fusion MiniUNet currently supports depth=3 (64->32->16 decoder fusion)")
+        self.input_channels = int(input_channels)
+        self.output_channels = int(output_channels)
+        self.base_channels = int(base_channels)
+        self.depth = int(depth)
+        self.metadata_embedding_dim = int(metadata_embedding_dim)
+        channels = [base_channels * (2**i) for i in range(depth)]
+        self.channels = tuple(channels)
+        encoders: list[nn.Module] = []
+        in_ch = input_channels
+        for out_ch in channels:
+            encoders.append(ConvBlock(in_ch, out_ch))
+            in_ch = out_ch
+        self.encoders = nn.ModuleList(encoders)
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.bottleneck_film = FiLM(metadata_embedding_dim, channels[-1])
+        self.global_encoder = GlobalContextFeatureEncoder(
+            input_channels=input_channels,
+            channel_indices=global_branch_channel_indices,
+            channel_names=global_branch_channel_names,
+            hidden_channels=global_hidden_channels,
+            output_channels_by_scale={"16": channels[-1], "32": channels[1], "64": channels[0]},
+            pool_size=global_pool_size,
+            context_blocks=global_context_blocks,
+        )
+        self.fuse16 = GlobalFeatureFusionBlock(channels[-1], channels[-1])
+        self.decoder32 = ConvBlock(channels[-1] + channels[1], channels[1])
+        self.decoder32_film = FiLM(metadata_embedding_dim, channels[1])
+        self.fuse32 = GlobalFeatureFusionBlock(channels[1], channels[1])
+        self.decoder64 = ConvBlock(channels[1] + channels[0], channels[0])
+        self.decoder64_film = FiLM(metadata_embedding_dim, channels[0])
+        self.fuse64 = GlobalFeatureFusionBlock(channels[0], channels[0])
+        self.head = nn.Conv2d(channels[0], output_channels, kernel_size=1)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        metadata_embedding: torch.Tensor | None = None,
+        *,
+        disabled_fusion_scales: tuple[str, ...] | list[str] = (),
+        return_features: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        disabled = {str(scale) for scale in disabled_fusion_scales}
+        skips: list[torch.Tensor] = []
+        h = x
+        for index, encoder in enumerate(self.encoders):
+            h = encoder(h)
+            if index < len(self.encoders) - 1:
+                skips.append(h)
+                h = self.pool(h)
+        h = self.bottleneck_film(h, metadata_embedding)
+        global_features = self.global_encoder(x)
+        h = self.fuse16(h, global_features["16"], enabled="16" not in disabled and "all" not in disabled)
+        skip32, skip64 = skips[-1], skips[0]
+        h = F.interpolate(h, size=skip32.shape[-2:], mode="bilinear", align_corners=False)
+        h = self.decoder32(torch.cat([h, skip32], dim=1))
+        h = self.decoder32_film(h, metadata_embedding)
+        h = self.fuse32(h, global_features["32"], enabled="32" not in disabled and "all" not in disabled)
+        h = F.interpolate(h, size=skip64.shape[-2:], mode="bilinear", align_corners=False)
+        h = self.decoder64(torch.cat([h, skip64], dim=1))
+        h = self.decoder64_film(h, metadata_embedding)
+        h = self.fuse64(h, global_features["64"], enabled="64" not in disabled and "all" not in disabled)
+        output = self.head(h)
+        if return_features:
+            return output, global_features
+        return output
+
+    def config(self) -> dict[str, object]:
+        return {
+            "feature_fusion_channels": list(self.channels),
+            "feature_fusion_parameters": count_parameters(self),
+            **self.global_encoder.config(),
+        }
+
+
 def low_frequency_energy_fraction(field: torch.Tensor, pool_size: int = 8) -> torch.Tensor:
     """Cheap per-sample low-frequency energy proxy from pooled/re-expanded fields."""
 
@@ -840,6 +1053,218 @@ class DecomposedMiniUNetWithGlobalBranch(nn.Module):
         }
 
 
+class DecomposedMiniUNetWithFeatureFusion(nn.Module):
+    """Conditioned decomposed CNN with package-scale features fused into the decoder."""
+
+    def __init__(
+        self,
+        input_channels: int = 34,
+        output_channels: int = 1,
+        base_channels: int = 32,
+        depth: int = 3,
+        refine_channels: int = 32,
+        refine_blocks: int = 4,
+        refinement_channel_indices: tuple[int, ...] | list[int] = (),
+        refinement_channel_names: tuple[str, ...] | list[str] = (),
+        metadata_dim: int = 0,
+        metadata_hidden_dim: int = 64,
+        metadata_embedding_dim: int = 64,
+        physics_input_mode: str = "source_superposition_v1",
+        physics_gate_hidden_dim: int = 32,
+        physics_gate_init: float = 0.9,
+        global_branch_channel_indices: tuple[int, ...] | list[int] = (),
+        global_branch_channel_names: tuple[str, ...] | list[str] = (),
+        global_hidden_channels: int = 32,
+        global_pool_size: int = 8,
+        global_context_blocks: int = 3,
+    ) -> None:
+        super().__init__()
+        indices = tuple(int(index) for index in refinement_channel_indices)
+        if not indices:
+            raise ValueError("DecomposedMiniUNetWithFeatureFusion requires refinement_channel_indices")
+        self.architecture = "miniunet_refine_conditioned_decomposed_feature_fusion"
+        self.input_channels = int(input_channels)
+        self.output_channels = int(output_channels)
+        self.base_channels = int(base_channels)
+        self.depth = int(depth)
+        self.refine_channels = int(refine_channels)
+        self.refine_blocks = int(refine_blocks)
+        self.refinement_channel_indices = indices
+        self.refinement_channel_names = tuple(str(name) for name in refinement_channel_names)
+        self.metadata_dim = int(metadata_dim)
+        self.metadata_hidden_dim = int(metadata_hidden_dim)
+        self.metadata_embedding_dim = int(metadata_embedding_dim)
+        self.physics_input_mode = str(physics_input_mode)
+        self.physics_gate_hidden_dim = int(physics_gate_hidden_dim)
+        self.physics_gate_init = float(physics_gate_init)
+        self.global_hidden_channels = int(global_hidden_channels)
+        self.global_pool_size = int(global_pool_size)
+        self.global_context_blocks = int(global_context_blocks)
+        self.metadata_encoder = MetadataEncoder(metadata_dim, metadata_hidden_dim, metadata_embedding_dim)
+        self.physics_gate = (
+            PhysicsReliabilityGate(metadata_embedding_dim, self.physics_gate_hidden_dim, self.physics_gate_init)
+            if self.physics_input_mode == "gated_v1"
+            else None
+        )
+        self.coarse_model = FeatureFusionFiLMMiniUNet(
+            input_channels=input_channels,
+            output_channels=output_channels,
+            base_channels=base_channels,
+            depth=depth,
+            metadata_embedding_dim=metadata_embedding_dim,
+            global_branch_channel_indices=global_branch_channel_indices,
+            global_branch_channel_names=global_branch_channel_names,
+            global_hidden_channels=global_hidden_channels,
+            global_pool_size=global_pool_size,
+            global_context_blocks=global_context_blocks,
+        )
+        self.refinement_model = ConditionedFullResolutionRefinementCNN(
+            len(indices) + output_channels,
+            refine_channels=refine_channels,
+            refine_blocks=refine_blocks,
+            metadata_embedding_dim=metadata_embedding_dim,
+        )
+        self.mean_head = nn.Sequential(
+            nn.Linear(metadata_embedding_dim + input_channels, metadata_hidden_dim),
+            nn.SiLU(),
+            nn.Linear(metadata_hidden_dim, 1),
+        )
+
+    def forward_components(
+        self,
+        x: torch.Tensor,
+        metadata: torch.Tensor | None = None,
+        *,
+        return_diagnostics: bool = False,
+        disabled_fusion_scales: tuple[str, ...] | list[str] = (),
+        ambient: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        if metadata is None:
+            raise ValueError("feature-fusion decomposed model requires metadata tensor")
+        embedding = self.metadata_encoder(metadata)
+        alpha = None
+        if self.physics_gate is not None:
+            if x.shape[1] < 1:
+                raise ValueError("gated_v1 requires a physics input channel")
+            alpha = self.physics_gate(embedding)
+            x = torch.cat([x[:, :-1], x[:, -1:] * alpha], dim=1)
+        coarse_result = self.coarse_model(
+            x,
+            embedding,
+            disabled_fusion_scales=disabled_fusion_scales,
+            return_features=return_diagnostics,
+        )
+        if return_diagnostics:
+            coarse, global_features = coarse_result
+        else:
+            coarse = coarse_result
+            global_features = {}
+        selected = x[:, list(self.refinement_channel_indices), :, :]
+        detail = self.refinement_model(torch.cat([selected, coarse], dim=1), embedding)
+        centered = coarse + detail
+        centered = centered - centered.mean(dim=(-2, -1), keepdim=True)
+        pooled = x.mean(dim=(-2, -1))
+        mean_rise = self.mean_head(torch.cat([embedding, pooled], dim=1)).squeeze(1)
+        output = {
+            "mean_rise": mean_rise,
+            "centered_field": centered.squeeze(1),
+            "coarse_centered_field": (coarse - coarse.mean(dim=(-2, -1), keepdim=True)).squeeze(1),
+            "detail_field": detail.squeeze(1),
+        }
+        if alpha is not None:
+            output["physics_gate_alpha"] = alpha.view(-1)
+        if return_diagnostics:
+            disabled = {str(scale) for scale in disabled_fusion_scales}
+            output["global_fusion_enabled_16"] = centered.new_full((centered.shape[0],), 0.0 if "all" in disabled or "16" in disabled else 1.0)
+            output["global_fusion_enabled_32"] = centered.new_full((centered.shape[0],), 0.0 if "all" in disabled or "32" in disabled else 1.0)
+            output["global_fusion_enabled_64"] = centered.new_full((centered.shape[0],), 0.0 if "all" in disabled or "64" in disabled else 1.0)
+            for scale, feature in global_features.items():
+                if scale in {"16", "32", "64"}:
+                    output[f"global_feature_{scale}_abs_mean"] = feature.abs().mean(dim=(1, 2, 3))
+            if ambient is not None:
+                output["final_temperature"] = ambient[:, None, None] + mean_rise[:, None, None] + output["centered_field"]
+        return output
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        metadata: torch.Tensor | None = None,
+        *,
+        return_diagnostics: bool = False,
+        disabled_fusion_scales: tuple[str, ...] | list[str] = (),
+        ambient: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        return self.forward_components(
+            x,
+            metadata,
+            return_diagnostics=return_diagnostics,
+            disabled_fusion_scales=disabled_fusion_scales,
+            ambient=ambient,
+        )
+
+    def forward_profile(
+        self,
+        x: torch.Tensor,
+        metadata: torch.Tensor,
+        graph: dict[str, torch.Tensor] | None = None,
+        *,
+        synchronize: object | None = None,
+        graph_correction_scale: float = 1.0,
+        disabled_fusion_scales: tuple[str, ...] | list[str] = (),
+    ) -> tuple[dict[str, torch.Tensor], dict[str, float]]:
+        del graph, graph_correction_scale
+        timings: dict[str, float] = {}
+
+        def tic() -> float:
+            if synchronize is not None:
+                synchronize()
+            return time.perf_counter()
+
+        def toc(name: str, start: float) -> None:
+            if synchronize is not None:
+                synchronize()
+            timings[name] = timings.get(name, 0.0) + time.perf_counter() - start
+
+        start = tic()
+        outputs = self.forward_components(
+            x,
+            metadata,
+            return_diagnostics=True,
+            disabled_fusion_scales=disabled_fusion_scales,
+        )
+        toc("feature_fusion_cnn_branch_s", start)
+        return outputs, timings
+
+    def config(self) -> dict[str, object]:
+        coarse_config = self.coarse_model.config()
+        return {
+            "architecture": self.architecture,
+            "input_channels": self.input_channels,
+            "output_channels": self.output_channels,
+            "base_channels": self.base_channels,
+            "depth": self.depth,
+            "refine_channels": self.refine_channels,
+            "refine_blocks": self.refine_blocks,
+            "refinement_channel_indices": list(self.refinement_channel_indices),
+            "refinement_channel_names": list(self.refinement_channel_names),
+            "metadata_dim": self.metadata_dim,
+            "metadata_hidden_dim": self.metadata_hidden_dim,
+            "metadata_embedding_dim": self.metadata_embedding_dim,
+            "conditioned": True,
+            "physics_input_mode": self.physics_input_mode,
+            "feature_fusion_enabled": True,
+            "metadata_parameters": count_parameters(self.metadata_encoder),
+            "coarse_parameters": count_parameters(self.coarse_model),
+            "refinement_parameters": count_parameters(self.refinement_model),
+            "feature_fusion_parameter_count": count_parameters(self.coarse_model.global_encoder)
+            + count_parameters(self.coarse_model.fuse16)
+            + count_parameters(self.coarse_model.fuse32)
+            + count_parameters(self.coarse_model.fuse64),
+            "total_parameters": count_parameters(self),
+            **coarse_config,
+        }
+
+
 class DecomposedMiniUNetWithGraph(nn.Module):
     """Conditioned decomposed CNN with a parallel chiplet interaction GNN."""
 
@@ -903,7 +1328,30 @@ class DecomposedMiniUNetWithGraph(nn.Module):
         self.graph_rasterizer_mode = str(graph_rasterizer_mode)
         self.freeze_cnn = bool(freeze_cnn)
         self.global_branch_enabled = self.architecture == "miniunet_refine_conditioned_decomposed_global_graph"
-        if self.global_branch_enabled:
+        self.feature_fusion_enabled = self.architecture == "miniunet_refine_conditioned_decomposed_feature_fusion_graph"
+        if self.feature_fusion_enabled:
+            self.cnn_model = DecomposedMiniUNetWithFeatureFusion(
+                input_channels=input_channels,
+                output_channels=output_channels,
+                base_channels=base_channels,
+                depth=depth,
+                refine_channels=refine_channels,
+                refine_blocks=refine_blocks,
+                refinement_channel_indices=refinement_channel_indices,
+                refinement_channel_names=refinement_channel_names,
+                metadata_dim=metadata_dim,
+                metadata_hidden_dim=metadata_hidden_dim,
+                metadata_embedding_dim=metadata_embedding_dim,
+                physics_input_mode=physics_input_mode,
+                physics_gate_hidden_dim=physics_gate_hidden_dim,
+                physics_gate_init=physics_gate_init,
+                global_branch_channel_indices=global_branch_channel_indices,
+                global_branch_channel_names=global_branch_channel_names,
+                global_hidden_channels=global_hidden_channels,
+                global_pool_size=global_pool_size,
+                global_context_blocks=global_blocks,
+            )
+        elif self.global_branch_enabled:
             self.cnn_model = DecomposedMiniUNetWithGlobalBranch(
                 input_channels=input_channels,
                 output_channels=output_channels,
@@ -980,11 +1428,19 @@ class DecomposedMiniUNetWithGraph(nn.Module):
         return_diagnostics: bool = False,
         graph_correction_scale: float = 1.0,
         global_correction_scale: float = 1.0,
+        disabled_fusion_scales: tuple[str, ...] | list[str] = (),
         ambient: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         if graph is None:
             raise ValueError("graph architecture requires graph batch")
-        if self.global_branch_enabled:
+        if self.feature_fusion_enabled:
+            cnn_outputs = self.cnn_model(
+                x,
+                metadata,
+                return_diagnostics=return_diagnostics,
+                disabled_fusion_scales=disabled_fusion_scales,
+            )
+        elif self.global_branch_enabled:
             cnn_outputs = self.cnn_model(x, metadata, global_correction_scale=global_correction_scale)
         else:
             cnn_outputs = self.cnn_model(x, metadata)
@@ -1034,6 +1490,7 @@ class DecomposedMiniUNetWithGraph(nn.Module):
         return_diagnostics: bool = False,
         graph_correction_scale: float = 1.0,
         global_correction_scale: float = 1.0,
+        disabled_fusion_scales: tuple[str, ...] | list[str] = (),
         ambient: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         return self.forward_components(
@@ -1043,6 +1500,7 @@ class DecomposedMiniUNetWithGraph(nn.Module):
             return_diagnostics=return_diagnostics,
             graph_correction_scale=graph_correction_scale,
             global_correction_scale=global_correction_scale,
+            disabled_fusion_scales=disabled_fusion_scales,
             ambient=ambient,
         )
 
@@ -1055,6 +1513,7 @@ class DecomposedMiniUNetWithGraph(nn.Module):
         synchronize: object | None = None,
         graph_correction_scale: float = 1.0,
         global_correction_scale: float = 1.0,
+        disabled_fusion_scales: tuple[str, ...] | list[str] = (),
     ) -> tuple[dict[str, torch.Tensor], dict[str, float]]:
         timings: dict[str, float] = {}
 
@@ -1069,7 +1528,14 @@ class DecomposedMiniUNetWithGraph(nn.Module):
             timings[name] = timings.get(name, 0.0) + time.perf_counter() - start
 
         start = tic()
-        if self.global_branch_enabled:
+        if self.feature_fusion_enabled:
+            cnn_outputs = self.cnn_model(
+                x,
+                metadata,
+                return_diagnostics=True,
+                disabled_fusion_scales=disabled_fusion_scales,
+            )
+        elif self.global_branch_enabled:
             cnn_outputs = self.cnn_model(x, metadata, global_correction_scale=global_correction_scale)
         else:
             cnn_outputs = self.cnn_model(x, metadata)
@@ -1125,6 +1591,7 @@ class DecomposedMiniUNetWithGraph(nn.Module):
             "physics_input_mode": self.physics_input_mode,
             "graph_enabled": True,
             "global_branch_enabled": self.global_branch_enabled,
+            "feature_fusion_enabled": self.feature_fusion_enabled,
             "graph_node_feature_dim": self.graph_node_feature_dim,
             "graph_edge_feature_dim": self.graph_edge_feature_dim,
             "graph_hidden_dim": self.graph_hidden_dim,
@@ -1146,6 +1613,8 @@ class DecomposedMiniUNetWithGraph(nn.Module):
         }
         if self.global_branch_enabled and hasattr(self.cnn_model, "global_branch"):
             payload.update(self.cnn_model.global_branch.config())
+        if self.feature_fusion_enabled and hasattr(self.cnn_model, "coarse_model"):
+            payload.update(self.cnn_model.coarse_model.config())
         return payload
 
 
@@ -1699,9 +2168,32 @@ def build_model(config: dict[str, object]) -> nn.Module:
             global_blocks=int(config.get("global_blocks", config.get("global_branch_blocks", 3))),
             global_pool_size=int(config.get("global_pool_size", config.get("global_branch_pool_size", 8))),
         )
+    if architecture == "miniunet_refine_conditioned_decomposed_feature_fusion":
+        return DecomposedMiniUNetWithFeatureFusion(
+            input_channels=int(config.get("input_channels", 34)),
+            output_channels=int(config.get("output_channels", 1)),
+            base_channels=int(config.get("base_channels", 32)),
+            depth=int(config.get("depth", 3)),
+            refine_channels=int(config.get("refine_channels", 32)),
+            refine_blocks=int(config.get("refine_blocks", 4)),
+            refinement_channel_indices=tuple(int(index) for index in config.get("refinement_channel_indices", ())),
+            refinement_channel_names=tuple(str(name) for name in config.get("refinement_channel_names", ())),
+            metadata_dim=int(config.get("metadata_dim", 0)),
+            metadata_hidden_dim=int(config.get("metadata_hidden_dim", 64)),
+            metadata_embedding_dim=int(config.get("metadata_embedding_dim", 64)),
+            physics_input_mode=str(config.get("physics_input_mode", "source_superposition_v1")),
+            physics_gate_hidden_dim=int(config.get("physics_gate_hidden_dim", 32)),
+            physics_gate_init=float(config.get("physics_gate_init", 0.9)),
+            global_branch_channel_indices=tuple(int(index) for index in config.get("global_branch_channel_indices", ())),
+            global_branch_channel_names=tuple(str(name) for name in config.get("global_branch_channel_names", ())),
+            global_hidden_channels=int(config.get("global_hidden_channels", config.get("global_branch_hidden_channels", 32))),
+            global_pool_size=int(config.get("global_pool_size", config.get("global_branch_pool_size", 8))),
+            global_context_blocks=int(config.get("global_blocks", config.get("global_branch_context_blocks", 3))),
+        )
     if architecture in {
         "miniunet_refine_conditioned_decomposed_graph",
         "miniunet_refine_conditioned_decomposed_global_graph",
+        "miniunet_refine_conditioned_decomposed_feature_fusion_graph",
     }:
         return DecomposedMiniUNetWithGraph(
             input_channels=int(config.get("input_channels", 34)),

@@ -73,8 +73,10 @@ def main() -> int:
             "miniunet_refine_decomposed",
             "miniunet_refine_conditioned_decomposed",
             "miniunet_refine_conditioned_decomposed_global",
+            "miniunet_refine_conditioned_decomposed_feature_fusion",
             "miniunet_refine_conditioned_decomposed_graph",
             "miniunet_refine_conditioned_decomposed_global_graph",
+            "miniunet_refine_conditioned_decomposed_feature_fusion_graph",
             "miniunet_refine_conditioned_decomposed_pairwise",
             "miniunet_refine_conditioned_decomposed_pairwise_basis",
         ],
@@ -177,9 +179,14 @@ def main() -> int:
         "miniunet_refine_conditioned_decomposed_global",
         "miniunet_refine_conditioned_decomposed_global_graph",
     }
+    is_feature_fusion_arch = args.model_architecture in {
+        "miniunet_refine_conditioned_decomposed_feature_fusion",
+        "miniunet_refine_conditioned_decomposed_feature_fusion_graph",
+    }
     is_generic_graph_arch = args.model_architecture in {
         "miniunet_refine_conditioned_decomposed_graph",
         "miniunet_refine_conditioned_decomposed_global_graph",
+        "miniunet_refine_conditioned_decomposed_feature_fusion_graph",
     }
     is_pairwise_arch = args.model_architecture == "miniunet_refine_conditioned_decomposed_pairwise"
     is_pairwise_basis_arch = args.model_architecture == "miniunet_refine_conditioned_decomposed_pairwise_basis"
@@ -188,8 +195,10 @@ def main() -> int:
         "miniunet_refine_conditioned",
         "miniunet_refine_conditioned_decomposed",
         "miniunet_refine_conditioned_decomposed_global",
+        "miniunet_refine_conditioned_decomposed_feature_fusion",
         "miniunet_refine_conditioned_decomposed_graph",
         "miniunet_refine_conditioned_decomposed_global_graph",
+        "miniunet_refine_conditioned_decomposed_feature_fusion_graph",
         "miniunet_refine_conditioned_decomposed_pairwise",
         "miniunet_refine_conditioned_decomposed_pairwise_basis",
     }
@@ -197,8 +206,10 @@ def main() -> int:
         "miniunet_refine_decomposed",
         "miniunet_refine_conditioned_decomposed",
         "miniunet_refine_conditioned_decomposed_global",
+        "miniunet_refine_conditioned_decomposed_feature_fusion",
         "miniunet_refine_conditioned_decomposed_graph",
         "miniunet_refine_conditioned_decomposed_global_graph",
+        "miniunet_refine_conditioned_decomposed_feature_fusion_graph",
         "miniunet_refine_conditioned_decomposed_pairwise",
         "miniunet_refine_conditioned_decomposed_pairwise_basis",
     }
@@ -240,7 +251,7 @@ def main() -> int:
         dataset_input_channels,
         stats,
         physics_input_mode=args.physics_input,
-        enabled=is_global_arch,
+        enabled=is_global_arch or is_feature_fusion_arch,
         requested=args.global_branch_channels,
     )
     model_config: dict[str, Any] = {
@@ -318,10 +329,11 @@ def main() -> int:
                 "source_power_feature_index": 6,
             }
         )
-    if is_global_arch:
+    if is_global_arch or is_feature_fusion_arch:
         model_config.update(
             {
-                "global_branch_enabled": True,
+                "global_branch_enabled": is_global_arch,
+                "feature_fusion_enabled": is_feature_fusion_arch,
                 "global_branch_channel_indices": list(global_channel_indices),
                 "global_branch_channel_names": list(global_channel_names),
                 "global_hidden_channels": args.global_hidden_channels,
@@ -389,6 +401,7 @@ def main() -> int:
         "metadata_conditioning": is_conditioned_arch,
         "graph_enabled": is_graph_arch,
         "global_branch_enabled": is_global_arch,
+        "feature_fusion_enabled": is_feature_fusion_arch,
         "pairwise_enabled": is_pairwise_arch,
         "pairwise_basis_enabled": is_pairwise_basis_arch,
         "model": model_config,
@@ -414,10 +427,11 @@ def main() -> int:
             "graph_edge_feature_names": list(getattr(train_dataset, "graph_edge_feature_names", ()) or []),
         }
     )
-    if is_global_arch:
+    if is_global_arch or is_feature_fusion_arch:
         config["model"].update(
             {
-                "global_branch_enabled": True,
+                "global_branch_enabled": is_global_arch,
+                "feature_fusion_enabled": is_feature_fusion_arch,
                 "global_branch_channel_indices": list(global_channel_indices),
                 "global_branch_channel_names": list(global_channel_names),
                 "global_hidden_channels": args.global_hidden_channels,
@@ -439,9 +453,9 @@ def main() -> int:
     if args.model_architecture == "miniunet_refine":
         print(f"Refinement channels: {list(refinement_channel_indices)}")
         print(f"Refinement channel names: {', '.join(refinement_channel_names)}")
-    if is_global_arch:
-        print(f"Global branch channels: {list(global_channel_indices)}")
-        print(f"Global branch channel names: {', '.join(global_channel_names)}")
+    if is_global_arch or is_feature_fusion_arch:
+        print(f"Global physical channels: {list(global_channel_indices)}")
+        print(f"Global physical channel names: {', '.join(global_channel_names)}")
     if init_summary:
         print(f"Initialized from {args.init_checkpoint}: {init_summary}")
     print(f"Trainable parameters: {count_parameters(model)}")

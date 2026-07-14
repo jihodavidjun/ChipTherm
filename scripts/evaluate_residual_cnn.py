@@ -53,12 +53,17 @@ def main() -> int:
     parser.add_argument("--graph-correction-scale", default=1.0, type=float)
     parser.add_argument("--disable-global-correction", action="store_true")
     parser.add_argument("--global-correction-scale", default=1.0, type=float)
+    parser.add_argument("--disable-global-fusion", action="store_true")
+    parser.add_argument("--disable-global-fusion-16", action="store_true")
+    parser.add_argument("--disable-global-fusion-32", action="store_true")
+    parser.add_argument("--disable-global-fusion-64", action="store_true")
     parser.add_argument("--graph-rasterizer-mode", default=None, choices=["vectorized", "legacy"])
     args = parser.parse_args()
     if args.disable_graph_correction:
         args.graph_correction_scale = 0.0
     if args.disable_global_correction:
         args.global_correction_scale = 0.0
+    disabled_fusion_scales = global_fusion_disabled_scales(args)
 
     device = select_device(args.device)
     out_dir = args.out_dir.resolve()
@@ -75,6 +80,7 @@ def main() -> int:
     graph_enabled = architecture in {
         "miniunet_refine_conditioned_decomposed_graph",
         "miniunet_refine_conditioned_decomposed_global_graph",
+        "miniunet_refine_conditioned_decomposed_feature_fusion_graph",
         "miniunet_refine_conditioned_decomposed_pairwise",
         "miniunet_refine_conditioned_decomposed_pairwise_basis",
     }
@@ -82,8 +88,10 @@ def main() -> int:
         "miniunet_refine_decomposed",
         "miniunet_refine_conditioned_decomposed",
         "miniunet_refine_conditioned_decomposed_global",
+        "miniunet_refine_conditioned_decomposed_feature_fusion",
         "miniunet_refine_conditioned_decomposed_graph",
         "miniunet_refine_conditioned_decomposed_global_graph",
+        "miniunet_refine_conditioned_decomposed_feature_fusion_graph",
         "miniunet_refine_conditioned_decomposed_pairwise",
         "miniunet_refine_conditioned_decomposed_pairwise_basis",
     }
@@ -91,8 +99,10 @@ def main() -> int:
         "miniunet_refine_conditioned",
         "miniunet_refine_conditioned_decomposed",
         "miniunet_refine_conditioned_decomposed_global",
+        "miniunet_refine_conditioned_decomposed_feature_fusion",
         "miniunet_refine_conditioned_decomposed_graph",
         "miniunet_refine_conditioned_decomposed_global_graph",
+        "miniunet_refine_conditioned_decomposed_feature_fusion_graph",
         "miniunet_refine_conditioned_decomposed_pairwise",
         "miniunet_refine_conditioned_decomposed_pairwise_basis",
     }
@@ -140,6 +150,7 @@ def main() -> int:
         graph_stats=graph_stats,
         graph_correction_scale=args.graph_correction_scale,
         global_correction_scale=args.global_correction_scale,
+        disabled_fusion_scales=disabled_fusion_scales,
     )
     cnn_runtime_per_sample = runtime_s / max(metrics["num_samples"], 1)
     gate_runtime_per_sample = gate_runtime_s / max(metrics["num_samples"], 1) if gate_runtime_s > 0.0 else None
@@ -239,6 +250,8 @@ def main() -> int:
         "global_correction_rms": metrics.get("global_correction_rms"),
         "global_correction_spatial_std": metrics.get("global_correction_spatial_std"),
         "global_correction_low_frequency_energy": metrics.get("global_correction_low_frequency_energy"),
+        "global_fusion_enabled": metrics.get("global_fusion_enabled"),
+        "global_feature_abs_mean": metrics.get("global_feature_abs_mean"),
         "pairwise_k": metrics.get("pairwise_k"),
         "pairwise_contribution": metrics.get("pairwise_contribution"),
         "pairwise_self": metrics.get("pairwise_self"),
@@ -262,6 +275,7 @@ def main() -> int:
             graph_stats=graph_stats,
             graph_correction_scale=args.graph_correction_scale,
             global_correction_scale=args.global_correction_scale,
+            disabled_fusion_scales=disabled_fusion_scales,
         )
         payload["component_runtime"] = component_profile
         (out_dir / "component_runtime.json").write_text(json.dumps(component_profile, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -314,6 +328,10 @@ def main() -> int:
             f"{global_summary['mean']:.3f} / {global_summary['std']:.3f} / "
             f"{global_summary['min']:.3f} / {global_summary['max']:.3f} K"
         )
+    if metrics.get("global_fusion_enabled"):
+        fusion = metrics["global_fusion_enabled"]
+        status = ", ".join(f"{scale}:{summary['mean']:.0f}" for scale, summary in sorted(fusion.items()))
+        print(f"Global feature fusion enabled by scale: {status}")
     if metrics.get("chiplet_mean_temperature"):
         chip_mean = metrics["chiplet_mean_temperature"]
         chip_peak = metrics.get("chiplet_peak_temperature", {})
@@ -346,6 +364,19 @@ def main() -> int:
     return 0
 
 
+def global_fusion_disabled_scales(args: argparse.Namespace) -> tuple[str, ...]:
+    if args.disable_global_fusion:
+        return ("all",)
+    disabled: list[str] = []
+    if args.disable_global_fusion_16:
+        disabled.append("16")
+    if args.disable_global_fusion_32:
+        disabled.append("32")
+    if args.disable_global_fusion_64:
+        disabled.append("64")
+    return tuple(disabled)
+
+
 @torch.no_grad()
 def evaluate(
     model: nn.Module,
@@ -363,6 +394,7 @@ def evaluate(
     graph_stats: Any | None = None,
     graph_correction_scale: float = 1.0,
     global_correction_scale: float = 1.0,
+    disabled_fusion_scales: tuple[str, ...] = (),
 ) -> tuple[dict[str, Any], dict[str, dict[str, dict[str, float]]], float, float | None, float | None, float]:
     residual_acc = MetricAccumulator()
     final_acc = MetricAccumulator()
@@ -384,6 +416,8 @@ def evaluate(
     global_correction_rms_acc = ScalarSummaryAccumulator()
     global_correction_std_acc = ScalarSummaryAccumulator()
     global_correction_low_freq_acc = ScalarSummaryAccumulator()
+    global_fusion_enabled_acc = {scale: ScalarSummaryAccumulator() for scale in ("16", "32", "64")}
+    global_feature_abs_acc = {scale: ScalarSummaryAccumulator() for scale in ("16", "32", "64")}
     cnn_centered_abs_acc = ScalarSummaryAccumulator()
     final_centered_abs_acc = ScalarSummaryAccumulator()
     chiplet_mean_acc = ScalarMetricAccumulator()
@@ -456,6 +490,7 @@ def evaluate(
                 graph_enabled=graph_enabled,
                 graph_correction_scale=graph_correction_scale,
                 global_correction_scale=global_correction_scale,
+                disabled_fusion_scales=disabled_fusion_scales,
             )
             pred_temperature = reconstruct_decomposed_temperature(outputs, ambient)
             pred_residual = pred_temperature - physics
@@ -491,6 +526,13 @@ def evaluate(
                 global_correction_std_acc.update(global_correction.std(dim=(-2, -1)))
                 if "global_correction_low_frequency_energy" in outputs:
                     global_correction_low_freq_acc.update(outputs["global_correction_low_frequency_energy"])
+            for scale in ("16", "32", "64"):
+                enabled_value = outputs.get(f"global_fusion_enabled_{scale}")
+                if enabled_value is not None:
+                    global_fusion_enabled_acc[scale].update(enabled_value)
+                feature_value = outputs.get(f"global_feature_{scale}_abs_mean")
+                if feature_value is not None:
+                    global_feature_abs_acc[scale].update(feature_value)
             update_pairwise_summaries(
                 outputs,
                 pairwise_k_acc,
@@ -648,6 +690,18 @@ def evaluate(
         low_freq_summary = global_correction_low_freq_acc.compute()
         if low_freq_summary:
             metrics["global_correction_low_frequency_energy"] = low_freq_summary
+    fusion_summary = {
+        scale: global_fusion_enabled_acc[scale].compute()
+        for scale in ("16", "32", "64")
+        if global_fusion_enabled_acc[scale].compute()
+    }
+    if fusion_summary:
+        metrics["global_fusion_enabled"] = fusion_summary
+        metrics["global_feature_abs_mean"] = {
+            scale: global_feature_abs_acc[scale].compute()
+            for scale in ("16", "32", "64")
+            if global_feature_abs_acc[scale].compute()
+        }
     pairwise_summary = pairwise_k_acc.compute()
     if pairwise_summary:
         metrics["pairwise_k"] = pairwise_summary
@@ -696,6 +750,7 @@ def profile_components(
     graph_stats: Any | None,
     graph_correction_scale: float,
     global_correction_scale: float = 1.0,
+    disabled_fusion_scales: tuple[str, ...] = (),
     warmup_batches: int = 2,
     profile_batches: int = 20,
 ) -> dict[str, Any]:
@@ -745,14 +800,15 @@ def profile_components(
 
         sync()
         forward_start = time.perf_counter()
-        _outputs, component_times = model.forward_profile(
-            model_input,
-            metadata_input,
-            graph_batch,
-            synchronize=sync,
-            graph_correction_scale=graph_correction_scale,
-            global_correction_scale=global_correction_scale,
-        )
+        profile_kwargs: dict[str, Any] = {
+            "synchronize": sync,
+            "graph_correction_scale": graph_correction_scale,
+        }
+        if getattr(model, "global_branch_enabled", False):
+            profile_kwargs["global_correction_scale"] = global_correction_scale
+        if getattr(model, "feature_fusion_enabled", False):
+            profile_kwargs["disabled_fusion_scales"] = disabled_fusion_scales
+        _outputs, component_times = model.forward_profile(model_input, metadata_input, graph_batch, **profile_kwargs)
         sync()
         total_time = time.perf_counter() - forward_start
         if batch_index >= warmup_batches:
@@ -828,17 +884,26 @@ def call_model(
     graph_enabled: bool,
     graph_correction_scale: float = 1.0,
     global_correction_scale: float = 1.0,
+    disabled_fusion_scales: tuple[str, ...] = (),
 ) -> Any:
     if graph_enabled:
-        return model(
-            model_input,
-            metadata_input,
-            graph_batch,
-            return_diagnostics=True,
-            graph_correction_scale=graph_correction_scale,
-            global_correction_scale=global_correction_scale,
-        )
+        kwargs = {
+            "return_diagnostics": True,
+            "graph_correction_scale": graph_correction_scale,
+        }
+        if getattr(model, "global_branch_enabled", False):
+            kwargs["global_correction_scale"] = global_correction_scale
+        if getattr(model, "feature_fusion_enabled", False):
+            kwargs["disabled_fusion_scales"] = disabled_fusion_scales
+        return model(model_input, metadata_input, graph_batch, **kwargs)
     if conditioned:
+        if getattr(model, "architecture", "") == "miniunet_refine_conditioned_decomposed_feature_fusion":
+            return model(
+                model_input,
+                metadata_input,
+                return_diagnostics=True,
+                disabled_fusion_scales=disabled_fusion_scales,
+            )
         if hasattr(model, "global_branch"):
             return model(
                 model_input,
