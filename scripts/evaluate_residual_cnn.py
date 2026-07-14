@@ -73,12 +73,12 @@ def main() -> int:
     }
     graph_stats = checkpoint["model_config"].get("graph_normalization")
     physics_input_mode = str(checkpoint["model_config"].get("physics_input_mode", "v1"))
-    if physics_input_mode not in {"v1", "none", "gated_v1"}:
+    if physics_input_mode not in {"v1", "none", "gated_v1", "source_superposition_v1"}:
         raise SystemExit(f"unsupported checkpoint physics_input_mode: {physics_input_mode}")
 
     dataset = ChipThermDataset(args.index, target="residual", return_metadata=True, return_graph=graph_enabled)
     dataset_input_channels = int(dataset[0]["x"].shape[0])
-    actual_input_channels = dataset_input_channels + (1 if physics_input_mode in {"v1", "gated_v1"} else 0)
+    actual_input_channels = dataset_input_channels + (1 if physics_input_mode in {"v1", "gated_v1", "source_superposition_v1"} else 0)
     expected_input_channels = int(checkpoint["model_config"].get("input_channels", actual_input_channels))
     if actual_input_channels != expected_input_channels:
         raise SystemExit(
@@ -130,6 +130,17 @@ def main() -> int:
             timing_note += (
                 " End-to-end timing equals CNN-side timing because checkpoint physics_input_mode=none; "
                 "physics_v1 is loaded only for reference metrics."
+            )
+        elif physics_input_mode == "source_superposition_v1":
+            end_to_end_runtime_per_sample = cnn_runtime_per_sample
+            end_to_end_speedup = (
+                hotspot_runtime_s / end_to_end_runtime_per_sample
+                if hotspot_runtime_s and end_to_end_runtime_per_sample
+                else None
+            )
+            timing_note += (
+                " End-to-end timing here is cached-source-base runtime only; "
+                "uncached source-response package inference must be added separately."
             )
         elif physics_runtime_s is None:
             timing_note += " End-to-end timing requested, but physics_runtime_s metadata was unavailable."

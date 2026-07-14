@@ -75,8 +75,8 @@ def main() -> int:
     parser.add_argument(
         "--physics-input",
         default="v1",
-        choices=["v1", "none", "gated_v1"],
-        help="Spatial physics input mode. 'v1' appends normalized physics_v1; 'none' uses normalized X only; 'gated_v1' metadata-gates normalized physics_v1.",
+        choices=["v1", "none", "gated_v1", "source_superposition_v1"],
+        help="Spatial base input mode. 'v1' appends normalized physics_v1; 'source_superposition_v1' appends normalized source-superposition base from prediction_path; 'none' uses normalized X only; 'gated_v1' metadata-gates normalized physics_v1.",
     )
     parser.add_argument("--physics-gate-hidden-dim", default=32, type=int)
     parser.add_argument("--physics-gate-init", default=0.9, type=float)
@@ -178,7 +178,7 @@ def main() -> int:
     train_dataset = ChipThermDataset(args.train_index, target="residual", return_metadata=True, return_graph=is_graph_arch)
     val_dataset = ChipThermDataset(args.val_index, target="residual", return_metadata=True, return_graph=is_graph_arch)
     dataset_input_channels = int(train_dataset[0]["x"].shape[0])
-    model_input_channels = dataset_input_channels + (1 if args.physics_input in {"v1", "gated_v1"} else 0)
+    model_input_channels = dataset_input_channels + (1 if args.physics_input in {"v1", "gated_v1", "source_superposition_v1"} else 0)
     train_loader = make_loader(train_dataset, args.batch_size, shuffle=True, num_workers=args.num_workers, device=device, graph_enabled=is_graph_arch)
     train_eval_loader = make_loader(train_dataset, args.batch_size, shuffle=False, num_workers=args.num_workers, device=device, graph_enabled=is_graph_arch)
     val_loader = make_loader(val_dataset, args.batch_size, shuffle=False, num_workers=args.num_workers, device=device, graph_enabled=is_graph_arch)

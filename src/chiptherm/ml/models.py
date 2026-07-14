@@ -471,7 +471,7 @@ class DecomposedMiniUNetWithRefinement(nn.Module):
         self.metadata_hidden_dim = metadata_hidden_dim
         self.metadata_embedding_dim = metadata_embedding_dim
         self.physics_input_mode = str(physics_input_mode)
-        if self.physics_input_mode not in {"v1", "none", "gated_v1"}:
+        if self.physics_input_mode not in {"v1", "none", "gated_v1", "source_superposition_v1"}:
             raise ValueError(f"unsupported physics_input_mode: {self.physics_input_mode}")
         if self.physics_input_mode == "gated_v1" and not self.conditioned:
             raise ValueError("gated_v1 requires a metadata-conditioned decomposed model")

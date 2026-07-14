@@ -142,7 +142,7 @@ def main() -> int:
 def architecture_info(model_config: dict[str, Any]) -> dict[str, Any]:
     architecture = str(model_config.get("architecture", "miniunet"))
     physics_input_mode = str(model_config.get("physics_input_mode", "v1"))
-    if physics_input_mode not in {"v1", "none", "gated_v1"}:
+    if physics_input_mode not in {"v1", "none", "gated_v1", "source_superposition_v1"}:
         raise ValueError(f"unsupported physics_input_mode: {physics_input_mode}")
     return {
         "architecture": architecture,
