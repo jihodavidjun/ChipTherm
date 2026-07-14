@@ -140,6 +140,65 @@ class SourceResponseDataset(Dataset):
         return resolve_path(path_value, self.index_csv.parent)
 
 
+class SourceResponsePackageDataset(Dataset):
+    """Package-grouped view where each item contains all source rows for one sample."""
+
+    def __init__(
+        self,
+        index_csv: str | Path,
+        *,
+        power_floor_W: float = 1.0e-6,
+        require_complete: bool = True,
+    ) -> None:
+        self.source_dataset = SourceResponseDataset(index_csv, power_floor_W=power_floor_W, return_metadata=True)
+        groups: dict[str, list[int]] = {}
+        for index, row in enumerate(self.source_dataset.rows):
+            groups.setdefault(row["original_sample_uid"], []).append(index)
+        self.package_uids: list[str] = []
+        self.group_indices: list[list[int]] = []
+        for uid, indices in sorted(groups.items()):
+            ordered = sorted(indices, key=lambda item: int(float(self.source_dataset.rows[item]["source_index"])))
+            first = self.source_dataset.rows[ordered[0]]
+            expected = int(float(first["num_chiplets"]))
+            if require_complete and len(ordered) != expected:
+                raise ValueError(
+                    f"package {uid} has {len(ordered)} source rows but expected {expected}; "
+                    "package-level loss requires complete source groups"
+                )
+            self.package_uids.append(uid)
+            self.group_indices.append(ordered)
+
+    @property
+    def channel_names(self) -> tuple[str, ...]:
+        return self.source_dataset.channel_names
+
+    @property
+    def rows(self) -> list[dict[str, str]]:
+        return self.source_dataset.rows
+
+    @property
+    def power_floor_W(self) -> float:
+        return self.source_dataset.power_floor_W
+
+    def __len__(self) -> int:
+        return len(self.group_indices)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        source_indices = self.group_indices[int(index)]
+        sources = [self.source_dataset[source_index] for source_index in source_indices]
+        first_meta = sources[0]["metadata"]
+        source_powers = torch.stack([source["source_power_W"] for source in sources])
+        return {
+            "original_sample_uid": str(first_meta["original_sample_uid"]),
+            "case_id": str(first_meta["case_id"]),
+            "sources": sources,
+            "num_sources": len(sources),
+            "total_power_W": torch.sum(source_powers),
+            "ambient_K": sources[0]["ambient_K"],
+            "full_temperature": sources[0]["full_temperature"],
+        }
+
+
 def read_rows(path: Path) -> list[dict[str, str]]:
     with path.open("r", newline="", encoding="utf-8") as fp:
         return list(csv.DictReader(fp))
@@ -235,6 +294,36 @@ def source_response_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
     for key in tensor_keys:
         result[key] = torch.stack([item[key] for item in batch])
     result["metadata"] = [item.get("metadata", {}) for item in batch]
+    return result
+
+
+def source_response_package_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
+    flat_sources: list[dict[str, Any]] = []
+    source_to_package: list[int] = []
+    package_uids: list[str] = []
+    case_ids: list[str] = []
+    source_counts: list[int] = []
+    total_powers: list[torch.Tensor] = []
+    ambients: list[torch.Tensor] = []
+    full_temperatures: list[torch.Tensor] = []
+    for package_index, package in enumerate(batch):
+        package_uids.append(package["original_sample_uid"])
+        case_ids.append(package["case_id"])
+        source_counts.append(int(package["num_sources"]))
+        total_powers.append(package["total_power_W"])
+        ambients.append(package["ambient_K"])
+        full_temperatures.append(package["full_temperature"])
+        for source in package["sources"]:
+            flat_sources.append(source)
+            source_to_package.append(package_index)
+    result = source_response_collate(flat_sources)
+    result["source_to_package_index"] = torch.tensor(source_to_package, dtype=torch.long)
+    result["package_ambient_K"] = torch.stack(ambients)
+    result["package_full_temperature"] = torch.stack(full_temperatures)
+    result["package_total_power_W"] = torch.stack(total_powers)
+    result["package_source_count"] = torch.tensor(source_counts, dtype=torch.long)
+    result["package_original_sample_uid"] = package_uids
+    result["package_case_id"] = case_ids
     return result
 
 

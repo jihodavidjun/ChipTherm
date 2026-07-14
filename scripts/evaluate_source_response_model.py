@@ -77,6 +77,7 @@ def main() -> int:
         "source_level": results["source_level"],
         "package_reconstruction": results["package_reconstruction"],
         "oracle_reconstruction": results["oracle_reconstruction"],
+        "package_bias_summary": results["package_bias_summary"],
         "prediction_stats": results["prediction_stats"],
         "evaluation_options": {"clamp_unit_response_min": args.clamp_unit_response_min},
         "runtime": results["runtime"],
@@ -84,6 +85,11 @@ def main() -> int:
     (out_dir / "metrics.json").write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     write_csv(out_dir / "source_metrics.csv", results["source_records"])
     write_csv(out_dir / "metrics_by_case.csv", results["case_records"])
+    write_csv(out_dir / "package_bias_diagnostics.csv", results["package_bias_records"])
+    (out_dir / "package_bias_summary.json").write_text(
+        json.dumps(results["package_bias_summary"], indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
     print("Source-response evaluation complete")
     print(f"Sources: {results['source_level']['num_sources']}")
     print(f"Packages: {results['package_reconstruction']['num_packages']}")
@@ -135,8 +141,9 @@ def evaluate(
         pred_rise = predict_source_rise(pred_unit, power)
         target_unit = batch["target_unit"].to(device)
         target_rise = batch["target_rise"].to(device)
+        source_error = pred_rise - target_rise
         unit_error = (pred_unit - target_unit).detach().cpu().numpy()
-        physical_error = (pred_rise - target_rise).detach().cpu().numpy()
+        physical_error = source_error.detach().cpu().numpy()
         source_unit_errors.append(unit_error)
         source_physical_errors.append(physical_error)
         pred_unit_values.append(pred_unit.detach().cpu().numpy().reshape(-1))
@@ -176,11 +183,18 @@ def evaluate(
                     "layout_path": meta["layout_path"],
                     "num_chiplets": int(float(meta["num_chiplets"])),
                     "num_sources": 0,
+                    "total_power_W": 0.0,
+                    "source_signed_mean_errors": [],
+                    "source_abs_mean_errors": [],
                 },
             )
             group["pred_sum"] += pred_np[i]
             group["target_sum"] += target_np[i]
             group["num_sources"] += 1
+            group["total_power_W"] += float(meta["source_power_W"])
+            source_error_i = source_error[i].detach().cpu().numpy()
+            group["source_signed_mean_errors"].append(float(np.mean(source_error_i)))
+            group["source_abs_mean_errors"].append(float(np.mean(np.abs(source_error_i))))
     elapsed = time.perf_counter() - start
     packages = package_records(groups, save_predictions=save_predictions, out_dir=out_dir)
     case_records = case_summary(packages)
@@ -206,6 +220,8 @@ def evaluate(
         "oracle_reconstruction": oracle_summary,
         "source_records": source_records,
         "case_records": case_records,
+        "package_bias_records": packages,
+        "package_bias_summary": package_bias_summary(packages),
         "prediction_stats": prediction_stats,
         "runtime": {
             "total_forward_seconds": elapsed,
@@ -242,6 +258,10 @@ def package_records(groups: dict[str, dict[str, Any]], *, save_predictions: bool
         full = group["full_temperature"]
         metrics = field_metrics(pred_temp, full)
         oracle = field_metrics(oracle_temp, full)
+        package_error = pred_temp - full
+        summed_source_error = group["pred_sum"] - group["target_sum"]
+        source_signed = np.asarray(group["source_signed_mean_errors"], dtype=np.float64)
+        source_abs = np.asarray(group["source_abs_mean_errors"], dtype=np.float64)
         pred_hotspot = np.unravel_index(int(np.argmax(pred_temp)), pred_temp.shape)
         target_hotspot = np.unravel_index(int(np.argmax(full)), full.shape)
         layout_path = Path(group["layout_path"])
@@ -250,10 +270,17 @@ def package_records(groups: dict[str, dict[str, Any]], *, save_predictions: bool
         record = {
             "original_sample_uid": uid,
             "case_id": group["case_id"],
+            "num_sources": group["num_sources"],
+            "total_power_W": float(group["total_power_W"]),
             "mae_K": metrics["mae_K"],
             "rmse_K": metrics["rmse_K"],
             "max_abs_error_K": metrics["max_abs_error_K"],
             "mean_signed_error_K": metrics["mean_signed_error_K"],
+            "summed_source_mean_signed_error_K": float(np.mean(summed_source_error)),
+            "mean_source_signed_error_K": float(np.mean(source_signed)) if source_signed.size else 0.0,
+            "mean_source_abs_error_K": float(np.mean(source_abs)) if source_abs.size else 0.0,
+            "positive_source_bias_fraction": float(np.mean(source_signed > 0.0)) if source_signed.size else 0.0,
+            "negative_source_bias_fraction": float(np.mean(source_signed < 0.0)) if source_signed.size else 0.0,
             "hotspot_temp_error_K": float(pred_temp[pred_hotspot] - full[target_hotspot]),
             "hotspot_location_error_cells": float(np.hypot(pred_hotspot[0] - target_hotspot[0], pred_hotspot[1] - target_hotspot[1])),
             "chiplet_mean_temperature_mae_K": chip["chiplet_mean_temperature_mae_K"],
@@ -278,6 +305,7 @@ def summarize_package_records(records: list[dict[str, Any]], *, prefix: str) -> 
         "num_packages": len(records),
         "mae_K": float(np.mean([r[key] for r in records])),
         "rmse_K": float(np.mean([r[rmse_key] for r in records])),
+        "mean_signed_error_K": float(np.mean([r[f"{prefix}mean_signed_error_K"] for r in records])) if f"{prefix}mean_signed_error_K" in records[0] else None,
     }
 
 
@@ -305,6 +333,45 @@ def case_summary(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def mean_optional(values: Any) -> float | None:
     numeric = [float(v) for v in values if v is not None]
     return float(np.mean(numeric)) if numeric else None
+
+
+def package_bias_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
+    if not records:
+        return {}
+    return {
+        "num_packages": len(records),
+        "package_mae_vs_source_count_spearman": spearman([r["mae_K"] for r in records], [r["num_sources"] for r in records]),
+        "package_mae_vs_total_power_spearman": spearman([r["mae_K"] for r in records], [r["total_power_W"] for r in records]),
+        "package_signed_bias_vs_source_count_spearman": spearman([r["mean_signed_error_K"] for r in records], [r["num_sources"] for r in records]),
+        "package_signed_bias_vs_mean_source_signed_bias_spearman": spearman(
+            [r["mean_signed_error_K"] for r in records],
+            [r["mean_source_signed_error_K"] for r in records],
+        ),
+        "mean_positive_source_bias_fraction": float(np.mean([r["positive_source_bias_fraction"] for r in records])),
+        "mean_negative_source_bias_fraction": float(np.mean([r["negative_source_bias_fraction"] for r in records])),
+    }
+
+
+def spearman(a: list[float], b: list[float]) -> float | None:
+    if len(a) < 2 or len(b) < 2:
+        return None
+    a_arr = np.asarray(a, dtype=np.float64)
+    b_arr = np.asarray(b, dtype=np.float64)
+    if float(np.std(a_arr)) == 0.0 or float(np.std(b_arr)) == 0.0:
+        return None
+    a_rank = rankdata(a_arr)
+    b_rank = rankdata(b_arr)
+    return float(np.corrcoef(a_rank, b_rank)[0, 1])
+
+
+def rankdata(values: np.ndarray) -> np.ndarray:
+    order = np.argsort(values, kind="mergesort")
+    ranks = np.empty_like(values, dtype=np.float64)
+    ranks[order] = np.arange(len(values), dtype=np.float64)
+    _, inverse, counts = np.unique(values, return_inverse=True, return_counts=True)
+    sums = np.bincount(inverse, weights=ranks)
+    mean_ranks = sums / counts
+    return mean_ranks[inverse]
 
 
 def write_csv(path: Path, records: list[dict[str, Any]]) -> None:

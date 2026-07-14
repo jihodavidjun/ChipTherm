@@ -26,11 +26,13 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from chiptherm.ml.source_response_dataset import (
+    SourceResponsePackageDataset,
     SourceResponseDataset,
     compute_source_response_normalization,
     normalize_source_input,
     normalize_source_target_unit,
     save_source_response_normalization,
+    source_response_package_collate,
     source_response_collate,
     unnormalize_source_prediction,
 )
@@ -49,11 +51,16 @@ def main() -> int:
     parser.add_argument("--out-dir", required=True, type=Path)
     parser.add_argument("--epochs", default=100, type=int)
     parser.add_argument("--batch-size", default=64, type=int)
+    parser.add_argument("--packages-per-batch", default=1, type=int)
     parser.add_argument("--lr", default=1.0e-3, type=float)
     parser.add_argument("--base-channels", default=32, type=int)
     parser.add_argument("--depth", default=3, type=int)
     parser.add_argument("--power-floor-W", default=1.0e-6, type=float)
     parser.add_argument("--low-power-warning-W", default=1.0, type=float)
+    parser.add_argument("--lambda-source", default=1.0, type=float)
+    parser.add_argument("--lambda-package", default=0.0, type=float)
+    parser.add_argument("--package-loss-warmup-epochs", default=0, type=int)
+    parser.add_argument("--lambda-source-mean", default=0.0, type=float)
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
     parser.add_argument("--num-workers", default=0, type=int)
     parser.add_argument("--seed", default=1, type=int)
@@ -67,6 +74,7 @@ def main() -> int:
 
     train_dataset = SourceResponseDataset(args.train_index, power_floor_W=args.power_floor_W)
     val_dataset = SourceResponseDataset(args.val_index, power_floor_W=args.power_floor_W)
+    train_package_dataset = SourceResponsePackageDataset(args.train_index, power_floor_W=args.power_floor_W, require_complete=True)
     stats = compute_source_response_normalization(train_dataset, batch_size=args.batch_size, num_workers=args.num_workers)
     save_source_response_normalization(stats, out_dir / "source_response_normalization.json")
     power_diagnostics = source_power_diagnostics(train_dataset, val_dataset, args.low_power_warning_W)
@@ -83,12 +91,21 @@ def main() -> int:
         "target_unit_mean_K_per_W": stats.target_unit_mean_K_per_W,
         "target_unit_std_K_per_W": stats.target_unit_std_K_per_W,
         "power_floor_W": args.power_floor_W,
+        "packages_per_batch": args.packages_per_batch,
+        "loss_config": {
+            "source_loss": "SmoothL1 on train-standardized unit response K/W",
+            "package_loss": "SmoothL1 on reconstructed full temperature in Kelvin",
+            "lambda_source": args.lambda_source,
+            "lambda_package": args.lambda_package,
+            "package_loss_warmup_epochs": args.package_loss_warmup_epochs,
+            "lambda_source_mean": args.lambda_source_mean,
+        },
     }
     model = build_source_response_model(model_config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     criterion = nn.SmoothL1Loss()
 
-    train_loader = make_loader(train_dataset, args.batch_size, True, args.num_workers, device)
+    train_loader = make_package_loader(train_package_dataset, args.packages_per_batch, True, args.num_workers, device)
     val_loader = make_loader(val_dataset, args.batch_size, False, args.num_workers, device)
     config = {
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -96,7 +113,7 @@ def main() -> int:
         "val_index": str(args.val_index),
         "model_config": model_config,
         "optimizer": "AdamW",
-        "loss": "SmoothL1 on train-standardized unit response K/W; best checkpoint selected by validation package full-grid MAE",
+        "loss": "lambda_source*SmoothL1(normalized source K/W) + active_lambda_package*SmoothL1(package K) + optional source mean loss; best checkpoint selected by validation package full-grid MAE",
         "parameter_count": count_parameters(model),
         "args": json_safe(vars(args)),
     }
@@ -107,8 +124,24 @@ def main() -> int:
     best_payload: dict[str, Any] | None = None
     for epoch in range(1, args.epochs + 1):
         start = time.perf_counter()
-        train_loss = train_one_epoch(model, train_loader, stats, criterion, optimizer, device)
+        active_package_weight = package_loss_weight(args.lambda_package, args.package_loss_warmup_epochs, epoch)
+        train_metrics = train_one_epoch(
+            model,
+            train_loader,
+            stats,
+            criterion,
+            optimizer,
+            device,
+            lambda_source=args.lambda_source,
+            lambda_package=active_package_weight,
+            lambda_source_mean=args.lambda_source_mean,
+        )
         val_metrics = evaluate_model(model, val_loader, stats, device)
+        write_records_csv(out_dir / "package_bias_diagnostics.csv", val_metrics["package_bias_records"])
+        (out_dir / "package_bias_summary.json").write_text(
+            json.dumps(val_metrics["package_bias_summary"], indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
         package_mae = val_metrics["package_reconstruction"]["mae_K"]
         if package_mae is None:
             raise SystemExit("validation package-level MAE unavailable; ensure val source index has all source chiplets per original sample")
@@ -120,11 +153,15 @@ def main() -> int:
         if is_best:
             torch.save(payload, checkpoints_dir / "best.pt")
             best_payload = payload
-        append_log(out_dir / "train_log.csv", epoch, train_loss, val_metrics, time.perf_counter() - start, is_best)
+        append_log(out_dir / "train_log.csv", epoch, train_metrics, val_metrics, time.perf_counter() - start, is_best, active_package_weight, optimizer)
         print(
-            f"epoch {epoch:03d} train_loss={train_loss:.6f} "
+            f"epoch {epoch:03d} train_loss={train_metrics['total_loss']:.6f} "
+            f"source_loss={train_metrics['source_loss']:.6f} "
+            f"package_loss={train_metrics['package_loss']:.6f} "
+            f"pkg_w={active_package_weight:.4f} "
             f"val_source_K={val_metrics['source_physical']['mae_K']:.4f} "
             f"val_source_K_per_W={val_metrics['source_unit']['mae_K_per_W']:.6f} "
+            f"val_pkg_bias={val_metrics['package_reconstruction'].get('mean_signed_error_K', float('nan')):.4f} "
             f"pred_K_per_W_mean={val_metrics['prediction_stats']['pred_unit_K_per_W']['mean']:.6f} "
             f"pred_K_per_W_std={val_metrics['prediction_stats']['pred_unit_K_per_W']['std']:.6f} "
             f"neg_frac={val_metrics['prediction_stats']['negative_unit_response_fraction']:.4f} "
@@ -136,21 +173,87 @@ def main() -> int:
     return 0
 
 
-def train_one_epoch(model: nn.Module, loader: DataLoader, stats: Any, criterion: nn.Module, optimizer: torch.optim.Optimizer, device: torch.device) -> float:
+def train_one_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    stats: Any,
+    criterion: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    *,
+    lambda_source: float,
+    lambda_package: float,
+    lambda_source_mean: float,
+) -> dict[str, float]:
     model.train()
-    total = 0.0
-    count = 0
+    totals = {
+        "total_loss": 0.0,
+        "source_loss": 0.0,
+        "package_loss": 0.0,
+        "source_mean_loss": 0.0,
+        "packages": 0.0,
+        "sources": 0.0,
+        "max_sources_per_batch": 0.0,
+    }
     for batch in loader:
         x = normalize_source_input(batch["x"].to(device), stats)
         target = normalize_source_target_unit(batch["target_unit"].to(device), stats)
+        target_rise = batch["target_rise"].to(device)
+        source_power = batch["source_power_W"].to(device)
+        source_to_package = batch["source_to_package_index"].to(device)
+        package_ambient = batch["package_ambient_K"].to(device)
+        package_target = batch["package_full_temperature"].to(device)
         optimizer.zero_grad(set_to_none=True)
         pred_normalized = model(x)
-        loss = criterion(pred_normalized, target)
+        source_loss = criterion(pred_normalized, target)
+        pred_unit = unnormalize_source_prediction(pred_normalized, stats)
+        pred_rise = predict_source_rise(pred_unit, source_power)
+        pred_sum = segment_sum_fields(pred_rise, source_to_package, int(package_target.shape[0]))
+        pred_temp = package_ambient[:, None, None] + pred_sum
+        package_loss = criterion(pred_temp, package_target)
+        if lambda_source_mean > 0.0:
+            source_mean_loss = criterion(pred_rise.mean(dim=(-2, -1)), target_rise.mean(dim=(-2, -1)))
+        else:
+            source_mean_loss = pred_normalized.new_tensor(0.0)
+        loss = float(lambda_source) * source_loss + float(lambda_package) * package_loss + float(lambda_source_mean) * source_mean_loss
         loss.backward()
         optimizer.step()
-        total += float(loss.item()) * int(x.shape[0])
-        count += int(x.shape[0])
-    return total / max(count, 1)
+        packages = int(package_target.shape[0])
+        sources = int(x.shape[0])
+        totals["total_loss"] += float(loss.item()) * packages
+        totals["source_loss"] += float(source_loss.item()) * packages
+        totals["package_loss"] += float(package_loss.item()) * packages
+        totals["source_mean_loss"] += float(source_mean_loss.item()) * packages
+        totals["packages"] += packages
+        totals["sources"] += sources
+        totals["max_sources_per_batch"] = max(totals["max_sources_per_batch"], float(sources))
+    package_count = max(totals["packages"], 1.0)
+    return {
+        "total_loss": totals["total_loss"] / package_count,
+        "source_loss": totals["source_loss"] / package_count,
+        "package_loss": totals["package_loss"] / package_count,
+        "source_mean_loss": totals["source_mean_loss"] / package_count,
+        "packages_per_batch": float(getattr(loader, "batch_size", 0) or 0),
+        "effective_sources_per_step": totals["sources"] / max(len(loader), 1),
+        "max_sources_per_batch": totals["max_sources_per_batch"],
+    }
+
+
+def segment_sum_fields(values: torch.Tensor, source_to_package: torch.Tensor, num_packages: int) -> torch.Tensor:
+    if values.ndim != 3:
+        raise ValueError(f"values must have shape [sources,H,W], got {tuple(values.shape)}")
+    result = values.new_zeros((int(num_packages), int(values.shape[-2]), int(values.shape[-1])))
+    result.index_add_(0, source_to_package.long(), values)
+    return result
+
+
+def package_loss_weight(lambda_package: float, warmup_epochs: int, epoch: int) -> float:
+    if lambda_package <= 0.0:
+        return 0.0
+    if warmup_epochs <= 0:
+        return float(lambda_package)
+    progress = max(0.0, min(1.0, (float(epoch) - 1.0) / float(warmup_epochs)))
+    return float(lambda_package) * progress
 
 
 @torch.no_grad()
@@ -171,8 +274,9 @@ def evaluate_model(model: nn.Module, loader: DataLoader, stats: Any, device: tor
         pred_rise = predict_source_rise(pred_unit, source_power)
         target_unit = batch["target_unit"].to(device)
         target_rise = batch["target_rise"].to(device)
+        source_error = pred_rise - target_rise
         source_unit_errors.append((pred_unit - target_unit).detach().cpu().numpy())
-        source_physical_errors.append((pred_rise - target_rise).detach().cpu().numpy())
+        source_physical_errors.append(source_error.detach().cpu().numpy())
         pred_unit_values.append(pred_unit.detach().cpu().numpy().reshape(-1))
         pred_rise_values.append(pred_rise.detach().cpu().numpy().reshape(-1))
         negative_count += int((pred_unit < 0.0).sum().item())
@@ -194,11 +298,18 @@ def evaluate_model(model: nn.Module, loader: DataLoader, stats: Any, device: tor
                     "layout_path": meta["layout_path"],
                     "num_chiplets": int(float(meta["num_chiplets"])),
                     "num_sources": 0,
+                    "total_power_W": 0.0,
+                    "source_signed_mean_errors": [],
+                    "source_abs_mean_errors": [],
                 },
             )
             group["pred_sum"] += pred_np[i]
             group["target_sum"] += target_np[i]
             group["num_sources"] += 1
+            group["total_power_W"] += float(meta["source_power_W"])
+            source_error_i = source_error[i].detach().cpu().numpy()
+            group["source_signed_mean_errors"].append(float(np.mean(source_error_i)))
+            group["source_abs_mean_errors"].append(float(np.mean(np.abs(source_error_i))))
     source_unit = aggregate_error(np.concatenate([e.reshape(-1) for e in source_unit_errors]), suffix="K_per_W")
     source_physical = aggregate_error(np.concatenate([e.reshape(-1) for e in source_physical_errors]), suffix="K")
     package = package_metrics(groups)
@@ -212,6 +323,8 @@ def evaluate_model(model: nn.Module, loader: DataLoader, stats: Any, device: tor
         "source_physical": source_physical,
         "package_reconstruction": package["overall"],
         "package_by_case": package["by_case"],
+        "package_bias_records": package["records"],
+        "package_bias_summary": package["bias_summary"],
         "prediction_stats": prediction_stats,
     }
 
@@ -225,14 +338,26 @@ def package_metrics(groups: dict[str, dict[str, Any]]) -> dict[str, Any]:
         pred_temp = float(group["ambient_K"]) + group["pred_sum"]
         full = group["full_temperature"]
         base = field_metrics(pred_temp, full)
+        package_error = pred_temp - full
+        summed_source_error = group["pred_sum"] - group["target_sum"]
+        source_signed = np.asarray(group["source_signed_mean_errors"], dtype=np.float64)
+        source_abs = np.asarray(group["source_abs_mean_errors"], dtype=np.float64)
         layout = load_json((REPO_ROOT / group["layout_path"]).resolve() if not Path(group["layout_path"]).is_absolute() else Path(group["layout_path"]))
         chip = chiplet_metrics(pred_temp, full, layout, full.shape)
         record = {
             "original_sample_uid": uid,
             "case_id": group["case_id"],
+            "num_sources": int(group["num_sources"]),
+            "total_power_W": float(group["total_power_W"]),
             "mae_K": base["mae_K"],
             "rmse_K": base["rmse_K"],
             "max_abs_error_K": base["max_abs_error_K"],
+            "mean_signed_error_K": float(np.mean(package_error)),
+            "summed_source_mean_signed_error_K": float(np.mean(summed_source_error)),
+            "mean_source_signed_error_K": float(np.mean(source_signed)) if source_signed.size else 0.0,
+            "mean_source_abs_error_K": float(np.mean(source_abs)) if source_abs.size else 0.0,
+            "positive_source_bias_fraction": float(np.mean(source_signed > 0.0)) if source_signed.size else 0.0,
+            "negative_source_bias_fraction": float(np.mean(source_signed < 0.0)) if source_signed.size else 0.0,
             "chiplet_mean_temperature_mae_K": chip["chiplet_mean_temperature_mae_K"],
             "chiplet_peak_temperature_mae_K": chip["chiplet_peak_temperature_mae_K"],
             "inter_chiplet_delta_T_mae_K": chip["inter_chiplet_delta_T_mae_K"],
@@ -240,11 +365,18 @@ def package_metrics(groups: dict[str, dict[str, Any]]) -> dict[str, Any]:
         records.append(record)
         by_case[str(group["case_id"])].append(record)
     if not records:
-        return {"overall": {"mae_K": None, "rmse_K": None, "num_packages": 0}, "by_case": {}}
+        return {
+            "overall": {"mae_K": None, "rmse_K": None, "num_packages": 0},
+            "by_case": {},
+            "records": [],
+            "bias_summary": {},
+        }
     overall = {
         "mae_K": float(np.mean([r["mae_K"] for r in records])),
         "rmse_K": float(np.mean([r["rmse_K"] for r in records])),
         "max_abs_error_K": float(np.max([r["max_abs_error_K"] for r in records])),
+        "mean_signed_error_K": float(np.mean([r["mean_signed_error_K"] for r in records])),
+        "mean_abs_signed_error_K": float(np.mean([abs(r["mean_signed_error_K"]) for r in records])),
         "chiplet_mean_temperature_mae_K": mean_optional(r["chiplet_mean_temperature_mae_K"] for r in records),
         "chiplet_peak_temperature_mae_K": mean_optional(r["chiplet_peak_temperature_mae_K"] for r in records),
         "inter_chiplet_delta_T_mae_K": mean_optional(r["inter_chiplet_delta_T_mae_K"] for r in records),
@@ -254,11 +386,52 @@ def package_metrics(groups: dict[str, dict[str, Any]]) -> dict[str, Any]:
         case: {
             "mae_K": float(np.mean([r["mae_K"] for r in items])),
             "rmse_K": float(np.mean([r["rmse_K"] for r in items])),
+            "mean_signed_error_K": float(np.mean([r["mean_signed_error_K"] for r in items])),
             "num_packages": len(items),
         }
         for case, items in sorted(by_case.items())
     }
-    return {"overall": overall, "by_case": case_payload}
+    return {"overall": overall, "by_case": case_payload, "records": records, "bias_summary": package_bias_summary(records)}
+
+
+def package_bias_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
+    if not records:
+        return {}
+    return {
+        "num_packages": len(records),
+        "package_mae_vs_source_count_spearman": spearman([r["mae_K"] for r in records], [r["num_sources"] for r in records]),
+        "package_mae_vs_total_power_spearman": spearman([r["mae_K"] for r in records], [r["total_power_W"] for r in records]),
+        "package_signed_bias_vs_source_count_spearman": spearman([r["mean_signed_error_K"] for r in records], [r["num_sources"] for r in records]),
+        "package_signed_bias_vs_mean_source_signed_bias_spearman": spearman(
+            [r["mean_signed_error_K"] for r in records],
+            [r["mean_source_signed_error_K"] for r in records],
+        ),
+        "mean_positive_source_bias_fraction": float(np.mean([r["positive_source_bias_fraction"] for r in records])),
+        "mean_negative_source_bias_fraction": float(np.mean([r["negative_source_bias_fraction"] for r in records])),
+    }
+
+
+def spearman(a: list[float], b: list[float]) -> float | None:
+    if len(a) < 2 or len(b) < 2:
+        return None
+    a_arr = np.asarray(a, dtype=np.float64)
+    b_arr = np.asarray(b, dtype=np.float64)
+    if float(np.std(a_arr)) == 0.0 or float(np.std(b_arr)) == 0.0:
+        return None
+    a_rank = rankdata(a_arr)
+    b_rank = rankdata(b_arr)
+    return float(np.corrcoef(a_rank, b_rank)[0, 1])
+
+
+def rankdata(values: np.ndarray) -> np.ndarray:
+    order = np.argsort(values, kind="mergesort")
+    ranks = np.empty_like(values, dtype=np.float64)
+    ranks[order] = np.arange(len(values), dtype=np.float64)
+    unique_values, inverse, counts = np.unique(values, return_inverse=True, return_counts=True)
+    del unique_values
+    sums = np.bincount(inverse, weights=ranks)
+    mean_ranks = sums / counts
+    return mean_ranks[inverse]
 
 
 def aggregate_error(error: np.ndarray, *, suffix: str) -> dict[str, float]:
@@ -348,16 +521,40 @@ def make_loader(dataset: SourceResponseDataset, batch_size: int, shuffle: bool, 
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=device.type == "cuda", collate_fn=source_response_collate)
 
 
+def make_package_loader(dataset: SourceResponsePackageDataset, packages_per_batch: int, shuffle: bool, num_workers: int, device: torch.device) -> DataLoader:
+    return DataLoader(
+        dataset,
+        batch_size=packages_per_batch,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=device.type == "cuda",
+        collate_fn=source_response_package_collate,
+    )
+
+
 def init_log(path: Path) -> None:
     with path.open("w", newline="", encoding="utf-8") as fp:
         csv.writer(fp).writerow(
             [
                 "epoch",
-                "train_loss_normalized",
+                "train_total_loss",
+                "train_source_loss",
+                "train_package_loss",
+                "train_source_mean_loss",
+                "active_lambda_package",
+                "packages_per_batch",
+                "effective_sources_per_step",
+                "max_sources_per_batch",
                 "val_source_mae_K_per_W",
                 "val_source_mae_K",
                 "val_package_mae_K",
                 "val_package_rmse_K",
+                "val_package_mean_signed_error_K",
+                "val_package_mean_abs_signed_error_K",
+                "package_mae_vs_source_count_spearman",
+                "package_mae_vs_total_power_spearman",
+                "package_signed_bias_vs_source_count_spearman",
+                "package_signed_bias_vs_mean_source_signed_bias_spearman",
                 "pred_K_per_W_mean",
                 "pred_K_per_W_std",
                 "pred_K_per_W_min",
@@ -367,23 +564,48 @@ def init_log(path: Path) -> None:
                 "pred_source_rise_K_min",
                 "pred_source_rise_K_max",
                 "negative_prediction_fraction",
+                "learning_rate",
                 "epoch_runtime_s",
                 "is_best",
             ]
         )
 
 
-def append_log(path: Path, epoch: int, train_loss: float, val_metrics: dict[str, Any], runtime: float, is_best: bool) -> None:
+def append_log(
+    path: Path,
+    epoch: int,
+    train_metrics: dict[str, float],
+    val_metrics: dict[str, Any],
+    runtime: float,
+    is_best: bool,
+    active_package_weight: float,
+    optimizer: torch.optim.Optimizer,
+) -> None:
     pred_unit = val_metrics["prediction_stats"]["pred_unit_K_per_W"]
     pred_rise = val_metrics["prediction_stats"]["pred_source_rise_K"]
+    bias = val_metrics.get("package_bias_summary", {})
+    package = val_metrics["package_reconstruction"]
     with path.open("a", newline="", encoding="utf-8") as fp:
         csv.writer(fp).writerow([
             epoch,
-            train_loss,
+            train_metrics["total_loss"],
+            train_metrics["source_loss"],
+            train_metrics["package_loss"],
+            train_metrics["source_mean_loss"],
+            active_package_weight,
+            train_metrics["packages_per_batch"],
+            train_metrics["effective_sources_per_step"],
+            train_metrics["max_sources_per_batch"],
             val_metrics["source_unit"]["mae_K_per_W"],
             val_metrics["source_physical"]["mae_K"],
-            val_metrics["package_reconstruction"]["mae_K"],
-            val_metrics["package_reconstruction"]["rmse_K"],
+            package["mae_K"],
+            package["rmse_K"],
+            package.get("mean_signed_error_K"),
+            package.get("mean_abs_signed_error_K"),
+            bias.get("package_mae_vs_source_count_spearman"),
+            bias.get("package_mae_vs_total_power_spearman"),
+            bias.get("package_signed_bias_vs_source_count_spearman"),
+            bias.get("package_signed_bias_vs_mean_source_signed_bias_spearman"),
             pred_unit["mean"],
             pred_unit["std"],
             pred_unit["min"],
@@ -393,9 +615,25 @@ def append_log(path: Path, epoch: int, train_loss: float, val_metrics: dict[str,
             pred_rise["min"],
             pred_rise["max"],
             val_metrics["prediction_stats"]["negative_unit_response_fraction"],
+            optimizer.param_groups[0]["lr"],
             runtime,
             int(is_best),
         ])
+
+
+def write_records_csv(path: Path, records: list[dict[str, Any]]) -> None:
+    if not records:
+        path.write_text("", encoding="utf-8")
+        return
+    columns: list[str] = []
+    for record in records:
+        for key in record:
+            if key not in columns:
+                columns.append(key)
+    with path.open("w", newline="", encoding="utf-8") as fp:
+        writer = csv.DictWriter(fp, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(records)
 
 
 def set_seed(seed: int) -> None:

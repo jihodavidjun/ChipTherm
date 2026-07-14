@@ -17,9 +17,11 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from chiptherm.ml.source_response_dataset import (  # noqa: E402
+    SourceResponsePackageDataset,
     SourceResponseDataset,
     build_source_input,
     compute_source_response_normalization,
+    source_response_package_collate,
 )
 from chiptherm.ml.encoder import active_power_map  # noqa: E402
 from scripts.build_source_response_dataset import select_split_rows  # noqa: E402
@@ -78,6 +80,71 @@ def make_fixture(root: Path) -> Path:
     return index_path
 
 
+def make_group_fixture(root: Path) -> Path:
+    layout = {
+        "package": {"size": {"width": 4.0, "height": 4.0}},
+        "chiplets": [
+            {"name": "CPU0", "type": "CPU", "position": {"x": 0.0, "y": 0.0}, "size": {"width": 2.0, "height": 2.0}},
+            {"name": "GPU0", "type": "GPU", "position": {"x": 2.0, "y": 0.0}, "size": {"width": 2.0, "height": 2.0}},
+            {"name": "MEM0", "type": "memory", "position": {"x": 0.0, "y": 2.0}, "size": {"width": 4.0, "height": 2.0}},
+        ],
+    }
+    layout_path = root / "layout_group.json"
+    layout_path.write_text(json.dumps(layout), encoding="utf-8")
+    x = np.zeros((8, 4, 4), dtype=np.float32)
+    x[1] = 1.0
+    x[2, :2, :2] = 1.0
+    x[3, :2, 2:] = 1.0
+    x[4, 2:, :] = 1.0
+    coords = (np.arange(4, dtype=np.float32) + 0.5) / 4.0
+    x[6] = coords.reshape(1, 4)
+    x[7] = coords.reshape(4, 1)
+    rows = []
+    for package_index, source_count in enumerate((2, 3)):
+        uid = f"pkg{package_index}"
+        x_path = root / f"{uid}_x.npy"
+        y_path = root / f"{uid}_y.npy"
+        np.save(x_path, x)
+        source_rises = []
+        for source_index in range(source_count):
+            rise = np.full((4, 4), float(source_index + 1), dtype=np.float32)
+            target_path = root / f"{uid}_src{source_index}_rise.npy"
+            np.save(target_path, rise)
+            source_rises.append(rise)
+            chiplet = layout["chiplets"][source_index]
+            area = float(chiplet["size"]["width"]) * float(chiplet["size"]["height"])
+            rows.append(
+                {
+                    "source_response_uid": f"{uid}__src{source_index:03d}_{chiplet['name']}",
+                    "original_sample_uid": uid,
+                    "case_id": "caseX",
+                    "split": "train",
+                    "dataset_source": "synthetic",
+                    "original_x_path": str(x_path),
+                    "original_y_path": str(y_path),
+                    "full_temperature_path": str(y_path),
+                    "layout_path": str(layout_path),
+                    "source_index": str(source_index),
+                    "source_name": chiplet["name"],
+                    "source_type": chiplet["type"],
+                    "source_power_W": str(float(source_index + 2)),
+                    "source_area_mm2": str(area),
+                    "source_power_density_W_per_mm2": str(float(source_index + 2) / area),
+                    "ambient_K": "318.0",
+                    "target_rise_path": str(target_path),
+                    "num_chiplets": str(source_count),
+                    "num_sources_included": str(source_count),
+                }
+            )
+        np.save(y_path, np.float32(318.0) + np.sum(source_rises, axis=0))
+    index_path = root / "group_index.csv"
+    with index_path.open("w", newline="", encoding="utf-8") as fp:
+        writer = csv.DictWriter(fp, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    return index_path
+
+
 def test_source_input_preserves_geometry_and_only_source_power(tmp_path: Path) -> None:
     index_path = make_fixture(tmp_path)
     dataset = SourceResponseDataset(index_path)
@@ -119,6 +186,32 @@ def test_normalization_stats(tmp_path: Path) -> None:
     assert stats.num_sources == 1
     assert "source_radius_mm" in stats.channel_names
     assert stats.source_power_min_W == 4.0
+
+
+def test_package_dataset_keeps_complete_variable_source_groups_together(tmp_path: Path) -> None:
+    index_path = make_group_fixture(tmp_path)
+    dataset = SourceResponsePackageDataset(index_path)
+    assert len(dataset) == 2
+    assert [dataset[i]["num_sources"] for i in range(len(dataset))] == [2, 3]
+    assert [dataset[i]["original_sample_uid"] for i in range(len(dataset))] == ["pkg0", "pkg1"]
+
+
+def test_package_collate_packs_sources_and_mapping(tmp_path: Path) -> None:
+    index_path = make_group_fixture(tmp_path)
+    dataset = SourceResponsePackageDataset(index_path)
+    batch = source_response_package_collate([dataset[0], dataset[1]])
+    assert batch["x"].shape == (5, 17, 4, 4)
+    assert batch["target_rise"].shape == (5, 4, 4)
+    assert batch["source_to_package_index"].tolist() == [0, 0, 1, 1, 1]
+    assert batch["package_full_temperature"].shape == (2, 4, 4)
+    assert batch["package_original_sample_uid"] == ["pkg0", "pkg1"]
+
+
+def test_package_target_loaded_from_original_y_and_ambient_added_once(tmp_path: Path) -> None:
+    index_path = make_group_fixture(tmp_path)
+    batch = source_response_package_collate([SourceResponsePackageDataset(index_path)[0]])
+    reconstructed = batch["package_ambient_K"][0] + batch["target_rise"].sum(dim=0)
+    assert np.allclose(reconstructed.numpy(), batch["package_full_temperature"][0].numpy())
 
 
 def test_split_selection_independent() -> None:
