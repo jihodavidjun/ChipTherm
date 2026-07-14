@@ -41,10 +41,14 @@ SAMPLE_COLUMNS = [
     "hotspot_max_K",
     "physics_mae_K",
     "physics_rmse_K",
+    "physics_global_pixel_rmse_K",
+    "physics_mean_sample_rmse_K",
     "physics_max_abs_error_K",
     "physics_mean_signed_error_K",
     "cnn_mae_K",
     "cnn_rmse_K",
+    "cnn_global_pixel_rmse_K",
+    "cnn_mean_sample_rmse_K",
     "cnn_max_abs_error_K",
     "cnn_mean_signed_error_K",
     "mae_improvement_percent",
@@ -294,10 +298,14 @@ def analyze(
                 "hotspot_max_K": float(y.max()),
                 "physics_mae_K": physics_stats["mae_K"],
                 "physics_rmse_K": physics_stats["rmse_K"],
+                "physics_global_pixel_rmse_K": physics_stats["global_pixel_rmse_K"],
+                "physics_mean_sample_rmse_K": physics_stats["mean_sample_rmse_K"],
                 "physics_max_abs_error_K": physics_stats["max_abs_error_K"],
                 "physics_mean_signed_error_K": physics_stats["mean_signed_error_K"],
                 "cnn_mae_K": cnn_stats["mae_K"],
                 "cnn_rmse_K": cnn_stats["rmse_K"],
+                "cnn_global_pixel_rmse_K": cnn_stats["global_pixel_rmse_K"],
+                "cnn_mean_sample_rmse_K": cnn_stats["mean_sample_rmse_K"],
                 "cnn_max_abs_error_K": cnn_stats["max_abs_error_K"],
                 "cnn_mean_signed_error_K": cnn_stats["mean_signed_error_K"],
                 "mae_improvement_percent": percent_improvement(physics_stats["mae_K"], cnn_stats["mae_K"]),
@@ -392,9 +400,12 @@ def to_numpy_or_none(value: torch.Tensor | None) -> np.ndarray | None:
 def error_stats(pred: np.ndarray, target: np.ndarray) -> dict[str, float]:
     error = pred.astype(np.float64) - target.astype(np.float64)
     abs_error = np.abs(error)
+    global_pixel_rmse = float(np.sqrt(np.mean(error * error)))
     return {
         "mae_K": float(abs_error.mean()),
-        "rmse_K": float(np.sqrt(np.mean(error * error))),
+        "global_pixel_rmse_K": global_pixel_rmse,
+        "mean_sample_rmse_K": global_pixel_rmse,
+        "rmse_K": global_pixel_rmse,
         "max_abs_error_K": float(abs_error.max()),
         "mean_signed_error_K": float(error.mean()),
     }
@@ -465,13 +476,10 @@ def aggregate_by_case(records: list[dict[str, Any]]) -> dict[str, dict[str, floa
 def aggregate_records(records: list[dict[str, Any]]) -> dict[str, float]:
     keys_mean = [
         "physics_mae_K",
-        "physics_rmse_K",
         "physics_mean_signed_error_K",
         "cnn_mae_K",
-        "cnn_rmse_K",
         "cnn_mean_signed_error_K",
         "mae_improvement_percent",
-        "rmse_improvement_percent",
         "hotspot_temp_error_K",
         "hotspot_location_error_cells",
         "occupied_mae_K",
@@ -485,13 +493,22 @@ def aggregate_records(records: list[dict[str, Any]]) -> dict[str, float]:
         "power_top_10pct_mae_K",
         "mean_rise_abs_error_K",
         "centered_field_mae_K",
-        "centered_field_rmse_K",
         "mean_bias_removed_mae_K",
-        "mean_bias_removed_rmse_K",
     ]
     result: dict[str, float] = {"num_samples": float(len(records))}
     for key in keys_mean:
         result[key] = mean_optional(record.get(key) for record in records)
+    for prefix in ("physics", "cnn", "centered_field", "mean_bias_removed"):
+        sample_key = f"{prefix}_rmse_K"
+        values = [float(record[sample_key]) for record in records if record.get(sample_key) is not None]
+        if values:
+            mean_sample = float(np.mean(values))
+            global_pixel = float(np.sqrt(np.mean(np.asarray(values, dtype=np.float64) ** 2)))
+            result[f"{prefix}_mean_sample_rmse_K"] = mean_sample
+            result[f"{prefix}_global_pixel_rmse_K"] = global_pixel
+            result[sample_key] = global_pixel
+    if result.get("physics_rmse_K") is not None and result.get("cnn_rmse_K") is not None:
+        result["rmse_improvement_percent"] = percent_improvement(result["physics_rmse_K"], result["cnn_rmse_K"])
     result["physics_max_abs_error_K"] = max(float(record["physics_max_abs_error_K"]) for record in records)
     result["cnn_max_abs_error_K"] = max(float(record["cnn_max_abs_error_K"]) for record in records)
     result["hotspot_mean_K"] = mean_optional(record.get("hotspot_mean_K") for record in records)
@@ -604,8 +621,12 @@ def write_case_metrics(path: Path, by_case: dict[str, dict[str, float]]) -> None
         "num_samples",
         "physics_mae_K",
         "physics_rmse_K",
+        "physics_global_pixel_rmse_K",
+        "physics_mean_sample_rmse_K",
         "cnn_mae_K",
         "cnn_rmse_K",
+        "cnn_global_pixel_rmse_K",
+        "cnn_mean_sample_rmse_K",
         "cnn_max_abs_error_K",
         "cnn_mean_signed_error_K",
         "mae_improvement_percent",
@@ -623,8 +644,12 @@ def write_case_metrics(path: Path, by_case: dict[str, dict[str, float]]) -> None
         "mean_rise_abs_error_K",
         "centered_field_mae_K",
         "centered_field_rmse_K",
+        "centered_field_global_pixel_rmse_K",
+        "centered_field_mean_sample_rmse_K",
         "mean_bias_removed_mae_K",
         "mean_bias_removed_rmse_K",
+        "mean_bias_removed_global_pixel_rmse_K",
+        "mean_bias_removed_mean_sample_rmse_K",
     ]
     with path.open("w", encoding="utf-8", newline="") as fp:
         writer = csv.DictWriter(fp, fieldnames=columns)

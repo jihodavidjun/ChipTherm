@@ -335,6 +335,7 @@ class MetricAccumulator:
         self.sum_abs = 0.0
         self.sum_sq = 0.0
         self.sum_signed = 0.0
+        self.sum_sample_rmse = 0.0
         self.max_abs = 0.0
         self.hotspot_temp_error_sum = 0.0
         self.hotspot_location_error_sum = 0.0
@@ -349,6 +350,7 @@ class MetricAccumulator:
         self.sum_abs += float(abs_error.sum().item())
         self.sum_sq += float((error * error).sum().item())
         self.sum_signed += float(error.sum().item())
+        self.sum_sample_rmse += float(torch.sqrt(torch.mean(error.reshape(error.shape[0], -1) ** 2, dim=1)).sum().item())
         self.max_abs = max(self.max_abs, float(abs_error.max().item()))
         for pred_item, target_item in zip(pred_cpu, target_cpu):
             pred_flat = pred_item.reshape(-1)
@@ -363,10 +365,14 @@ class MetricAccumulator:
     def compute(self) -> dict[str, float]:
         if self.num_cells == 0:
             return {}
+        global_pixel_rmse = (self.sum_sq / self.num_cells) ** 0.5
         return {
             "num_samples": float(self.num_samples),
+            "num_cells": float(self.num_cells),
             "mae_K": self.sum_abs / self.num_cells,
-            "rmse_K": (self.sum_sq / self.num_cells) ** 0.5,
+            "global_pixel_rmse_K": global_pixel_rmse,
+            "mean_sample_rmse_K": self.sum_sample_rmse / max(self.num_samples, 1),
+            "rmse_K": global_pixel_rmse,
             "max_abs_error_K": self.max_abs,
             "mean_signed_error_K": self.sum_signed / self.num_cells,
             "hotspot_temp_error_K": self.hotspot_temp_error_sum / max(self.num_samples, 1),

@@ -298,13 +298,18 @@ def package_records(groups: dict[str, dict[str, Any]], *, save_predictions: bool
 
 def summarize_package_records(records: list[dict[str, Any]], *, prefix: str) -> dict[str, Any]:
     if not records:
-        return {"num_packages": 0, "mae_K": None, "rmse_K": None}
+        return {"num_packages": 0, "mae_K": None, "rmse_K": None, "global_pixel_rmse_K": None, "mean_sample_rmse_K": None}
     key = f"{prefix}mae_K"
     rmse_key = f"{prefix}rmse_K"
+    rmses = np.asarray([r[rmse_key] for r in records], dtype=np.float64)
+    global_pixel_rmse = float(np.sqrt(np.mean(rmses * rmses)))
+    mean_sample_rmse = float(np.mean(rmses))
     return {
         "num_packages": len(records),
         "mae_K": float(np.mean([r[key] for r in records])),
-        "rmse_K": float(np.mean([r[rmse_key] for r in records])),
+        "global_pixel_rmse_K": global_pixel_rmse,
+        "mean_sample_rmse_K": mean_sample_rmse,
+        "rmse_K": global_pixel_rmse,
         "mean_signed_error_K": float(np.mean([r[f"{prefix}mean_signed_error_K"] for r in records])) if f"{prefix}mean_signed_error_K" in records[0] else None,
     }
 
@@ -320,7 +325,9 @@ def case_summary(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "case_id": case_id,
                 "num_packages": len(items),
                 "mae_K": float(np.mean([item["mae_K"] for item in items])),
-                "rmse_K": float(np.mean([item["rmse_K"] for item in items])),
+                "global_pixel_rmse_K": float(np.sqrt(np.mean(np.asarray([item["rmse_K"] for item in items], dtype=np.float64) ** 2))),
+                "mean_sample_rmse_K": float(np.mean([item["rmse_K"] for item in items])),
+                "rmse_K": float(np.sqrt(np.mean(np.asarray([item["rmse_K"] for item in items], dtype=np.float64) ** 2))),
                 "oracle_mae_K": float(np.mean([item["oracle_mae_K"] for item in items])),
                 "chiplet_mean_temperature_mae_K": mean_optional(item["chiplet_mean_temperature_mae_K"] for item in items),
                 "chiplet_peak_temperature_mae_K": mean_optional(item["chiplet_peak_temperature_mae_K"] for item in items),
