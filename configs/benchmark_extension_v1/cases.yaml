@@ -1,0 +1,141 @@
+schema_version: 1
+name: benchmark_extension_v1
+description: Controlled ChipTherm benchmark extension with ATPlace-style 2.5D package families.
+defaults:
+  ambient_K: 318.15
+  grid_rows: 64
+  grid_cols: 64
+  min_spacing_mm: 0.5
+  power_workload_multipliers:
+    idle: 0.25
+    nominal: 1.0
+    peak: 1.25
+  chiplet_type_size_ranges_mm:
+    CPU: [3.5, 10.0]
+    GPU: [5.0, 13.0]
+    NPU: [4.0, 11.0]
+    HBM: [3.0, 7.5]
+    DRAM: [3.0, 8.0]
+    IO: [2.5, 7.0]
+    ANALOG: [2.0, 6.0]
+    MEMS: [1.5, 5.0]
+  chiplet_type_power_density_ranges_W_per_mm2:
+    CPU: [0.35, 2.4]
+    GPU: [0.45, 2.6]
+    NPU: [0.35, 2.2]
+    HBM: [0.04, 0.30]
+    DRAM: [0.04, 0.45]
+    IO: [0.03, 0.55]
+    ANALOG: [0.02, 0.60]
+    MEMS: [0.01, 0.40]
+cases:
+  - case_id: case11
+    split_role: train
+    purpose: sparse high-power accelerator islands with large whitespace
+    bump_type: x16
+    die_count: 8
+    nets_range: [700, 1400]
+    interposer_mm: [55.0, 48.0]
+    whitespace_range: [0.70, 0.78]
+    composition: {GPU: 3, CPU: 1, HBM: 2, IO: 1, NPU: 1}
+    placement_regime: sparse_islands
+    power_density_scale: 1.20
+  - case_id: case12
+    split_role: train
+    purpose: wide horizontal package with far-separated sources
+    bump_type: x16
+    die_count: 10
+    nets_range: [900, 1800]
+    interposer_mm: [72.0, 32.0]
+    whitespace_range: [0.62, 0.72]
+    composition: {GPU: 2, CPU: 2, HBM: 3, IO: 2, DRAM: 1}
+    placement_regime: horizontal_spread
+    power_density_scale: 1.05
+  - case_id: case13
+    split_role: train
+    purpose: mixed small and medium chiplets with moderate clustering
+    bump_type: x16
+    die_count: 12
+    nets_range: [1200, 2400]
+    interposer_mm: [46.0, 42.0]
+    whitespace_range: [0.50, 0.62]
+    composition: {CPU: 3, GPU: 2, HBM: 2, DRAM: 2, IO: 2, MEMS: 1}
+    placement_regime: mixed_clusters
+    power_density_scale: 1.00
+  - case_id: case14
+    split_role: train
+    purpose: dense many-die heterogeneous package
+    bump_type: x16
+    die_count: 20
+    nets_range: [2200, 4200]
+    interposer_mm: [50.0, 46.0]
+    whitespace_range: [0.38, 0.50]
+    composition: {CPU: 4, GPU: 4, HBM: 4, DRAM: 3, IO: 3, ANALOG: 2}
+    placement_regime: dense_mixed
+    power_density_scale: 0.95
+  - case_id: case15
+    split_role: train
+    purpose: edge-heavy IO and memory placement
+    bump_type: x16
+    die_count: 16
+    nets_range: [1800, 3600]
+    interposer_mm: [58.0, 58.0]
+    whitespace_range: [0.48, 0.60]
+    composition: {GPU: 3, CPU: 2, HBM: 4, IO: 5, DRAM: 2}
+    placement_regime: edge_heavy
+    power_density_scale: 1.00
+  - case_id: case16
+    split_role: train
+    purpose: asymmetric high-power source imbalance
+    bump_type: x16
+    die_count: 9
+    nets_range: [900, 1900]
+    interposer_mm: [45.0, 55.0]
+    whitespace_range: [0.58, 0.70]
+    composition: {GPU: 2, NPU: 2, CPU: 1, HBM: 2, IO: 2}
+    placement_regime: asymmetric_power
+    power_density_scale: 1.25
+  - case_id: case17
+    split_role: val
+    purpose: validation vertical package with clustered accelerators
+    bump_type: x16
+    die_count: 14
+    nets_range: [1500, 3000]
+    interposer_mm: [36.0, 68.0]
+    whitespace_range: [0.55, 0.68]
+    composition: {GPU: 3, CPU: 2, HBM: 3, IO: 3, DRAM: 2, NPU: 1}
+    placement_regime: vertical_clusters
+    power_density_scale: 1.05
+  - case_id: case18
+    split_role: val
+    purpose: validation compact high-count memory-rich package
+    bump_type: x16
+    die_count: 24
+    nets_range: [2400, 4800]
+    interposer_mm: [54.0, 44.0]
+    whitespace_range: [0.34, 0.46]
+    composition: {CPU: 4, GPU: 3, HBM: 6, DRAM: 4, IO: 5, ANALOG: 2}
+    placement_regime: compact_high_count
+    power_density_scale: 0.90
+  - case_id: case19
+    split_role: test
+    purpose: held-out sparse corner-dominated high-power family
+    bump_type: x16
+    die_count: 7
+    nets_range: [600, 1300]
+    interposer_mm: [64.0, 64.0]
+    whitespace_range: [0.74, 0.82]
+    composition: {GPU: 2, NPU: 1, CPU: 1, HBM: 2, IO: 1}
+    placement_regime: corner_hotspot
+    power_density_scale: 1.30
+  - case_id: case20
+    split_role: test
+    purpose: held-out elongated dense/edge mixed package
+    bump_type: x16
+    die_count: 18
+    nets_range: [2000, 3900]
+    interposer_mm: [78.0, 38.0]
+    whitespace_range: [0.44, 0.58]
+    composition: {GPU: 4, CPU: 3, HBM: 4, IO: 4, DRAM: 2, MEMS: 1}
+    placement_regime: elongated_edge_mixed
+    power_density_scale: 1.05

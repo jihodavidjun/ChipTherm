@@ -53,6 +53,7 @@ def main() -> int:
     parser.add_argument("--timed-batches", default=None, type=int)
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--compare-cached-index", default=None, type=Path)
+    parser.add_argument("--sample-selection", default="stratified", choices=["stratified", "prefix"])
     parser.add_argument("--precision", default="fp32", choices=["fp32", "fp16", "bf16"])
     parser.add_argument("--inference-mode", action="store_true")
     parser.add_argument("--channels-last", action="store_true")
@@ -87,12 +88,11 @@ def main() -> int:
         device_summation=args.device_summation,
         non_blocking_transfer=args.non_blocking_transfer,
     )
+    canonical_rows_all = read_rows(args.index)
+    canonical_rows = select_rows(canonical_rows_all, max_samples=args.max_samples, mode=args.sample_selection)
     cached_rows = read_rows(args.compare_cached_index) if args.compare_cached_index else None
     if cached_rows is not None:
-        canonical_rows = read_rows(args.index)
-        if args.max_samples is not None:
-            canonical_rows = canonical_rows[: args.max_samples]
-            cached_rows = cached_rows[: args.max_samples]
+        cached_rows = cached_rows_for_selected(cached_rows, canonical_rows)
         validate_cached_rows(canonical_rows, cached_rows, expected_source_hash=integrated.source_checkpoint_sha256)
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
@@ -105,6 +105,7 @@ def main() -> int:
                 integrated=integrated,
                 index=args.index,
                 cached_rows=cached_rows,
+                selected_rows=canonical_rows,
                 out_dir=out_dir,
                 package_batch_size=package_batch_size,
                 source_batch_size=source_batch_size,
@@ -113,6 +114,7 @@ def main() -> int:
                 profile_components=args.profile_components,
                 save_predictions=args.save_predictions and primary_payload is None,
                 max_samples=args.max_samples,
+                sample_selection=args.sample_selection,
                 warmup_batches=args.warmup_batches,
                 timed_batches=args.timed_batches if (len(args.package_batch_size) > 1 or len(args.source_batch_size) > 1) else None,
                 inference_mode=args.inference_mode,
@@ -164,6 +166,7 @@ def evaluate_once(
     integrated: IntegratedChipThermModel,
     index: Path,
     cached_rows: list[dict[str, str]] | None,
+    selected_rows: list[dict[str, str]],
     out_dir: Path,
     package_batch_size: int,
     source_batch_size: int,
@@ -172,14 +175,14 @@ def evaluate_once(
     profile_components: bool,
     save_predictions: bool,
     max_samples: int | None,
+    sample_selection: str,
     warmup_batches: int,
     timed_batches: int | None,
     inference_mode: bool,
     pinned_memory: bool,
 ) -> dict[str, Any]:
     dataset = ChipThermDataset(index, target="residual", return_metadata=True, return_graph=integrated.graph_enabled)
-    if max_samples is not None:
-        dataset.rows = dataset.rows[: int(max_samples)]
+    dataset.rows = list(selected_rows)
     loader = DataLoader(
         dataset,
         batch_size=package_batch_size,
@@ -204,6 +207,8 @@ def evaluate_once(
             "source_superposition_base": MetricAccumulator(),
         }
     )
+    case_sample_counts: dict[str, int] = defaultdict(int)
+    case_source_counts: dict[str, int] = defaultdict(int)
     equivalence = EquivalenceAccumulator()
     runtime = RuntimeAccumulator()
     prediction_dir = out_dir / "predictions"
@@ -268,6 +273,8 @@ def evaluate_once(
         sample_uids = metadata_values(batch["metadata"], "sample_uid", batch_size)
         for i, case_id in enumerate(case_ids):
             key = str(case_id)
+            case_sample_counts[key] += 1
+            case_source_counts[key] += int(result["source_counts"][i])
             by_case[key]["final_temperature"].update(final[i : i + 1], temperature[i : i + 1])
             by_case[key]["cnn_only_temperature"].update(cnn_only[i : i + 1], temperature[i : i + 1])
             by_case[key]["source_superposition_base"].update(base[i : i + 1], temperature[i : i + 1])
@@ -302,6 +309,7 @@ def evaluate_once(
         },
     }
     runtime_payload = runtime.compute()
+    add_gpu_model_runtime(runtime_payload)
     if device.type == "cuda":
         runtime_payload["peak_cuda_memory_allocated_bytes"] = int(torch.cuda.max_memory_allocated(device))
         runtime_payload["peak_cuda_memory_reserved_bytes"] = int(torch.cuda.max_memory_reserved(device))
@@ -324,6 +332,8 @@ def evaluate_once(
             "source_batch_size": source_batch_size,
             "profile_components": profile_components,
             "max_samples": max_samples,
+            "sample_selection": sample_selection if max_samples is not None else "full",
+            "selected_sample_count": len(selected_rows),
             "warmup_batches": warmup_batches,
             "timed_batches": timed_batches,
             "warning_tolerance_K": WARNING_TOLERANCE_K,
@@ -339,6 +349,11 @@ def evaluate_once(
         "max": float(source_counts_array.max()) if source_counts_array.size else None,
         "p50": float(np.percentile(source_counts_array, 50)) if source_counts_array.size else None,
         "p95": float(np.percentile(source_counts_array, 95)) if source_counts_array.size else None,
+    }
+    metrics_payload["case_sample_counts"] = dict(sorted(case_sample_counts.items()))
+    metrics_payload["case_mean_source_counts"] = {
+        case_id: float(case_source_counts[case_id] / max(count, 1))
+        for case_id, count in sorted(case_sample_counts.items())
     }
     return {
         "num_samples": final_acc.num_samples,
@@ -578,14 +593,24 @@ class DifferenceAccumulator:
 
 def runtime_summary_row(package_batch_size: int, source_batch_size: int, payload: dict[str, Any]) -> dict[str, Any]:
     runtime = payload["runtime"]
+    metrics = payload["metrics_payload"]
     row = {
         "package_batch_size": package_batch_size,
         "source_batch_size": source_batch_size,
         "num_packages": runtime.get("num_packages"),
         "num_sources": runtime.get("num_sources"),
+        "mean_sources_per_package": (
+            float(runtime.get("num_sources", 0)) / max(float(runtime.get("num_packages", 0)), 1.0)
+            if runtime.get("num_packages")
+            else None
+        ),
+        "case_sample_counts_json": json.dumps(metrics.get("case_sample_counts", {}), sort_keys=True),
+        "case_mean_source_counts_json": json.dumps(metrics.get("case_mean_source_counts", {}), sort_keys=True),
         "runtime_per_package_s": runtime.get("runtime_per_package_s"),
         "runtime_per_source_s": runtime.get("runtime_per_source_s"),
         "throughput_packages_per_s": runtime.get("throughput_packages_per_s"),
+        "gpu_model_runtime_per_package_s": runtime.get("gpu_model_runtime_per_package_s"),
+        "gpu_model_throughput_packages_per_s": runtime.get("gpu_model_throughput_packages_per_s"),
         "speedup_vs_hotspot": runtime.get("speedup_vs_hotspot"),
         "peak_cuda_memory_allocated_bytes": runtime.get("peak_cuda_memory_allocated_bytes"),
     }
@@ -685,6 +710,70 @@ def validate_cached_rows(
             )
 
 
+def select_rows(rows: list[dict[str, str]], *, max_samples: int | None, mode: str) -> list[dict[str, str]]:
+    if max_samples is None or int(max_samples) >= len(rows):
+        return list(rows)
+    limit = int(max_samples)
+    if limit <= 0:
+        raise SystemExit("--max-samples must be positive")
+    if mode == "prefix":
+        return list(rows[:limit])
+    if mode != "stratified":
+        raise SystemExit(f"unsupported sample selection mode: {mode}")
+    original_order = {str(row["sample_uid"]): index for index, row in enumerate(rows)}
+    by_case: dict[str, list[dict[str, str]]] = defaultdict(list)
+    for row in rows:
+        by_case[str(row.get("case_id", ""))].append(row)
+    cases = sorted(by_case)
+    base = limit // max(len(cases), 1)
+    remainder = limit % max(len(cases), 1)
+    selected: list[dict[str, str]] = []
+    for case_index, case_id in enumerate(cases):
+        target = base + (1 if case_index < remainder else 0)
+        if target <= 0:
+            continue
+        case_rows = sorted(
+            by_case[case_id],
+            key=lambda row: (
+                int(float(row.get("num_chiplets") or row.get("source_count") or 0)),
+                str(row.get("sample_uid", "")),
+            ),
+        )
+        selected.extend(evenly_spaced(case_rows, min(target, len(case_rows))))
+    return sorted(selected, key=lambda row: original_order[str(row["sample_uid"])])
+
+
+def evenly_spaced(rows: list[dict[str, str]], count: int) -> list[dict[str, str]]:
+    if count >= len(rows):
+        return list(rows)
+    if count == 1:
+        return [rows[len(rows) // 2]]
+    indices = np.linspace(0, len(rows) - 1, num=count)
+    selected_indices = []
+    seen = set()
+    for value in indices:
+        index = int(round(float(value)))
+        while index in seen and index + 1 < len(rows):
+            index += 1
+        while index in seen and index - 1 >= 0:
+            index -= 1
+        if index not in seen:
+            seen.add(index)
+            selected_indices.append(index)
+    return [rows[index] for index in selected_indices[:count]]
+
+
+def cached_rows_for_selected(cached_rows: list[dict[str, str]], selected_rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    by_uid = {str(row["sample_uid"]): row for row in cached_rows}
+    result: list[dict[str, str]] = []
+    for row in selected_rows:
+        uid = str(row["sample_uid"])
+        if uid not in by_uid:
+            raise SystemExit(f"cached comparison index is missing selected sample_uid {uid}")
+        result.append(by_uid[uid])
+    return result
+
+
 def read_rows(path: Path | None) -> list[dict[str, str]]:
     if path is None:
         return []
@@ -706,6 +795,38 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer = csv.DictWriter(fp, fieldnames=columns)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def add_gpu_model_runtime(runtime_payload: dict[str, Any]) -> None:
+    components = runtime_payload.get("components", {})
+    gpu_keys = (
+        "source_host_to_device_transfer_s",
+        "source_input_normalization_s",
+        "source_response_model_inference_s",
+        "source_kw_denormalization_s",
+        "source_power_scaling_s",
+        "source_segment_sum_s",
+        "ambient_base_reconstruction_s",
+        "residual_input_assembly_s",
+        "residual_total_forward_s",
+        "final_reconstruction_s",
+    )
+    total = 0.0
+    present = []
+    for key in gpu_keys:
+        component = components.get(key)
+        if component:
+            total += float(component.get("total_s", 0.0))
+            present.append(key)
+    packages = float(runtime_payload.get("num_packages") or 0.0)
+    runtime_payload["gpu_model_runtime_total_s"] = total
+    runtime_payload["gpu_model_runtime_per_package_s"] = total / max(packages, 1.0) if packages else None
+    runtime_payload["gpu_model_throughput_packages_per_s"] = packages / total if total > 0 else None
+    runtime_payload["gpu_model_runtime_components"] = present
+    runtime_payload["gpu_model_runtime_note"] = (
+        "This is model-side tensor work after DataLoader timing and excludes package YAML/JSON parsing and source raster construction. "
+        "With host summation it still includes source_segment_sum_s because it is part of the model assembly path."
+    )
 
 
 def write_case_metrics(path: Path, case_metrics: dict[str, dict[str, dict[str, float]]]) -> None:

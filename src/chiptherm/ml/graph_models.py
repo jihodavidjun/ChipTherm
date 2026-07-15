@@ -265,28 +265,28 @@ class ChipletMessagePassingGNN(nn.Module):
             src = torch.empty(0, dtype=torch.long, device=h.device)
             dst = torch.empty(0, dtype=torch.long, device=h.device)
         for message_mlp, update_mlp, norm in zip(self.message_mlps, self.update_mlps, self.norms):
-            aggregate = torch.zeros_like(h)
+            aggregate = torch.zeros(h.shape, dtype=torch.float32, device=h.device)
             if src.numel() > 0:
                 parts = [h[src], h[dst]]
                 if self.use_edge_features:
                     parts.append(edge_h)
                 messages = message_mlp(torch.cat(parts, dim=1))
-                aggregate.index_add_(0, dst, messages)
+                aggregate.index_add_(0, dst, messages.float())
                 if self.aggregation == "mean":
-                    degree = torch.zeros(h.shape[0], dtype=h.dtype, device=h.device)
-                    degree.index_add_(0, dst, torch.ones(dst.shape[0], dtype=h.dtype, device=h.device))
+                    degree = torch.zeros(h.shape[0], dtype=torch.float32, device=h.device)
+                    degree.index_add_(0, dst, torch.ones(dst.shape[0], dtype=torch.float32, device=h.device))
                     aggregate = aggregate / degree.clamp_min(1.0).unsqueeze(1)
-            update = update_mlp(torch.cat([h, aggregate], dim=1))
+            update = update_mlp(torch.cat([h, aggregate.to(dtype=h.dtype)], dim=1))
             h = norm(h + update)
-        graph_embedding = torch.zeros(num_graphs, h.shape[1], dtype=h.dtype, device=h.device)
-        graph_embedding.index_add_(0, node_batch, h)
-        graph_counts = torch.zeros(num_graphs, dtype=h.dtype, device=h.device)
-        graph_counts.index_add_(0, node_batch, torch.ones(h.shape[0], dtype=h.dtype, device=h.device))
+        graph_embedding = torch.zeros(num_graphs, h.shape[1], dtype=torch.float32, device=h.device)
+        graph_embedding.index_add_(0, node_batch, h.float())
+        graph_counts = torch.zeros(num_graphs, dtype=torch.float32, device=h.device)
+        graph_counts.index_add_(0, node_batch, torch.ones(h.shape[0], dtype=torch.float32, device=h.device))
         graph_embedding = graph_embedding / graph_counts.clamp_min(1.0).unsqueeze(1)
         result = {
             "node_embeddings": h,
             "node_raster_values": self.node_raster_head(h),
-            "graph_embedding": self.global_head(graph_embedding),
+            "graph_embedding": self.global_head(graph_embedding.to(dtype=h.dtype)),
         }
         if return_diagnostics:
             result["encoded_edges"] = edge_h
@@ -324,27 +324,27 @@ class ChipletMessagePassingGNN(nn.Module):
             dst = torch.empty(0, dtype=torch.long, device=h.device)
         start = tic()
         for message_mlp, update_mlp, norm in zip(self.message_mlps, self.update_mlps, self.norms):
-            aggregate = torch.zeros_like(h)
+            aggregate = torch.zeros(h.shape, dtype=torch.float32, device=h.device)
             if src.numel() > 0:
                 parts = [h[src], h[dst]]
                 if self.use_edge_features:
                     parts.append(edge_h)
                 messages = message_mlp(torch.cat(parts, dim=1))
-                aggregate.index_add_(0, dst, messages)
+                aggregate.index_add_(0, dst, messages.float())
                 if self.aggregation == "mean":
-                    degree = torch.zeros(h.shape[0], dtype=h.dtype, device=h.device)
-                    degree.index_add_(0, dst, torch.ones(dst.shape[0], dtype=h.dtype, device=h.device))
+                    degree = torch.zeros(h.shape[0], dtype=torch.float32, device=h.device)
+                    degree.index_add_(0, dst, torch.ones(dst.shape[0], dtype=torch.float32, device=h.device))
                     aggregate = aggregate / degree.clamp_min(1.0).unsqueeze(1)
-            update = update_mlp(torch.cat([h, aggregate], dim=1))
+            update = update_mlp(torch.cat([h, aggregate.to(dtype=h.dtype)], dim=1))
             h = norm(h + update)
         toc("message_passing_s", start)
         start = tic()
-        graph_embedding = torch.zeros(num_graphs, h.shape[1], dtype=h.dtype, device=h.device)
-        graph_embedding.index_add_(0, node_batch, h)
-        graph_counts = torch.zeros(num_graphs, dtype=h.dtype, device=h.device)
-        graph_counts.index_add_(0, node_batch, torch.ones(h.shape[0], dtype=h.dtype, device=h.device))
+        graph_embedding = torch.zeros(num_graphs, h.shape[1], dtype=torch.float32, device=h.device)
+        graph_embedding.index_add_(0, node_batch, h.float())
+        graph_counts = torch.zeros(num_graphs, dtype=torch.float32, device=h.device)
+        graph_counts.index_add_(0, node_batch, torch.ones(h.shape[0], dtype=torch.float32, device=h.device))
         graph_embedding = graph_embedding / graph_counts.clamp_min(1.0).unsqueeze(1)
-        graph_embedding = self.global_head(graph_embedding)
+        graph_embedding = self.global_head(graph_embedding.to(dtype=h.dtype))
         node_raster_values = self.node_raster_head(h)
         toc("graph_pooling_s", start)
         return {
@@ -369,7 +369,7 @@ def rasterize_node_values_legacy(
     node_batch = graph["node_batch"].long()
     num_graphs = int(graph["num_graphs"].item()) if torch.is_tensor(graph["num_graphs"]) else int(graph["num_graphs"])
     channels = int(node_values.shape[1])
-    maps = node_values.new_zeros((num_graphs, channels, height, width))
+    maps = torch.zeros((num_graphs, channels, height, width), dtype=torch.float32, device=node_values.device)
     rows = torch.arange(height, dtype=node_values.dtype, device=node_values.device) + 0.5
     cols = torch.arange(width, dtype=node_values.dtype, device=node_values.device) + 0.5
     yy_unit, xx_unit = torch.meshgrid(rows / float(height), cols / float(width), indexing="ij")
@@ -389,8 +389,8 @@ def rasterize_node_values_legacy(
             dy = torch.clamp(torch.maximum(y0 - yy, yy - y1), min=0.0)
             distance = torch.sqrt(dx * dx + dy * dy + EPSILON)
             weight = torch.exp(-distance / decay)
-            maps[graph_index] += node_values[node_index, :, None, None] * weight[None, :, :]
-    return maps
+            maps[graph_index] += node_values[node_index, :, None, None].float() * weight[None, :, :].float()
+    return maps.to(dtype=node_values.dtype)
 
 
 def rasterize_node_values_vectorized(
@@ -423,18 +423,18 @@ def rasterize_node_values_vectorized(
     pixels = int(height) * int(width)
     if cache is not None:
         validate_raster_cache(cache, graph, height=height, width=width, halo_decay_mm=halo_decay_mm)
-        weights = cache.raster_weights.to(device=node_values.device, dtype=node_values.dtype)
+        weights = cache.raster_weights.to(device=node_values.device, dtype=torch.float32)
         node_batch = cache.node_batch.to(device=node_values.device)
         num_graphs = int(cache.num_graphs)
     else:
-        weights = compute_node_raster_weights(graph, height=height, width=width, halo_decay_mm=halo_decay_mm, dtype=node_values.dtype)
-    maps_flat = node_values.new_zeros((num_graphs, channels, pixels))
+        weights = compute_node_raster_weights(graph, height=height, width=width, halo_decay_mm=halo_decay_mm, dtype=torch.float32)
+    maps_flat = torch.zeros((num_graphs, channels, pixels), dtype=torch.float32, device=node_values.device)
     chunk = max(int(channel_chunk_size), 1)
     for start in range(0, channels, chunk):
         end = min(start + chunk, channels)
-        contribution = weights[:, None, :] * node_values[:, start:end, None]
+        contribution = weights[:, None, :] * node_values[:, start:end, None].float()
         maps_flat[:, start:end, :].index_add_(0, node_batch, contribution)
-    return maps_flat.view(num_graphs, channels, height, width)
+    return maps_flat.view(num_graphs, channels, height, width).to(dtype=node_values.dtype)
 
 
 def compute_node_raster_weights(
@@ -648,8 +648,9 @@ class PairwiseThermalImpedanceOperator(nn.Module):
             k_values = self.pairwise_mlp(pair_input).squeeze(1)
             source_power = node_features.index_select(0, src)[:, self.source_power_feature_index]
             pairwise_contributions = source_power * k_values
-            pairwise_node_sums = node_features.new_zeros(node_count)
-            pairwise_node_sums.index_add_(0, dst, pairwise_contributions)
+            pairwise_node_sums_fp32 = torch.zeros(node_count, dtype=torch.float32, device=node_features.device)
+            pairwise_node_sums_fp32.index_add_(0, dst, pairwise_contributions.float())
+            pairwise_node_sums = pairwise_node_sums_fp32.to(dtype=pairwise_contributions.dtype)
         else:
             k_values = node_features.new_empty((0,))
             pairwise_contributions = node_features.new_empty((0,))
@@ -806,7 +807,7 @@ def pairwise_basis_superpose(
     node_batch = graph["node_batch"].long()
     num_graphs = int(package_size.shape[0])
     pixels = int(height) * int(width)
-    output = weighted_coefficients.new_zeros((num_graphs, pixels))
+    output = torch.zeros((num_graphs, pixels), dtype=torch.float32, device=weighted_coefficients.device)
     if edge_index.numel() == 0:
         return output
     src_all = edge_index[0].long()
@@ -832,9 +833,9 @@ def pairwise_basis_superpose(
             basis_rank=basis_rank,
             halo_decay_mm=halo_decay_mm,
         )
-        contribution = (weighted_coefficients[start:end, :, None] * basis).sum(dim=1)
+        contribution = (weighted_coefficients[start:end, :, None].float() * basis.float()).sum(dim=1)
         output.index_add_(0, graph_index, contribution)
-    return output
+    return output.to(dtype=weighted_coefficients.dtype)
 
 
 def pairwise_basis_chunk(
