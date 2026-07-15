@@ -35,6 +35,7 @@ from scripts.build_chiptherm_extension import (
     _load_active_index,
     _missing_label_uids_from_index,
     _rebase_stage_indexes,
+    _schedule_decision,
     _write_hotspot_reports,
 )
 from scripts.rebase_chiptherm_index_paths import rebase_value
@@ -175,6 +176,27 @@ def _test_exact_two_sample_retry_bookkeeping(root: Path) -> None:
     assert {row["sample_uid"] for row in active_rows} == set(failed_uids)
     missing = _missing_label_uids_from_index(active_rows, stage)
     assert missing == set(failed_uids)
+    for uid in failed_uids:
+        case_id = uid.split("_sample_", 1)[0].rsplit("_", 1)[1]
+        sample_num = int(uid.rsplit("_", 1)[1])
+        sample_dir = stage / case_id / f"sample_{sample_num:06d}"
+        row = next(row for row in active_rows if row["sample_uid"] == uid)
+        decision = _schedule_decision(
+            uid=uid,
+            sample_dir=sample_dir,
+            active_row=row,
+            out_dir=stage,
+            resume=True,
+            max_retries=2,
+            source_validation_passed=True,
+            source_validation_problems=[],
+        )
+        assert decision["final_should_schedule"], decision
+        assert decision["retry_count"] == 0
+        assert decision["sample_directory_exists"]
+        assert decision["source_directory_exists"]
+        assert not decision["path_y_exists"]
+        assert decision["schedule_reason"] == "scheduled because durable label is missing"
     _write_hotspot_reports(
         stage,
         [],

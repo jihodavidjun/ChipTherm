@@ -125,6 +125,7 @@ def main() -> int:
     if args.run_hotspot and rebased_values:
         print(f"Auto-rebased portable path values across active CSVs: {rebased_values}")
     active_index_path, active_index_rows = _load_active_index(out_dir)
+    active_by_uid = {row.get("sample_uid", ""): row for row in active_index_rows}
     missing_label_uids = _missing_label_uids_from_index(active_index_rows, out_dir) if args.retry_missing_labels else set()
     requested_uids = set(args.sample_uids or []) | missing_label_uids
     selected_uids = set(requested_uids)
@@ -185,30 +186,35 @@ def main() -> int:
             validations.append({"sample_uid": sample_uid, "passed": validation["passed"], "problems": validation["problems"]})
             hotspot_result = _existing_hotspot_status(sample_dir)
             if args.run_hotspot and is_requested:
+                active_row = active_by_uid.get(sample_uid, {})
+                decision = _schedule_decision(
+                    uid=sample_uid,
+                    sample_dir=sample_dir,
+                    active_row=active_row,
+                    out_dir=out_dir,
+                    resume=args.resume,
+                    max_retries=args.max_retries,
+                    source_validation_passed=validation["passed"],
+                    source_validation_problems=validation["problems"],
+                )
+                _print_schedule_decision(decision)
                 if not validation["passed"]:
-                    unscheduled_reasons[sample_uid] = "source validation failed: " + "; ".join(validation["problems"])
-                else:
-                    should_run, reason = _should_run_hotspot(
-                        sample_dir=sample_dir,
-                        resume=args.resume,
-                        retry_failed=args.retry_failed,
-                        selected_uids=selected_uids,
+                    unscheduled_reasons[sample_uid] = decision["exact_exclusion_reason"]
+                elif decision["final_should_schedule"]:
+                    hotspot_jobs.append(
+                        {
+                            "sample_uid": sample_uid,
+                            "case_id": case["case_id"],
+                            "scenario_path": str(paths["scenario_path"].resolve()),
+                            "sample_dir": str(sample_dir.resolve()),
+                        }
                     )
-                    if should_run:
-                        hotspot_jobs.append(
-                            {
-                                "sample_uid": sample_uid,
-                                "case_id": case["case_id"],
-                                "scenario_path": str(paths["scenario_path"].resolve()),
-                                "sample_dir": str(sample_dir.resolve()),
-                            }
-                        )
-                        scheduled_uids.add(sample_uid)
-                        hotspot_result = {"status": "queued", "runtime_s": ""}
-                    else:
-                        unscheduled_reasons[sample_uid] = reason
-                        if reason == "valid label exists and --resume was set":
-                            skipped_valid_uids.add(sample_uid)
+                    scheduled_uids.add(sample_uid)
+                    hotspot_result = {"status": "queued", "runtime_s": ""}
+                else:
+                    unscheduled_reasons[sample_uid] = decision["exact_exclusion_reason"]
+                    if decision["resume_skip_reason"]:
+                        skipped_valid_uids.add(sample_uid)
             sample_stats.append(stats)
             rows.append(
                 row_for_sample(
@@ -617,29 +623,95 @@ def _resolve_index_path(value: str, out_dir: Path) -> Path:
     return REPO_ROOT / path
 
 
-def _should_run_hotspot(*, sample_dir: Path, resume: bool, retry_failed: bool, selected_uids: set[str]) -> tuple[bool, str]:
-    valid = _label_valid(sample_dir)
-    if valid and resume:
-        return False, "valid label exists and --resume was set"
+def _schedule_decision(
+    *,
+    uid: str,
+    sample_dir: Path,
+    active_row: dict[str, str],
+    out_dir: Path,
+    resume: bool,
+    max_retries: int,
+    source_validation_passed: bool,
+    source_validation_problems: list[str],
+) -> dict[str, Any]:
+    y_path_string = active_row.get("y_path", "")
+    resolved_y_path = _resolve_index_path(y_path_string, out_dir) if y_path_string else sample_dir / "parsed/temp_layer0.npy"
+    y_path_exists = resolved_y_path.exists()
+    durable_valid = _label_valid_path(resolved_y_path)
     manifest_path = sample_dir / "manifest.json"
-    failed = False
-    if manifest_path.exists():
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            failed = manifest.get("hotspot_status") == "failed" or manifest.get("success") is False
-        except Exception:
-            failed = True
-    if retry_failed:
-        if (not valid) and (failed or bool(selected_uids)):
-            return True, "missing/failed selected for retry"
-        return False, "not failed and not explicitly selected"
-    if not valid:
-        return True, "missing label"
-    return False, "valid label exists"
+    manifest = _read_manifest(manifest_path)
+    prior_status = str(manifest.get("hotspot_status") or manifest.get("status") or "none") if manifest else "none"
+    failure_record_presence = bool(manifest and (manifest.get("success") is False or manifest.get("failure_category")))
+    retry_count = int(manifest.get("attempts", 0) or 0) if manifest else 0
+    retry_exhausted = retry_count > max_retries
+    resume_skip_reason = "valid durable label exists and --resume was set" if resume and durable_valid else ""
+    if not source_validation_passed:
+        should_schedule = False
+        reason = "source validation failed: " + "; ".join(source_validation_problems)
+    elif retry_exhausted:
+        should_schedule = False
+        reason = f"retry count {retry_count} exceeds max retries {max_retries}"
+    elif durable_valid:
+        should_schedule = False
+        reason = resume_skip_reason or "valid durable label exists"
+    else:
+        should_schedule = True
+        reason = "scheduled because durable label is missing"
+    return {
+        "uid": uid,
+        "y_path_string": y_path_string,
+        "resolved_y_path": str(resolved_y_path),
+        "path_y_exists": y_path_exists,
+        "sample_directory_exists": sample_dir.exists(),
+        "source_directory_exists": (sample_dir / "source").exists(),
+        "prior_status": prior_status,
+        "failure_record_presence": failure_record_presence,
+        "retry_count": retry_count,
+        "retry_exhausted": retry_exhausted,
+        "resume_skip_reason": resume_skip_reason,
+        "final_should_schedule": should_schedule,
+        "exact_exclusion_reason": "" if should_schedule else reason,
+        "schedule_reason": reason if should_schedule else "",
+    }
+
+
+def _print_schedule_decision(decision: dict[str, Any]) -> None:
+    uid = decision["uid"]
+    if decision["final_should_schedule"]:
+        print(f"UID {uid}: {decision['schedule_reason']}")
+    else:
+        print(f"UID {uid}: not scheduled because {decision['exact_exclusion_reason']}")
+    for key in (
+        "y_path_string",
+        "resolved_y_path",
+        "path_y_exists",
+        "sample_directory_exists",
+        "source_directory_exists",
+        "prior_status",
+        "failure_record_presence",
+        "retry_count",
+        "retry_exhausted",
+        "resume_skip_reason",
+        "final_should_schedule",
+        "exact_exclusion_reason",
+    ):
+        print(f"  {key}: {decision[key]}")
+
+
+def _read_manifest(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"success": False, "failure_category": "manifest_parse_failure"}
 
 
 def _label_valid(sample_dir: Path) -> bool:
-    y_path = sample_dir / "parsed/temp_layer0.npy"
+    return _label_valid_path(sample_dir / "parsed/temp_layer0.npy")
+
+
+def _label_valid_path(y_path: Path) -> bool:
     if not y_path.exists():
         return False
     try:
