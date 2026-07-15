@@ -5,6 +5,7 @@ import argparse
 import csv
 import json
 import os
+import shutil
 import shlex
 import subprocess
 import sys
@@ -25,7 +26,7 @@ from chiptherm.benchmark_extension import (
     DEFAULT_CONFIG_PATH,
     estimate_storage,
     file_sha256,
-    generate_sample,
+    generate_valid_sample,
     layout_statistics,
     load_extension_config,
     row_for_sample,
@@ -57,7 +58,9 @@ def main() -> int:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--retry-failed", action="store_true")
     parser.add_argument("--retry-missing-labels", action="store_true")
+    parser.add_argument("--repair-invalid-sources", action="store_true", help="Regenerate durable source files that fail hard source validation.")
     parser.add_argument("--max-retries", type=int, default=2)
+    parser.add_argument("--max-layout-attempts", type=int, default=100)
     parser.add_argument("--sample-uids", nargs="+", default=None)
     parser.add_argument("--keep-hotspot-workdirs", action="store_true")
     parser.add_argument("--cleanup-hotspot-workdirs", action="store_true")
@@ -93,6 +96,8 @@ def main() -> int:
         raise SystemExit("--hotspot-workers must be positive")
     if args.max_retries < 0:
         raise SystemExit("--max-retries must be nonnegative")
+    if args.max_layout_attempts <= 0:
+        raise SystemExit("--max-layout-attempts must be positive")
 
     plan = {
         "schema_version": 1,
@@ -152,24 +157,20 @@ def main() -> int:
                 matched_uids.add(sample_uid)
             sample_dir = case_dir / f"sample_{sample_index:06d}"
             if args.resume and (sample_dir / "source/scenario.yaml").exists():
-                layout_path = sample_dir / "source/layout.json"
-                power_path = sample_dir / "source/power.yaml"
-                layout = json.loads(layout_path.read_text(encoding="utf-8"))
-                import yaml
-
-                power = yaml.safe_load(power_path.read_text(encoding="utf-8")) or {}
-                paths = {
-                    "source_dir": sample_dir / "source",
-                    "scenario_path": sample_dir / "source/scenario.yaml",
-                    "layout_path": layout_path,
-                    "power_path": power_path,
-                    "package_path": sample_dir / "source/package.yaml",
-                    "hotspot_path": sample_dir / "source/hotspot.yaml",
-                    "benchmark_path": sample_dir / "source/benchmark.yaml",
-                    "y_path": sample_dir / "parsed/temp_layer0.npy",
-                }
+                layout, power, benchmark, paths = _load_sample_sources(sample_dir)
             else:
-                layout, power, benchmark = generate_sample(case, config["defaults"], sample_index, args.seed)
+                layout, power, benchmark, attempt_info = generate_valid_sample(
+                    case,
+                    config["defaults"],
+                    sample_index,
+                    args.seed,
+                    max_attempts=args.max_layout_attempts,
+                )
+                if int(attempt_info["attempt"]) > 0:
+                    print(
+                        f"UID {sample_uid}: generated valid source on attempt {attempt_info['attempt']} "
+                        f"(candidate_seed={attempt_info['candidate_seed']})"
+                    )
                 paths = write_sample_sources(
                     sample_dir,
                     sample_uid,
@@ -183,6 +184,33 @@ def main() -> int:
             stats["case_id"] = case["case_id"]
             stats["split"] = case["split_role"]
             validation = validate_sample_sources(paths["scenario_path"], case)
+            if not validation["passed"] and args.repair_invalid_sources and is_requested:
+                old_stats = stats
+                print(f"UID {sample_uid}: invalid source detected")
+                print(f"  old achieved metrics: {_format_source_metrics(old_stats)}")
+                print(f"  repairing invalid source")
+                layout, power, benchmark, paths, repair_info = _repair_invalid_source(
+                    sample_dir=sample_dir,
+                    sample_uid=sample_uid,
+                    case=case,
+                    defaults=config["defaults"],
+                    sample_index=sample_index,
+                    seed=args.seed,
+                    max_layout_attempts=args.max_layout_attempts,
+                    cleanup_hotspot_workdirs=args.cleanup_hotspot_workdirs and not args.keep_hotspot_workdirs,
+                )
+                stats = layout_statistics(layout, power)
+                stats["sample_uid"] = sample_uid
+                stats["case_id"] = case["case_id"]
+                stats["split"] = case["split_role"]
+                validation = validate_sample_sources(paths["scenario_path"], case)
+                print(
+                    f"UID {sample_uid}: regenerated successfully on attempt {repair_info['attempt']} "
+                    f"(candidate_seed={repair_info['candidate_seed']})"
+                )
+                print(f"  new achieved metrics: {_format_source_metrics(stats)}")
+                if not validation["passed"]:
+                    raise SystemExit(f"repaired source for {sample_uid} still fails validation: {validation['problems']}")
             validations.append({"sample_uid": sample_uid, "passed": validation["passed"], "problems": validation["problems"]})
             hotspot_result = _existing_hotspot_status(sample_dir)
             if args.run_hotspot and is_requested:
@@ -231,6 +259,11 @@ def main() -> int:
     if args.run_hotspot and requested_uids and not matched_uids:
         _write_hotspot_reports(out_dir, [], workers=args.hotspot_workers, executable=Path(args.hotspot_executable or "unresolved"), requested_uids=sorted(requested_uids), matched_uids=[], scheduled_uids=[], skipped_valid_uids=[], unresolved_reasons={uid: "requested UID did not match generated sample grid" for uid in sorted(requested_uids)})
         raise SystemExit(f"requested UIDs matched zero rows: {sorted(requested_uids)}")
+
+    source_report = _write_source_validation_report(out_dir, validations)
+    if source_report["failed_count"]:
+        failed = [item["sample_uid"] for item in source_report["failed_samples"]]
+        print(f"Source validation failures: {source_report['failed_count']} ({failed})")
 
     if args.run_hotspot:
         print(f"Matched UIDs: {sorted(matched_uids)}")
@@ -485,6 +518,123 @@ def _samples_per_case(args: argparse.Namespace) -> int:
     if args.full:
         return 400
     return 50
+
+
+def _load_sample_sources(sample_dir: Path) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Path]]:
+    import yaml
+
+    paths = _source_paths(sample_dir)
+    layout = json.loads(paths["layout_path"].read_text(encoding="utf-8"))
+    power = yaml.safe_load(paths["power_path"].read_text(encoding="utf-8")) or {}
+    benchmark = {}
+    if paths["benchmark_path"].exists():
+        benchmark = yaml.safe_load(paths["benchmark_path"].read_text(encoding="utf-8")) or {}
+    return layout, power, benchmark, paths
+
+
+def _source_paths(sample_dir: Path) -> dict[str, Path]:
+    source_dir = sample_dir / "source"
+    return {
+        "source_dir": source_dir,
+        "scenario_path": source_dir / "scenario.yaml",
+        "layout_path": source_dir / "layout.json",
+        "power_path": source_dir / "power.yaml",
+        "package_path": source_dir / "package.yaml",
+        "hotspot_path": source_dir / "hotspot.yaml",
+        "benchmark_path": source_dir / "benchmark.yaml",
+        "y_path": sample_dir / "parsed/temp_layer0.npy",
+    }
+
+
+def _repair_invalid_source(
+    *,
+    sample_dir: Path,
+    sample_uid: str,
+    case: dict[str, Any],
+    defaults: dict[str, Any],
+    sample_index: int,
+    seed: int,
+    max_layout_attempts: int,
+    cleanup_hotspot_workdirs: bool,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Path], dict[str, Any]]:
+    layout, power, benchmark, attempt_info = generate_valid_sample(
+        case,
+        defaults,
+        sample_index,
+        seed,
+        max_attempts=max_layout_attempts,
+    )
+    tmp_sample_dir = sample_dir.parent / f"{sample_dir.name}.__repair_tmp__"
+    if tmp_sample_dir.exists():
+        shutil.rmtree(tmp_sample_dir)
+    try:
+        tmp_paths = write_sample_sources(tmp_sample_dir, sample_uid, layout, power, benchmark)
+        validation = validate_sample_sources(tmp_paths["scenario_path"], case)
+        if not validation["passed"]:
+            raise RuntimeError(f"temporary repaired source failed validation: {validation['problems']}")
+        final_source = sample_dir / "source"
+        final_source.mkdir(parents=True, exist_ok=True)
+        for filename in ("scenario.yaml", "layout.json", "power.yaml", "package.yaml", "hotspot.yaml", "benchmark.yaml"):
+            (tmp_sample_dir / "source" / filename).replace(final_source / filename)
+    finally:
+        if tmp_sample_dir.exists():
+            shutil.rmtree(tmp_sample_dir)
+    if cleanup_hotspot_workdirs:
+        hotspot_dir = sample_dir / "hotspot"
+        if hotspot_dir.exists():
+            for child in hotspot_dir.iterdir():
+                if child.is_file():
+                    child.unlink()
+                elif child.is_dir():
+                    shutil.rmtree(child)
+    _invalidate_stale_label(sample_dir)
+    return layout, power, benchmark, _source_paths(sample_dir), attempt_info
+
+
+def _invalidate_stale_label(sample_dir: Path) -> None:
+    for path in (
+        sample_dir / "parsed/temp_layer0.npy",
+        sample_dir / "parsed/temp_layer0.tmp.npy",
+        sample_dir / "manifest.json",
+    ):
+        if path.exists():
+            path.unlink()
+
+
+def _format_source_metrics(stats: dict[str, Any]) -> str:
+    keys = (
+        "whitespace_fraction",
+        "occupied_fraction",
+        "min_pairwise_edge_distance_mm",
+        "mean_power_density_W_per_mm2",
+        "max_power_density_W_per_mm2",
+        "total_power_W",
+    )
+    return ", ".join(f"{key}={float(stats[key]):.6g}" for key in keys if key in stats)
+
+
+def _write_source_validation_report(out_dir: Path, validations: list[dict[str, Any]]) -> dict[str, Any]:
+    failed = [item for item in validations if not item.get("passed")]
+    report = {
+        "schema_version": 1,
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "sample_count": len(validations),
+        "failed_count": len(failed),
+        "passed": not failed,
+        "failed_samples": failed,
+    }
+    (out_dir / "source_validation_report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    fields = ["sample_uid", "passed", "problems"]
+    rows = [
+        {
+            "sample_uid": item.get("sample_uid", ""),
+            "passed": item.get("passed", False),
+            "problems": "; ".join(item.get("problems", [])),
+        }
+        for item in validations
+    ]
+    _write_csv(out_dir / "source_validation_failures.csv", [row for row in rows if not row["passed"]], fields)
+    return report
 
 
 def _stage(args: argparse.Namespace, samples_per_case: int) -> str:

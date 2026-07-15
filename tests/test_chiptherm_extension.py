@@ -7,6 +7,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import numpy as np
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = REPO_ROOT / "src"
 if str(REPO_ROOT) not in sys.path:
@@ -18,6 +20,7 @@ from chiptherm.benchmark_extension import (
     approve_pilot,
     estimate_storage,
     generate_sample,
+    generate_valid_sample,
     layout_statistics,
     load_extension_config,
     read_index,
@@ -35,6 +38,7 @@ from scripts.build_chiptherm_extension import (
     _load_active_index,
     _missing_label_uids_from_index,
     _rebase_stage_indexes,
+    _repair_invalid_source,
     _schedule_decision,
     _write_hotspot_reports,
 )
@@ -48,6 +52,7 @@ def main() -> int:
         _test_approval_gate(root)
         _test_rebase_and_splits()
         _test_exact_two_sample_retry_bookkeeping(root)
+        _test_deterministic_source_repair(root)
     print("chiptherm extension tests passed")
     return 0
 
@@ -60,7 +65,7 @@ def _test_config_and_generation(root: Path) -> None:
     stats_rows = []
     validations = []
     for case in cases:
-        layout, power, benchmark = generate_sample(case, config["defaults"], sample_index=1, seed=123)
+        layout, power, benchmark, _ = generate_valid_sample(case, config["defaults"], sample_index=1, seed=123)
         stats = layout_statistics(layout, power)
         assert stats["chiplet_count"] == case["die_count"]
         low, high = case["whitespace_range"]
@@ -210,6 +215,63 @@ def _test_exact_two_sample_retry_bookkeeping(root: Path) -> None:
     )
     assert (stage / "hotspot_generation_report.json").exists()
     assert (stage / "hotspot_failures.csv").exists()
+
+
+def _test_deterministic_source_repair(root: Path) -> None:
+    config = load_extension_config()
+    cases = {case["case_id"]: case for case in config["cases"]}
+    case = cases["case12"]
+    sample_index = 2
+    sample_uid = "benchmark_extension_v1_case12_sample_000002"
+    invalid_layout, invalid_power, invalid_benchmark = generate_sample(case, config["defaults"], sample_index=sample_index, seed=0)
+    invalid_stats = layout_statistics(invalid_layout, invalid_power)
+    assert invalid_stats["whitespace_fraction"] > float(case["whitespace_range"][1]) + 1e-6
+
+    repaired_layout_a, repaired_power_a, _, repair_info_a = generate_valid_sample(
+        case,
+        config["defaults"],
+        sample_index=sample_index,
+        seed=0,
+        max_attempts=100,
+    )
+    repaired_layout_b, repaired_power_b, _, repair_info_b = generate_valid_sample(
+        case,
+        config["defaults"],
+        sample_index=sample_index,
+        seed=0,
+        max_attempts=100,
+    )
+    assert repair_info_a["attempt"] > 0
+    assert repair_info_a["attempt"] == repair_info_b["attempt"]
+    assert repaired_layout_a == repaired_layout_b
+    assert repaired_power_a == repaired_power_b
+    assert repaired_layout_a["package"]["name"] == sample_uid
+    repaired_stats = layout_statistics(repaired_layout_a, repaired_power_a)
+    low, high = case["whitespace_range"]
+    assert float(low) <= repaired_stats["whitespace_fraction"] <= float(high)
+
+    sample_dir = root / "repair_source" / "smoke" / "case12" / "sample_000002"
+    paths = write_sample_sources(sample_dir, sample_uid, invalid_layout, invalid_power, invalid_benchmark)
+    stale_label = sample_dir / "parsed/temp_layer0.npy"
+    stale_label.parent.mkdir(parents=True, exist_ok=True)
+    np.save(stale_label, np.zeros((64, 64), dtype=np.float32))
+    assert validate_sample_sources(paths["scenario_path"], case)["passed"] is False
+    valid_sibling = sample_dir.parent / "sample_000003" / "parsed/temp_layer0.npy"
+    valid_sibling.parent.mkdir(parents=True, exist_ok=True)
+    np.save(valid_sibling, np.ones((64, 64), dtype=np.float32))
+    _repair_invalid_source(
+        sample_dir=sample_dir,
+        sample_uid=sample_uid,
+        case=case,
+        defaults=config["defaults"],
+        sample_index=sample_index,
+        seed=0,
+        max_layout_attempts=100,
+        cleanup_hotspot_workdirs=False,
+    )
+    assert validate_sample_sources(sample_dir / "source/scenario.yaml", case)["passed"]
+    assert not stale_label.exists()
+    assert valid_sibling.exists()
 
 
 def _write_test_csv(path: Path, rows: list[dict[str, str]]) -> None:

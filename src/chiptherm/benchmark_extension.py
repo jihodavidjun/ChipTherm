@@ -15,12 +15,13 @@ from typing import Any
 import yaml
 
 from .scenario import load_simulation_input
-from .validate import validate_simulation_input
+from .validate import POWER_DENSITY_LIMITS_W_PER_MM2, validate_simulation_input
 from .writers import write_manifest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG_PATH = REPO_ROOT / "configs" / "benchmark_extension_v1" / "cases.yaml"
+HARD_CONSTRAINT_EPS = 1e-6
 
 DEFAULT_PACKAGE = {
     "schema_version": 1,
@@ -102,8 +103,20 @@ def select_cases(config: dict[str, Any], case_ids: list[str] | None) -> list[dic
     return selected
 
 
-def generate_sample(case: dict[str, Any], defaults: dict[str, Any], sample_index: int, seed: int) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-    rng = random.Random(seed + _stable_int(case["case_id"]) * 1000003 + sample_index)
+def candidate_seed(case_id: str, sample_index: int, seed: int, attempt: int = 0) -> int:
+    return seed + _stable_int(case_id) * 1000003 + sample_index + attempt * 10000019
+
+
+def generate_sample(
+    case: dict[str, Any],
+    defaults: dict[str, Any],
+    sample_index: int,
+    seed: int,
+    *,
+    attempt: int = 0,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    generated_seed = candidate_seed(str(case["case_id"]), sample_index, seed, attempt)
+    rng = random.Random(generated_seed)
     width_mm, height_mm = [float(v) for v in case["interposer_mm"]]
     whitespace_low, whitespace_high = [float(v) for v in case["whitespace_range"]]
     target_whitespace = rng.uniform(whitespace_low, whitespace_high)
@@ -133,12 +146,143 @@ def generate_sample(case: dict[str, Any], defaults: dict[str, Any], sample_index
         "interposer_height_mm": height_mm,
         "target_whitespace": target_whitespace,
         "actual_whitespace": layout_statistics(layout, power)["whitespace_fraction"],
+        "generation_attempt": attempt,
+        "candidate_seed": generated_seed,
         "placement_regime": case["placement_regime"],
         "generation_constraints": {"min_spacing_mm": float(defaults.get("min_spacing_mm", 0.5))},
         "purpose": case.get("purpose", ""),
         "sample_id": sample_uid,
     }
     return layout, power, benchmark
+
+
+def generate_valid_sample(
+    case: dict[str, Any],
+    defaults: dict[str, Any],
+    sample_index: int,
+    seed: int,
+    *,
+    max_attempts: int = 100,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+    if max_attempts <= 0:
+        raise ValueError("max_attempts must be positive")
+    failures: list[dict[str, Any]] = []
+    for attempt in range(max_attempts):
+        layout, power, benchmark = generate_sample(case, defaults, sample_index, seed, attempt=attempt)
+        validation = validate_generated_candidate(layout, power, benchmark, case, defaults)
+        benchmark["candidate_validation"] = {
+            "passed": validation["passed"],
+            "problems": validation["problems"],
+            "statistics": validation["statistics"],
+        }
+        if validation["passed"]:
+            return layout, power, benchmark, {
+                "attempt": attempt,
+                "candidate_seed": benchmark["candidate_seed"],
+                "validation": validation,
+            }
+        failures.append(
+            {
+                "attempt": attempt,
+                "candidate_seed": benchmark["candidate_seed"],
+                "problems": validation["problems"],
+                "statistics": validation["statistics"],
+            }
+        )
+    preview = "; ".join(f"attempt {item['attempt']}: {', '.join(item['problems'])}" for item in failures[:5])
+    raise ValueError(
+        f"could not generate valid source for {case['case_id']} sample {sample_index:06d} "
+        f"after {max_attempts} attempts. First failures: {preview}"
+    )
+
+
+def validate_generated_candidate(
+    layout: dict[str, Any],
+    power: dict[str, Any],
+    benchmark: dict[str, Any],
+    expected_case: dict[str, Any],
+    defaults: dict[str, Any],
+) -> dict[str, Any]:
+    problems: list[str] = []
+    stats = layout_statistics(layout, power)
+    width = float(layout["package"]["size"]["width"])
+    height = float(layout["package"]["size"]["height"])
+    if stats["chiplet_count"] != int(expected_case["die_count"]):
+        problems.append(f"die count mismatch: expected {expected_case['die_count']}, got {stats['chiplet_count']}")
+    low, high = [float(v) for v in expected_case["whitespace_range"]]
+    whitespace = float(stats["whitespace_fraction"])
+    if whitespace < low - HARD_CONSTRAINT_EPS or whitespace > high + HARD_CONSTRAINT_EPS:
+        problems.append(f"whitespace {whitespace:.6f} outside target range [{low}, {high}]")
+    expected_counts = {str(key): int(value) for key, value in expected_case.get("composition", {}).items()}
+    if stats["type_counts"] != expected_counts:
+        problems.append(f"type composition mismatch: expected {expected_counts}, got {stats['type_counts']}")
+
+    rects: list[tuple[str, str, float, float, float, float]] = []
+    seen_names: set[str] = set()
+    for chiplet in layout.get("chiplets", []):
+        name = str(chiplet.get("name", ""))
+        chiplet_type = str(chiplet.get("type", ""))
+        if name in seen_names:
+            problems.append(f"duplicate chiplet name {name}")
+        seen_names.add(name)
+        try:
+            x = float(chiplet["position"]["x"])
+            y = float(chiplet["position"]["y"])
+            w = float(chiplet["size"]["width"])
+            h = float(chiplet["size"]["height"])
+        except Exception:
+            problems.append(f"{name}: missing or nonnumeric geometry")
+            continue
+        if not all(math.isfinite(v) for v in (x, y, w, h)):
+            problems.append(f"{name}: nonfinite geometry")
+        if w <= 0.0 or h <= 0.0:
+            problems.append(f"{name}: nonpositive size")
+        if x < -HARD_CONSTRAINT_EPS or y < -HARD_CONSTRAINT_EPS:
+            problems.append(f"{name}: negative position")
+        if x + w > width + HARD_CONSTRAINT_EPS:
+            problems.append(f"{name}: right edge exceeds package width")
+        if y + h > height + HARD_CONSTRAINT_EPS:
+            problems.append(f"{name}: top edge exceeds package height")
+        watts = power.get("chiplets", {}).get(name)
+        if watts is None:
+            problems.append(f"missing power for chiplet {name}")
+        else:
+            try:
+                watts_f = float(watts)
+            except Exception:
+                watts_f = float("nan")
+            if not math.isfinite(watts_f) or watts_f <= 0.0:
+                problems.append(f"{name}: power must be positive finite")
+            else:
+                density = watts_f / max(w * h, 1e-12)
+                low_density, high_density = POWER_DENSITY_LIMITS_W_PER_MM2.get(chiplet_type, (0.0, float("inf")))
+                if density < low_density - HARD_CONSTRAINT_EPS or density > high_density + HARD_CONSTRAINT_EPS:
+                    problems.append(
+                        f"{name}: power density {density:.6f} W/mm^2 outside {chiplet_type} range "
+                        f"[{low_density}, {high_density}]"
+                    )
+        rects.append((name, chiplet_type, x, y, w, h))
+
+    min_spacing = float(defaults.get("min_spacing_mm", 0.5))
+    for index, first in enumerate(rects):
+        for second in rects[index + 1:]:
+            spacing = _edge_spacing_rect((first[2], first[3], first[4], first[5]), (second[2], second[3], second[4], second[5]))
+            if spacing < min_spacing - HARD_CONSTRAINT_EPS:
+                problems.append(f"{first[0]} and {second[0]} spacing {spacing:.6f} mm below minimum {min_spacing:g} mm")
+
+    regime = str(expected_case.get("placement_regime", ""))
+    if regime in {"edge_heavy", "elongated_edge_mixed"} and stats["fraction_chiplets_near_edge"] <= 0.0:
+        problems.append(f"{regime}: expected at least one near-edge chiplet")
+    if regime == "corner_hotspot" and stats["fraction_chiplets_near_corner"] <= 0.0:
+        problems.append("corner_hotspot: expected at least one near-corner chiplet")
+
+    if power.get("active_workload") != "nominal":
+        problems.append("power.active_workload must be nominal")
+    nominal = power.get("workloads", {}).get("nominal", {})
+    if dict(power.get("chiplets", {})) != dict(nominal):
+        problems.append("power.chiplets must match workloads.nominal")
+
+    return {"passed": not problems, "problems": problems, "statistics": stats}
 
 
 def write_sample_sources(
