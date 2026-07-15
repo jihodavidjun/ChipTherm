@@ -31,6 +31,12 @@ from chiptherm.benchmark_extension import (
     write_sample_sources,
 )
 from scripts.build_chiptherm_extension_indices import split_per_case
+from scripts.build_chiptherm_extension import (
+    _load_active_index,
+    _missing_label_uids_from_index,
+    _rebase_stage_indexes,
+    _write_hotspot_reports,
+)
 from scripts.rebase_chiptherm_index_paths import rebase_value
 
 
@@ -40,6 +46,7 @@ def main() -> int:
         _test_config_and_generation(root)
         _test_approval_gate(root)
         _test_rebase_and_splits()
+        _test_exact_two_sample_retry_bookkeeping(root)
     print("chiptherm extension tests passed")
     return 0
 
@@ -129,6 +136,68 @@ def _test_rebase_and_splits() -> None:
     assert len(splits["val"]) == 2
     assert len(splits["test"]) == 2
     assert {row["case_id"] for row in splits["train"]} == {"case11", "case12"}
+
+
+def _test_exact_two_sample_retry_bookkeeping(root: Path) -> None:
+    stage = root / "retry_case" / "smoke"
+    rows = []
+    failed_uids = [
+        "benchmark_extension_v1_case12_sample_000002",
+        "benchmark_extension_v1_case20_sample_000001",
+    ]
+    for uid in failed_uids:
+        case_id = uid.split("_sample_", 1)[0].rsplit("_", 1)[1]
+        sample_num = int(uid.rsplit("_", 1)[1])
+        source_dir = stage / case_id / f"sample_{sample_num:06d}" / "source"
+        source_dir.mkdir(parents=True, exist_ok=True)
+        abs_prefix = "/nethome/jjun49/chiptherm_test/data/runs/benchmarks/benchmark_extension_v1/smoke"
+        rows.append(
+            {
+                "sample_uid": uid,
+                "case_id": case_id,
+                "split": "train" if case_id == "case12" else "test",
+                "source_dir": f"{abs_prefix}/{case_id}/sample_{sample_num:06d}/source",
+                "scenario_path": f"{abs_prefix}/{case_id}/sample_{sample_num:06d}/source/scenario.yaml",
+                "layout_path": f"{abs_prefix}/{case_id}/sample_{sample_num:06d}/source/layout.json",
+                "power_path": f"{abs_prefix}/{case_id}/sample_{sample_num:06d}/source/power.yaml",
+                "package_path": f"{abs_prefix}/{case_id}/sample_{sample_num:06d}/source/package.yaml",
+                "hotspot_path": f"{abs_prefix}/{case_id}/sample_{sample_num:06d}/source/hotspot.yaml",
+                "benchmark_path": f"{abs_prefix}/{case_id}/sample_{sample_num:06d}/source/benchmark.yaml",
+                "y_path": "",
+            }
+        )
+    for name in ("all_extension_index.csv", "train_index.csv", "test_index.csv"):
+        selected = rows if name == "all_extension_index.csv" else [row for row in rows if row["split"] in name]
+        _write_test_csv(stage / name, selected or rows)
+    changed = _rebase_stage_indexes(stage)
+    assert changed > 0
+    _, active_rows = _load_active_index(stage)
+    assert {row["sample_uid"] for row in active_rows} == set(failed_uids)
+    missing = _missing_label_uids_from_index(active_rows, stage)
+    assert missing == set(failed_uids)
+    _write_hotspot_reports(
+        stage,
+        [],
+        workers=4,
+        executable=Path("unresolved"),
+        requested_uids=failed_uids,
+        matched_uids=failed_uids,
+        scheduled_uids=[],
+        skipped_valid_uids=[],
+        unresolved_reasons={uid: "unit-test not scheduled" for uid in failed_uids},
+    )
+    assert (stage / "hotspot_generation_report.json").exists()
+    assert (stage / "hotspot_failures.csv").exists()
+
+
+def _write_test_csv(path: Path, rows: list[dict[str, str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    import csv
+
+    with path.open("w", newline="", encoding="utf-8") as fp:
+        writer = csv.DictWriter(fp, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 if __name__ == "__main__":

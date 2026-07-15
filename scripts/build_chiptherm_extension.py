@@ -56,6 +56,7 @@ def main() -> int:
     parser.add_argument("--samples-per-case", type=int, default=None)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--retry-failed", action="store_true")
+    parser.add_argument("--retry-missing-labels", action="store_true")
     parser.add_argument("--max-retries", type=int, default=2)
     parser.add_argument("--sample-uids", nargs="+", default=None)
     parser.add_argument("--keep-hotspot-workdirs", action="store_true")
@@ -120,7 +121,22 @@ def main() -> int:
 
     start = time.perf_counter()
     out_dir.mkdir(parents=True, exist_ok=True)
-    selected_uids = set(args.sample_uids or [])
+    rebased_values = _rebase_stage_indexes(out_dir)
+    if args.run_hotspot and rebased_values:
+        print(f"Auto-rebased portable path values across active CSVs: {rebased_values}")
+    active_index_path, active_index_rows = _load_active_index(out_dir)
+    missing_label_uids = _missing_label_uids_from_index(active_index_rows, out_dir) if args.retry_missing_labels else set()
+    requested_uids = set(args.sample_uids or []) | missing_label_uids
+    selected_uids = set(requested_uids)
+    matched_uids: set[str] = set()
+    scheduled_uids: set[str] = set()
+    skipped_valid_uids: set[str] = set()
+    unscheduled_reasons: dict[str, str] = {}
+    if args.run_hotspot:
+        print(f"Active index: {active_index_path if active_index_path else 'generated sample grid'}")
+        print(f"Requested UIDs: {sorted(requested_uids)}")
+        if args.retry_missing_labels:
+            print(f"Discovered missing-label UIDs: {sorted(missing_label_uids)}")
     rows = []
     sample_stats = []
     validations = []
@@ -130,6 +146,9 @@ def main() -> int:
         case_dir = out_dir / case["case_id"]
         for sample_index in range(1, samples_per_case + 1):
             sample_uid = f"benchmark_extension_v1_{case['case_id']}_sample_{sample_index:06d}"
+            is_requested = not selected_uids or sample_uid in selected_uids
+            if sample_uid in requested_uids:
+                matched_uids.add(sample_uid)
             sample_dir = case_dir / f"sample_{sample_index:06d}"
             if args.resume and (sample_dir / "source/scenario.yaml").exists():
                 layout_path = sample_dir / "source/layout.json"
@@ -165,23 +184,31 @@ def main() -> int:
             validation = validate_sample_sources(paths["scenario_path"], case)
             validations.append({"sample_uid": sample_uid, "passed": validation["passed"], "problems": validation["problems"]})
             hotspot_result = _existing_hotspot_status(sample_dir)
-            if args.run_hotspot and validation["passed"] and (not selected_uids or sample_uid in selected_uids):
-                should_run = _should_run_hotspot(
-                    sample_dir=sample_dir,
-                    resume=args.resume,
-                    retry_failed=args.retry_failed,
-                    selected_uids=selected_uids,
-                )
-                if should_run:
-                    hotspot_jobs.append(
-                        {
-                            "sample_uid": sample_uid,
-                            "case_id": case["case_id"],
-                            "scenario_path": str(paths["scenario_path"].resolve()),
-                            "sample_dir": str(sample_dir.resolve()),
-                        }
+            if args.run_hotspot and is_requested:
+                if not validation["passed"]:
+                    unscheduled_reasons[sample_uid] = "source validation failed: " + "; ".join(validation["problems"])
+                else:
+                    should_run, reason = _should_run_hotspot(
+                        sample_dir=sample_dir,
+                        resume=args.resume,
+                        retry_failed=args.retry_failed,
+                        selected_uids=selected_uids,
                     )
-                    hotspot_result = {"status": "queued", "runtime_s": ""}
+                    if should_run:
+                        hotspot_jobs.append(
+                            {
+                                "sample_uid": sample_uid,
+                                "case_id": case["case_id"],
+                                "scenario_path": str(paths["scenario_path"].resolve()),
+                                "sample_dir": str(sample_dir.resolve()),
+                            }
+                        )
+                        scheduled_uids.add(sample_uid)
+                        hotspot_result = {"status": "queued", "runtime_s": ""}
+                    else:
+                        unscheduled_reasons[sample_uid] = reason
+                        if reason == "valid label exists and --resume was set":
+                            skipped_valid_uids.add(sample_uid)
             sample_stats.append(stats)
             rows.append(
                 row_for_sample(
@@ -195,8 +222,38 @@ def main() -> int:
             )
             rows[-1]["hotspot_runtime_s"] = hotspot_result["runtime_s"]
 
+    if args.run_hotspot and requested_uids and not matched_uids:
+        _write_hotspot_reports(out_dir, [], workers=args.hotspot_workers, executable=Path(args.hotspot_executable or "unresolved"), requested_uids=sorted(requested_uids), matched_uids=[], scheduled_uids=[], skipped_valid_uids=[], unresolved_reasons={uid: "requested UID did not match generated sample grid" for uid in sorted(requested_uids)})
+        raise SystemExit(f"requested UIDs matched zero rows: {sorted(requested_uids)}")
+
+    if args.run_hotspot:
+        print(f"Matched UIDs: {sorted(matched_uids)}")
+        print(f"Scheduled UIDs: {sorted(scheduled_uids)}")
+        print(f"Skipped-valid UIDs: {sorted(skipped_valid_uids)}")
+
+    executable: Path | None = None
+    if args.run_hotspot:
+        try:
+            executable = resolve_hotspot_executable(args.hotspot_executable, args.hotspot_home)
+        except SystemExit as exc:
+            message = str(exc)
+            for uid in sorted(scheduled_uids or requested_uids):
+                unscheduled_reasons.setdefault(uid, f"executable resolution failed: {message}")
+            _write_hotspot_reports(
+                out_dir,
+                [],
+                workers=args.hotspot_workers,
+                executable=Path(args.hotspot_executable or "unresolved"),
+                requested_uids=sorted(requested_uids),
+                matched_uids=sorted(matched_uids),
+                scheduled_uids=sorted(scheduled_uids),
+                skipped_valid_uids=sorted(skipped_valid_uids),
+                unresolved_reasons=unscheduled_reasons,
+            )
+            raise
+
     if args.run_hotspot and hotspot_jobs:
-        executable = resolve_hotspot_executable(args.hotspot_executable, args.hotspot_home)
+        assert executable is not None
         print(f"Running HotSpot for {len(hotspot_jobs)} sample(s) with {args.hotspot_workers} worker(s)")
         hotspot_results = _run_hotspot_jobs(
             hotspot_jobs,
@@ -208,6 +265,11 @@ def main() -> int:
             workers=args.hotspot_workers,
             max_retries=args.max_retries,
             out_dir=out_dir,
+            requested_uids=sorted(requested_uids),
+            matched_uids=sorted(matched_uids),
+            scheduled_uids=sorted(scheduled_uids),
+            skipped_valid_uids=sorted(skipped_valid_uids),
+            unresolved_reasons=unscheduled_reasons,
         )
         for row in rows:
             result = hotspot_results.get(row["sample_uid"])
@@ -220,6 +282,18 @@ def main() -> int:
                 y_path = sample_dir / "parsed/temp_layer0.npy"
                 row["y_path"] = str(y_path.resolve().relative_to(REPO_ROOT)) if y_path.exists() else ""
     elif args.run_hotspot:
+        assert executable is not None
+        _write_hotspot_reports(
+            out_dir,
+            [],
+            workers=args.hotspot_workers,
+            executable=executable,
+            requested_uids=sorted(requested_uids),
+            matched_uids=sorted(matched_uids),
+            scheduled_uids=[],
+            skipped_valid_uids=sorted(skipped_valid_uids),
+            unresolved_reasons=unscheduled_reasons,
+        )
         for row in rows:
             sample_dir = _sample_dir_for_uid(out_dir, row["sample_uid"])
             status = _existing_hotspot_status(sample_dir)
@@ -240,13 +314,14 @@ def main() -> int:
     manifest["runtime_s"] = time.perf_counter() - start
     if args.run_hotspot:
         manifest["hotspot_generation"] = _summarize_hotspot_generation(out_dir, rows)
-        manifest["hotspot_executable_provenance"] = str(resolve_hotspot_executable(args.hotspot_executable, args.hotspot_home))
+        manifest["hotspot_executable_provenance"] = str(executable) if executable is not None else ""
     write_manifest(out_dir / "manifest.json", manifest)
     print(f"Generated ChipTherm extension {stage}: {len(rows)} samples")
     print(f"Output: {out_dir}")
     print(f"Validation passed: {manifest['validation']['passed']}")
     if args.run_hotspot:
         unresolved = [row["sample_uid"] for row in rows if row.get("hotspot_status") != "full_package_done"]
+        print(f"Unresolved UIDs: {sorted(unresolved)}")
         if unresolved:
             print(f"Unresolved HotSpot labels: {len(unresolved)}")
             return 3
@@ -446,10 +521,106 @@ def _verify_smoke_gate(smoke_root: Path) -> None:
         raise SystemExit("full generation requires smoke validation to pass with --require-hotspot-labels")
 
 
-def _should_run_hotspot(*, sample_dir: Path, resume: bool, retry_failed: bool, selected_uids: set[str]) -> bool:
+PATH_COLUMNS = [
+    "source_dir",
+    "scenario_path",
+    "layout_path",
+    "power_path",
+    "package_path",
+    "hotspot_path",
+    "benchmark_path",
+    "x_path",
+    "y_path",
+    "prediction_path",
+    "residual_path",
+    "graph_path",
+    "source_superposition_base_path",
+    "source_superposition_residual_path",
+]
+
+
+def _load_active_index(out_dir: Path) -> tuple[Path | None, list[dict[str, str]]]:
+    for name in ("all_extension_index.csv", "combined_encoded_index.csv"):
+        path = out_dir / name
+        if path.exists():
+            with path.open("r", encoding="utf-8", newline="") as fp:
+                return path, list(csv.DictReader(fp))
+    return None, []
+
+
+def _missing_label_uids_from_index(rows: list[dict[str, str]], out_dir: Path) -> set[str]:
+    missing = set()
+    for row in rows:
+        uid = row.get("sample_uid", "")
+        if not uid:
+            continue
+        y_value = row.get("y_path", "")
+        y_path = _resolve_index_path(y_value, out_dir) if y_value else None
+        sample_dir = _sample_dir_for_uid(out_dir, uid)
+        if not y_path or not y_path.exists() or not _label_valid(sample_dir):
+            missing.add(uid)
+    return missing
+
+
+def _rebase_stage_indexes(out_dir: Path) -> int:
+    changed = 0
+    for name in (
+        "all_extension_index.csv",
+        "combined_encoded_index.csv",
+        "train_index.csv",
+        "val_index.csv",
+        "test_index.csv",
+    ):
+        path = out_dir / name
+        if not path.exists():
+            continue
+        with path.open("r", encoding="utf-8", newline="") as fp:
+            reader = csv.DictReader(fp)
+            rows = list(reader)
+            fieldnames = list(reader.fieldnames or [])
+        if not rows:
+            continue
+        row_changed = False
+        for row in rows:
+            for column in PATH_COLUMNS:
+                value = row.get(column, "")
+                if not value:
+                    continue
+                new_value = _portable_index_path(value)
+                if new_value != value:
+                    row[column] = new_value
+                    changed += 1
+                    row_changed = True
+        if row_changed:
+            _write_csv(path, rows, fieldnames or list(rows[0].keys()))
+    return changed
+
+
+def _portable_index_path(value: str) -> str:
+    if not value:
+        return value
+    text = value
+    if text.startswith("/"):
+        for marker in ("/data/runs/", "/outputs/"):
+            if marker in text:
+                return marker.strip("/") + "/" + text.split(marker, 1)[1]
+    return text
+
+
+def _resolve_index_path(value: str, out_dir: Path) -> Path:
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    for candidate in (REPO_ROOT / path, out_dir / path, Path.cwd() / path):
+        if candidate.exists():
+            return candidate
+    return REPO_ROOT / path
+
+
+def _should_run_hotspot(*, sample_dir: Path, resume: bool, retry_failed: bool, selected_uids: set[str]) -> tuple[bool, str]:
     valid = _label_valid(sample_dir)
     if valid and resume:
-        return False
+        return False, "valid label exists and --resume was set"
     manifest_path = sample_dir / "manifest.json"
     failed = False
     if manifest_path.exists():
@@ -459,8 +630,12 @@ def _should_run_hotspot(*, sample_dir: Path, resume: bool, retry_failed: bool, s
         except Exception:
             failed = True
     if retry_failed:
-        return (not valid) and (failed or bool(selected_uids))
-    return not valid
+        if (not valid) and (failed or bool(selected_uids)):
+            return True, "missing/failed selected for retry"
+        return False, "not failed and not explicitly selected"
+    if not valid:
+        return True, "missing label"
+    return False, "valid label exists"
 
 
 def _label_valid(sample_dir: Path) -> bool:
@@ -506,6 +681,11 @@ def _run_hotspot_jobs(
     workers: int,
     max_retries: int,
     out_dir: Path,
+    requested_uids: list[str],
+    matched_uids: list[str],
+    scheduled_uids: list[str],
+    skipped_valid_uids: list[str],
+    unresolved_reasons: dict[str, str],
 ) -> dict[str, dict[str, Any]]:
     remaining = list(jobs)
     all_results: dict[str, dict[str, Any]] = {}
@@ -557,7 +737,17 @@ def _run_hotspot_jobs(
             except KeyboardInterrupt:
                 executor.shutdown(cancel_futures=True)
                 raise
-    _write_hotspot_reports(out_dir, list(all_results.values()), workers=workers, executable=executable)
+    _write_hotspot_reports(
+        out_dir,
+        list(all_results.values()),
+        workers=workers,
+        executable=executable,
+        requested_uids=requested_uids,
+        matched_uids=matched_uids,
+        scheduled_uids=scheduled_uids,
+        skipped_valid_uids=skipped_valid_uids,
+        unresolved_reasons=unresolved_reasons,
+    )
     return all_results
 
 
@@ -588,7 +778,18 @@ def _finish_hotspot_worker(sample_dir: Path, payload: dict[str, Any], start: flo
     return payload
 
 
-def _write_hotspot_reports(out_dir: Path, results: list[dict[str, Any]], *, workers: int, executable: Path) -> None:
+def _write_hotspot_reports(
+    out_dir: Path,
+    results: list[dict[str, Any]],
+    *,
+    workers: int,
+    executable: Path,
+    requested_uids: list[str] | None = None,
+    matched_uids: list[str] | None = None,
+    scheduled_uids: list[str] | None = None,
+    skipped_valid_uids: list[str] | None = None,
+    unresolved_reasons: dict[str, str] | None = None,
+) -> None:
     results = sorted(results, key=lambda item: item["sample_uid"])
     failures = [item for item in results if item.get("status") != "full_package_done"]
     write_manifest(
@@ -601,6 +802,11 @@ def _write_hotspot_reports(out_dir: Path, results: list[dict[str, Any]], *, work
             "total": len(results),
             "successful": len(results) - len(failures),
             "failed": len(failures),
+            "requested_uids": requested_uids or [],
+            "matched_uids": matched_uids or [],
+            "scheduled_uids": scheduled_uids or [],
+            "skipped_valid_uids": skipped_valid_uids or [],
+            "unresolved_reasons": unresolved_reasons or {},
             "results": results,
         },
     )
@@ -615,8 +821,13 @@ def _write_hotspot_reports(out_dir: Path, results: list[dict[str, Any]], *, work
         "stderr_tail",
         "parse_status",
         "cleanup_status",
+        "unresolved_reason",
     ]
-    _write_csv(out_dir / "hotspot_failures.csv", failures, fields)
+    failure_rows = list(failures)
+    for uid, reason in sorted((unresolved_reasons or {}).items()):
+        if uid not in {row.get("sample_uid") for row in failure_rows}:
+            failure_rows.append({"sample_uid": uid, "status": "not_scheduled", "failure_category": "not_scheduled", "unresolved_reason": reason})
+    _write_csv(out_dir / "hotspot_failures.csv", failure_rows, fields)
     by_case: dict[str, list[float]] = {}
     for item in results:
         try:
