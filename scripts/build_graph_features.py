@@ -241,6 +241,14 @@ def build_graph_for_row(row: dict[str, str], *, softening_mm: float) -> dict[str
 
 
 def source_dir_for_row(row: dict[str, str]) -> Path:
+    value = row.get("source_dir")
+    if value:
+        path = Path(value)
+        if path.is_absolute() and path.exists():
+            return path
+        for candidate in (REPO_ROOT / path, Path.cwd() / path):
+            if candidate.exists():
+                return candidate
     case_id = row["case_id"]
     original = row.get("original_sample_uid") or row["sample_uid"]
     sample_name = original

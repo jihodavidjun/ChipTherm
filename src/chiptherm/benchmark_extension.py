@@ -230,15 +230,15 @@ def row_for_sample(
         "case_id": case["case_id"],
         "dataset_source": f"benchmark_extension_v1_{stage}",
         "split": split,
-        "source_dir": str(paths["source_dir"]),
-        "scenario_path": str(paths["scenario_path"]),
-        "layout_path": str(paths["layout_path"]),
-        "power_path": str(paths["power_path"]),
-        "package_path": str(paths["package_path"]),
-        "hotspot_path": str(paths["hotspot_path"]),
-        "benchmark_path": str(paths["benchmark_path"]),
+        "source_dir": portable_path(paths["source_dir"]),
+        "scenario_path": portable_path(paths["scenario_path"]),
+        "layout_path": portable_path(paths["layout_path"]),
+        "power_path": portable_path(paths["power_path"]),
+        "package_path": portable_path(paths["package_path"]),
+        "hotspot_path": portable_path(paths["hotspot_path"]),
+        "benchmark_path": portable_path(paths["benchmark_path"]),
         "x_path": "",
-        "y_path": str(y_path),
+        "y_path": portable_path(y_path) if y_path else "",
         "prediction_path": "",
         "residual_path": "",
         "hotspot_runtime_s": "",
@@ -403,7 +403,7 @@ def case_statistics(sample_stats: list[dict[str, Any]]) -> dict[str, dict[str, f
     return out
 
 
-def validate_extension_root(out_dir: Path, *, require_hotspot_labels: bool = False) -> dict[str, Any]:
+def validate_extension_root(out_dir: Path, *, require_hotspot_labels: bool = False, check_portability: bool = False) -> dict[str, Any]:
     rows = read_index(out_dir / "all_extension_index.csv")
     problems: list[str] = []
     warnings: list[str] = []
@@ -417,21 +417,28 @@ def validate_extension_root(out_dir: Path, *, require_hotspot_labels: bool = Fal
             problems.append(f"duplicate sample_uid {uid}")
         seen_uids.add(uid)
         for field in ("scenario_path", "layout_path", "power_path", "package_path", "hotspot_path", "benchmark_path"):
-            if not Path(row[field]).exists():
+            if check_portability and not is_portable_path_value(row.get(field, "")):
+                problems.append(f"{uid}: non-portable {field} {row.get(field, '')}")
+            if not resolve_portable_path(row[field], out_dir).exists():
                 problems.append(f"{uid}: missing {field} {row[field]}")
         if row.get("x_path"):
-            warnings.append(f"{uid}: x_path is populated before canonical encoding")
+            if check_portability and not is_portable_path_value(row["x_path"]):
+                problems.append(f"{uid}: non-portable x_path {row['x_path']}")
         if row.get("residual_path") or row.get("prediction_path"):
-            warnings.append(f"{uid}: prediction/residual path is populated unexpectedly")
+            for field in ("prediction_path", "residual_path"):
+                if row.get(field) and check_portability and not is_portable_path_value(row[field]):
+                    problems.append(f"{uid}: non-portable {field} {row[field]}")
         if require_hotspot_labels and not row.get("y_path"):
             problems.append(f"{uid}: missing required HotSpot label y_path")
-        if row.get("y_path") and not Path(row["y_path"]).exists():
+        if row.get("y_path") and check_portability and not is_portable_path_value(row["y_path"]):
+            problems.append(f"{uid}: non-portable y_path {row['y_path']}")
+        if row.get("y_path") and not resolve_portable_path(row["y_path"], out_dir).exists():
             problems.append(f"{uid}: y_path does not exist")
         if row.get("layout_hash") in layout_hashes:
             problems.append(f"{uid}: duplicate layout hash {row.get('layout_hash')}")
         layout_hashes.add(row.get("layout_hash"))
         try:
-            sim = load_simulation_input(row["scenario_path"])
+            sim = load_simulation_input(resolve_portable_path(row["scenario_path"], out_dir))
             validate_simulation_input(sim)
         except Exception as exc:
             problems.append(f"{uid}: canonical validation failed: {exc}")
@@ -449,6 +456,7 @@ def validate_extension_root(out_dir: Path, *, require_hotspot_labels: bool = Fal
         "case_counts": _counts(row["case_id"] for row in rows),
         "split_cases": split_cases,
         "require_hotspot_labels": require_hotspot_labels,
+        "check_portability": check_portability,
     }
     write_manifest(out_dir / "validation_report.json", report)
     _write_validation_md(out_dir / "validation_report.md", report)
@@ -528,6 +536,41 @@ def file_sha256(path: Path) -> str:
         for chunk in iter(lambda: fp.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def portable_path(path: str | Path) -> str:
+    path = Path(path)
+    if not str(path):
+        return ""
+    try:
+        return str(path.resolve().relative_to(REPO_ROOT))
+    except ValueError:
+        return str(path)
+
+
+def resolve_portable_path(path_value: str | Path, dataset_root: Path | None = None) -> Path:
+    path = Path(str(path_value)).expanduser()
+    if path.is_absolute():
+        return path
+    candidates = []
+    if dataset_root is not None:
+        candidates.append(dataset_root / path)
+    candidates.extend([REPO_ROOT / path, Path.cwd() / path])
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0] if candidates else path
+
+
+def is_portable_path_value(path_value: str) -> bool:
+    if not path_value:
+        return True
+    path = Path(path_value)
+    text = str(path_value)
+    if path.is_absolute():
+        return False
+    forbidden = ("/Users/", "/nethome/", "\\Users\\")
+    return not any(item in text for item in forbidden)
 
 
 def layout_hash(layout: dict[str, Any]) -> str:

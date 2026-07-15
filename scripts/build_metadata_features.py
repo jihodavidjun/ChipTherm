@@ -192,6 +192,12 @@ def build_manifest(records: list[dict[str, Any]], train_uids: set[str], dataset_
 
 
 def source_paths_for_row(row: dict[str, str]) -> tuple[Path, Path, Path]:
+    explicit = (row.get("layout_path"), row.get("package_path"), row.get("hotspot_path"))
+    if all(explicit):
+        paths = tuple(resolve_path(value, REPO_ROOT) for value in explicit)
+        missing = [path for path in paths if not path.exists()]
+        if not missing:
+            return paths  # type: ignore[return-value]
     original_uid = row.get("original_sample_uid", "")
     case_id = row["case_id"]
     prefix = f"{case_id}_"

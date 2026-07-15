@@ -129,11 +129,14 @@ def _encode_row(row: dict[str, str], dataset_root: Path, out_dir: Path) -> dict[
     x_path = case_dir / f"{sample_uid}_x.npy"
     y_path = case_dir / f"{sample_uid}_y.npy"
 
+    temp_value = row.get("temp_layer0_path") or row.get("y_path") or row.get("original_temp_path")
+    if not temp_value:
+        raise ValueError(f"{sample_uid} has no temp_layer0_path/y_path")
     x, y, metadata = encode_sample(
-        layout_path=dataset_root / row["layout_path"],
-        power_path=dataset_root / row["power_path"],
-        hotspot_path=dataset_root / row["hotspot_path"],
-        temp_path=dataset_root / row["temp_layer0_path"],
+        layout_path=resolve_path(row["layout_path"], dataset_root),
+        power_path=resolve_path(row["power_path"], dataset_root),
+        hotspot_path=resolve_path(row["hotspot_path"], dataset_root),
+        temp_path=resolve_path(temp_value, dataset_root),
     )
     np.save(x_path, x)
     np.save(y_path, y)
@@ -143,7 +146,7 @@ def _encode_row(row: dict[str, str], dataset_root: Path, out_dir: Path) -> dict[
         "case_id": case_id,
         "x_path": _rel(out_dir, x_path),
         "y_path": _rel(out_dir, y_path),
-        "original_temp_path": row["temp_layer0_path"],
+        "original_temp_path": temp_value,
         "H": y.shape[0],
         "W": y.shape[1],
         "C": x.shape[0],

@@ -9,6 +9,8 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = REPO_ROOT / "src"
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
@@ -28,6 +30,8 @@ from chiptherm.benchmark_extension import (
     write_indexes,
     write_sample_sources,
 )
+from scripts.build_chiptherm_extension_indices import split_per_case
+from scripts.rebase_chiptherm_index_paths import rebase_value
 
 
 def main() -> int:
@@ -35,6 +39,7 @@ def main() -> int:
         root = Path(tmp)
         _test_config_and_generation(root)
         _test_approval_gate(root)
+        _test_rebase_and_splits()
     print("chiptherm extension tests passed")
     return 0
 
@@ -109,6 +114,21 @@ def _test_approval_gate(root: Path) -> None:
         assert "hash mismatch" in str(exc)
     else:
         raise AssertionError("approval gate should fail after manifest mutation")
+
+
+def _test_rebase_and_splits() -> None:
+    old = "/nethome/jjun49/chiptherm_test/data/runs/benchmarks/benchmark_extension_v1/smoke/case11/sample_000001/source/layout.json"
+    rebased = rebase_value(old, old_prefix=None, new_prefix="")
+    assert rebased == "data/runs/benchmarks/benchmark_extension_v1/smoke/case11/sample_000001/source/layout.json"
+    rows = []
+    for case_id in ("case11", "case12"):
+        for index in range(1, 11):
+            rows.append({"sample_uid": f"{case_id}_sample_{index:06d}", "case_id": case_id, "split": "family"})
+    splits = split_per_case(rows, 0.8, 0.1)
+    assert len(splits["train"]) == 16
+    assert len(splits["val"]) == 2
+    assert len(splits["test"]) == 2
+    assert {row["case_id"] for row in splits["train"]} == {"case11", "case12"}
 
 
 if __name__ == "__main__":

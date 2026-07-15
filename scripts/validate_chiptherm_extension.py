@@ -18,8 +18,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Validate a ChipTherm benchmark-extension root.")
     parser.add_argument("--root", required=True, type=Path)
     parser.add_argument("--require-hotspot-labels", action="store_true")
+    parser.add_argument("--check-portability", action="store_true")
     args = parser.parse_args()
-    report = validate_extension_root(args.root.resolve(), require_hotspot_labels=args.require_hotspot_labels)
+    report = validate_extension_root(
+        args.root.resolve(),
+        require_hotspot_labels=args.require_hotspot_labels,
+        check_portability=args.check_portability,
+    )
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0 if report["passed"] else 2
 
