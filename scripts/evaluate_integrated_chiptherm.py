@@ -6,6 +6,7 @@ import csv
 import json
 import sys
 import time
+from contextlib import nullcontext
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,7 +43,7 @@ def main() -> int:
     parser.add_argument("--index", required=True, type=Path)
     parser.add_argument("--out-dir", required=True, type=Path)
     parser.add_argument("--package-batch-size", nargs="+", default=[8], type=int)
-    parser.add_argument("--source-batch-size", default=64, type=int)
+    parser.add_argument("--source-batch-size", nargs="+", default=[64], type=int)
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
     parser.add_argument("--num-workers", default=0, type=int)
     parser.add_argument("--profile-components", action="store_true")
@@ -52,10 +53,20 @@ def main() -> int:
     parser.add_argument("--timed-batches", default=None, type=int)
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--compare-cached-index", default=None, type=Path)
+    parser.add_argument("--precision", default="fp32", choices=["fp32", "fp16", "bf16"])
+    parser.add_argument("--inference-mode", action="store_true")
+    parser.add_argument("--channels-last", action="store_true")
+    parser.add_argument("--compile-source", action="store_true")
+    parser.add_argument("--compile-package-cnn", action="store_true")
+    parser.add_argument("--compile-graph", action="store_true")
+    parser.add_argument("--device-summation", action="store_true")
+    parser.add_argument("--pinned-memory", action="store_true")
+    parser.add_argument("--non-blocking-transfer", action="store_true")
     args = parser.parse_args()
 
-    if args.source_batch_size <= 0:
-        raise SystemExit("--source-batch-size must be positive")
+    for source_batch_size in args.source_batch_size:
+        if source_batch_size <= 0:
+            raise SystemExit("--source-batch-size values must be positive")
     for batch_size in args.package_batch_size:
         if batch_size <= 0:
             raise SystemExit("--package-batch-size values must be positive")
@@ -68,6 +79,13 @@ def main() -> int:
         residual_checkpoint=args.residual_checkpoint,
         device=device,
         deterministic=args.deterministic,
+        precision=args.precision,
+        channels_last=args.channels_last,
+        compile_source=args.compile_source,
+        compile_package_cnn=args.compile_package_cnn,
+        compile_graph=args.compile_graph,
+        device_summation=args.device_summation,
+        non_blocking_transfer=args.non_blocking_transfer,
     )
     cached_rows = read_rows(args.compare_cached_index) if args.compare_cached_index else None
     if cached_rows is not None:
@@ -76,31 +94,39 @@ def main() -> int:
             canonical_rows = canonical_rows[: args.max_samples]
             cached_rows = cached_rows[: args.max_samples]
         validate_cached_rows(canonical_rows, cached_rows, expected_source_hash=integrated.source_checkpoint_sha256)
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
 
     runtime_rows: list[dict[str, Any]] = []
     primary_payload: dict[str, Any] | None = None
-    for batch_size_index, package_batch_size in enumerate(args.package_batch_size):
-        payload = evaluate_once(
-            integrated=integrated,
-            index=args.index,
-            cached_rows=cached_rows,
-            out_dir=out_dir,
-            package_batch_size=package_batch_size,
-            source_batch_size=args.source_batch_size,
-            device=device,
-            num_workers=args.num_workers,
-            profile_components=args.profile_components,
-            save_predictions=args.save_predictions and batch_size_index == 0,
-            max_samples=args.max_samples,
-            warmup_batches=args.warmup_batches,
-            timed_batches=args.timed_batches if len(args.package_batch_size) > 1 else None,
-        )
-        runtime_rows.append(runtime_summary_row(package_batch_size, payload))
-        if primary_payload is None:
-            primary_payload = payload
+    for package_batch_size in args.package_batch_size:
+        for source_batch_size in args.source_batch_size:
+            payload = evaluate_once(
+                integrated=integrated,
+                index=args.index,
+                cached_rows=cached_rows,
+                out_dir=out_dir,
+                package_batch_size=package_batch_size,
+                source_batch_size=source_batch_size,
+                device=device,
+                num_workers=args.num_workers,
+                profile_components=args.profile_components,
+                save_predictions=args.save_predictions and primary_payload is None,
+                max_samples=args.max_samples,
+                warmup_batches=args.warmup_batches,
+                timed_batches=args.timed_batches if (len(args.package_batch_size) > 1 or len(args.source_batch_size) > 1) else None,
+                inference_mode=args.inference_mode,
+                pinned_memory=args.pinned_memory,
+            )
+            runtime_rows.append(runtime_summary_row(package_batch_size, source_batch_size, payload))
+            if primary_payload is None:
+                primary_payload = payload
 
     assert primary_payload is not None
     write_csv(out_dir / "integrated_runtime_by_batch_size.csv", runtime_rows)
+    write_csv(out_dir / "runtime_sweep.csv", runtime_rows)
+    write_csv(out_dir / "integrated_runtime_components.csv", runtime_component_rows(primary_payload))
+    write_csv(out_dir / "optimization_comparison.csv", [optimization_comparison_row(args, primary_payload)])
     (out_dir / "integrated_metrics.json").write_text(json.dumps(primary_payload["metrics_payload"], indent=2, sort_keys=True) + "\n", encoding="utf-8")
     write_case_metrics(out_dir / "integrated_metrics_by_case.csv", primary_payload["metrics_by_case"])
     (out_dir / "integrated_runtime.json").write_text(json.dumps(primary_payload["runtime"], indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -109,6 +135,7 @@ def main() -> int:
         encoding="utf-8",
     )
     (out_dir / "numerical_equivalence.json").write_text(json.dumps(primary_payload["equivalence"], indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    (out_dir / "integrated_manifest.json").write_text(json.dumps(primary_payload["manifest"], indent=2, sort_keys=True) + "\n", encoding="utf-8")
     (out_dir / "integrated_inference_manifest.json").write_text(json.dumps(primary_payload["manifest"], indent=2, sort_keys=True) + "\n", encoding="utf-8")
     write_report(out_dir / "integrated_report.md", primary_payload)
 
@@ -147,6 +174,8 @@ def evaluate_once(
     max_samples: int | None,
     warmup_batches: int,
     timed_batches: int | None,
+    inference_mode: bool,
+    pinned_memory: bool,
 ) -> dict[str, Any]:
     dataset = ChipThermDataset(index, target="residual", return_metadata=True, return_graph=integrated.graph_enabled)
     if max_samples is not None:
@@ -156,7 +185,7 @@ def evaluate_once(
         batch_size=package_batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=device.type == "cuda",
+        pin_memory=bool(pinned_memory and device.type == "cuda"),
         collate_fn=chiptherm_collate if integrated.graph_enabled else None,
     )
     final_acc = MetricAccumulator()
@@ -167,6 +196,7 @@ def evaluate_once(
     chip_mean_acc = ScalarAverage()
     chip_peak_acc = ScalarAverage()
     chip_delta_acc = ScalarAverage()
+    source_counts: list[int] = []
     by_case: dict[str, dict[str, MetricAccumulator]] = defaultdict(
         lambda: {
             "final_temperature": MetricAccumulator(),
@@ -196,12 +226,14 @@ def evaluate_once(
         batch_size = int(batch["x"].shape[0])
         batch_rows = rows_from_batch_metadata(batch["metadata"], batch_size)
         batch_start = time.perf_counter()
-        result = integrated.predict_batch(
-            batch,
-            batch_rows,
-            source_batch_size=source_batch_size,
-            profile_components=profile_components,
-        )
+        context = torch.inference_mode() if inference_mode else nullcontext()
+        with context:
+            result = integrated.predict_batch(
+                batch,
+                batch_rows,
+                source_batch_size=source_batch_size,
+                profile_components=profile_components,
+            )
         total_latency_s = time.perf_counter() - batch_start + data_loading_s
         if total_batches >= warmup_batches:
             timings = dict(result["timings"])
@@ -209,6 +241,7 @@ def evaluate_once(
             timings["raw_input_to_output_latency_s"] = total_latency_s
             runtime.update(timings, batch_size, sum(result["source_counts"]))
             measured_batches += 1
+        source_counts.extend(int(value) for value in result["source_counts"])
 
         temperature = result["temperature"]
         final = result["final_temperature_K"]
@@ -263,8 +296,15 @@ def evaluate_once(
         "chiplet_mean_temperature": chip_mean_acc.compute("mae_K"),
         "chiplet_peak_temperature": chip_peak_acc.compute("mae_K"),
         "inter_chiplet_delta_T": chip_delta_acc.compute("mae_K"),
+        "parameter_counts": {
+            "source_response": integrated.manifest().get("source_parameter_count"),
+            "residual_package_model": integrated.manifest().get("residual_parameter_count"),
+        },
     }
     runtime_payload = runtime.compute()
+    if device.type == "cuda":
+        runtime_payload["peak_cuda_memory_allocated_bytes"] = int(torch.cuda.max_memory_allocated(device))
+        runtime_payload["peak_cuda_memory_reserved_bytes"] = int(torch.cuda.max_memory_reserved(device))
     runtime_payload["hotspot_reference_s_per_package"] = HOTSPOT_REFERENCE_S
     runtime_payload["speedup_vs_hotspot"] = (
         HOTSPOT_REFERENCE_S / runtime_payload["runtime_per_package_s"]
@@ -288,8 +328,18 @@ def evaluate_once(
             "timed_batches": timed_batches,
             "warning_tolerance_K": WARNING_TOLERANCE_K,
             "hard_tolerance_K": HARD_TOLERANCE_K,
+            "inference_mode": inference_mode,
+            "pinned_memory": pinned_memory,
         }
     )
+    source_counts_array = np.asarray(source_counts, dtype=np.float64) if source_counts else np.asarray([], dtype=np.float64)
+    metrics_payload["source_counts_per_package"] = {
+        "mean": float(source_counts_array.mean()) if source_counts_array.size else None,
+        "min": float(source_counts_array.min()) if source_counts_array.size else None,
+        "max": float(source_counts_array.max()) if source_counts_array.size else None,
+        "p50": float(np.percentile(source_counts_array, 50)) if source_counts_array.size else None,
+        "p95": float(np.percentile(source_counts_array, 95)) if source_counts_array.size else None,
+    }
     return {
         "num_samples": final_acc.num_samples,
         "metrics_payload": metrics_payload,
@@ -320,6 +370,21 @@ def compare_cached_batch(
     cached_base = torch.from_numpy(np.stack(source_base_values).astype(np.float32, copy=False))
     cached_result = integrated.residual_from_base(batch, cached_base)
     equivalence.update("source_superposition_base_K", integrated_result["source_superposition_base_K"], cached_base.to(integrated.device))
+    left_components = integrated_result.get("components", {})
+    right_components = cached_result.get("components", {})
+    component_pairs = {
+        "cnn_mean_rise_correction_K": ("cnn_mean_rise", "cnn_mean_rise"),
+        "cnn_centered_field_correction_K": ("cnn_centered_field", "cnn_centered_field"),
+        "graph_mean_rise_correction_K": ("graph_mean_delta", "graph_mean_delta"),
+        "graph_centered_field_correction_K": ("graph_correction_field", "graph_correction_field"),
+        "residual_mean_rise_total_K": ("mean_rise", "mean_rise"),
+        "residual_centered_field_total_K": ("centered_field", "centered_field"),
+    }
+    for label, (left_key, right_key) in component_pairs.items():
+        left = left_components.get(left_key)
+        right = right_components.get(right_key)
+        if left is not None and right is not None:
+            equivalence.update(label, left, right)
     equivalence.update("cnn_only_temperature_K", integrated_result["cnn_only_temperature_K"], cached_result["cnn_only_temperature_K"])
     graph_left = integrated_result.get("graph_correction_K")
     graph_right = cached_result.get("graph_correction_K")
@@ -438,6 +503,8 @@ class RuntimeAccumulator:
             "runtime_total_s": total_latency,
             "runtime_per_package_s": total_latency / max(self.total_packages, 1),
             "runtime_per_source_s": total_latency / max(self.total_sources, 1),
+            "throughput_packages_per_s": self.total_packages / total_latency if total_latency > 0 else None,
+            "batch_latency_s": summarize_runtime_values(self.values.get("raw_input_to_output_latency_s", [])),
             "components": {},
         }
         for key, values in sorted(self.values.items()):
@@ -447,6 +514,7 @@ class RuntimeAccumulator:
                 "mean_s_per_batch": float(arr.mean()),
                 "median_s_per_batch": float(np.median(arr)),
                 "p95_s_per_batch": float(np.percentile(arr, 95)),
+                "p99_s_per_batch": float(np.percentile(arr, 99)),
                 "mean_s_per_package": float(arr.sum() / max(self.total_packages, 1)),
             }
         return result
@@ -454,7 +522,7 @@ class RuntimeAccumulator:
 
 class EquivalenceAccumulator:
     def __init__(self) -> None:
-        self.items: dict[str, MetricAccumulator] = defaultdict(MetricAccumulator)
+        self.items: dict[str, DifferenceAccumulator] = defaultdict(DifferenceAccumulator)
 
     def update(self, name: str, left: torch.Tensor, right: torch.Tensor) -> None:
         self.items[name].update(left, right)
@@ -462,11 +530,11 @@ class EquivalenceAccumulator:
     def compute(self) -> dict[str, Any]:
         values = {
             name: {
-                "max_abs_diff_K": metric.compute().get("max_abs_error_K", 0.0),
-                "mean_abs_diff_K": metric.compute().get("mae_K", 0.0),
-                "rmse_diff_K": metric.compute().get("rmse_K", 0.0),
-                "warning": metric.compute().get("max_abs_error_K", 0.0) > WARNING_TOLERANCE_K,
-                "ok": metric.compute().get("max_abs_error_K", 0.0) <= HARD_TOLERANCE_K,
+                "max_abs_diff_K": metric.compute().get("max_abs_diff_K", 0.0),
+                "mean_abs_diff_K": metric.compute().get("mean_abs_diff_K", 0.0),
+                "rmse_diff_K": metric.compute().get("rmse_diff_K", 0.0),
+                "warning": metric.compute().get("max_abs_diff_K", 0.0) > WARNING_TOLERANCE_K,
+                "ok": metric.compute().get("max_abs_diff_K", 0.0) <= HARD_TOLERANCE_K,
             }
             for name, metric in sorted(self.items.items())
         }
@@ -479,19 +547,98 @@ class EquivalenceAccumulator:
         }
 
 
-def runtime_summary_row(package_batch_size: int, payload: dict[str, Any]) -> dict[str, Any]:
+class DifferenceAccumulator:
+    def __init__(self) -> None:
+        self.count = 0
+        self.sum_abs = 0.0
+        self.sum_sq = 0.0
+        self.max_abs = 0.0
+
+    def update(self, left: torch.Tensor, right: torch.Tensor) -> None:
+        left_cpu = left.detach().float().cpu()
+        right_cpu = right.detach().float().cpu()
+        if tuple(left_cpu.shape) != tuple(right_cpu.shape):
+            raise ValueError(f"equivalence shape mismatch: {tuple(left_cpu.shape)} != {tuple(right_cpu.shape)}")
+        diff = left_cpu - right_cpu
+        abs_diff = diff.abs()
+        self.count += int(diff.numel())
+        self.sum_abs += float(abs_diff.sum().item())
+        self.sum_sq += float((diff * diff).sum().item())
+        self.max_abs = max(self.max_abs, float(abs_diff.max().item()))
+
+    def compute(self) -> dict[str, float]:
+        if self.count == 0:
+            return {}
+        return {
+            "max_abs_diff_K": self.max_abs,
+            "mean_abs_diff_K": self.sum_abs / self.count,
+            "rmse_diff_K": (self.sum_sq / self.count) ** 0.5,
+        }
+
+
+def runtime_summary_row(package_batch_size: int, source_batch_size: int, payload: dict[str, Any]) -> dict[str, Any]:
     runtime = payload["runtime"]
     row = {
         "package_batch_size": package_batch_size,
+        "source_batch_size": source_batch_size,
         "num_packages": runtime.get("num_packages"),
         "num_sources": runtime.get("num_sources"),
         "runtime_per_package_s": runtime.get("runtime_per_package_s"),
         "runtime_per_source_s": runtime.get("runtime_per_source_s"),
+        "throughput_packages_per_s": runtime.get("throughput_packages_per_s"),
         "speedup_vs_hotspot": runtime.get("speedup_vs_hotspot"),
+        "peak_cuda_memory_allocated_bytes": runtime.get("peak_cuda_memory_allocated_bytes"),
     }
     for name, component in sorted(runtime.get("components", {}).items()):
         row[f"{name}_per_package_s"] = component.get("mean_s_per_package")
     return row
+
+
+def runtime_component_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = []
+    for name, component in sorted(payload["runtime"].get("components", {}).items()):
+        row = {"component": name}
+        row.update(component)
+        rows.append(row)
+    return rows
+
+
+def optimization_comparison_row(args: argparse.Namespace, payload: dict[str, Any]) -> dict[str, Any]:
+    final = payload["metrics_payload"].get("final_temperature", {})
+    equivalence = payload.get("equivalence", {})
+    max_diff = None
+    if equivalence.get("comparisons"):
+        max_diff = max(float(item.get("max_abs_diff_K", 0.0)) for item in equivalence["comparisons"].values())
+    return {
+        "precision": args.precision,
+        "inference_mode": bool(args.inference_mode),
+        "channels_last": bool(args.channels_last),
+        "compile_source": bool(args.compile_source),
+        "compile_package_cnn": bool(args.compile_package_cnn),
+        "compile_graph": bool(args.compile_graph),
+        "device_summation": bool(args.device_summation),
+        "pinned_memory": bool(args.pinned_memory),
+        "non_blocking_transfer": bool(args.non_blocking_transfer),
+        "package_batch_size": args.package_batch_size[0],
+        "source_batch_size": args.source_batch_size[0],
+        "final_mae_K": final.get("mae_K"),
+        "runtime_per_package_s": payload["runtime"].get("runtime_per_package_s"),
+        "speedup_vs_hotspot": payload["runtime"].get("speedup_vs_hotspot"),
+        "max_equivalence_diff_K": max_diff,
+        "equivalence_ok": equivalence.get("ok"),
+    }
+
+
+def summarize_runtime_values(values: list[float]) -> dict[str, float]:
+    if not values:
+        return {}
+    arr = np.asarray(values, dtype=np.float64)
+    return {
+        "mean_s": float(arr.mean()),
+        "median_s": float(np.median(arr)),
+        "p95_s": float(np.percentile(arr, 95)),
+        "p99_s": float(np.percentile(arr, 99)),
+    }
 
 
 def metadata_values(metadata: dict[str, Any], key: str, batch_size: int) -> list[Any]:
@@ -518,6 +665,18 @@ def validate_cached_rows(
             )
         if not cached.get("source_superposition_base_path"):
             raise SystemExit(f"cached row {index} missing source_superposition_base_path")
+        if cached.get("source_base_mode") and cached["source_base_mode"] != "source_superposition_v1":
+            raise SystemExit(f"cached row {index} has incompatible source_base_mode={cached['source_base_mode']}")
+        if cached.get("source_base_shape") and cached["source_base_shape"] != "64x64":
+            raise SystemExit(f"cached row {index} has incompatible source_base_shape={cached['source_base_shape']}")
+        if cached.get("source_base_dtype") and cached["source_base_dtype"] != "float32":
+            raise SystemExit(f"cached row {index} has incompatible source_base_dtype={cached['source_base_dtype']}")
+        if cached.get("source_count") and canonical.get("num_chiplets"):
+            if int(float(cached["source_count"])) != int(float(canonical["num_chiplets"])):
+                raise SystemExit(
+                    f"cached row {index} source_count mismatch: "
+                    f"{cached['source_count']} != canonical num_chiplets {canonical['num_chiplets']}"
+                )
         cached_hash = cached.get("source_checkpoint_sha256")
         if expected_source_hash and cached_hash and cached_hash != expected_source_hash:
             raise SystemExit(

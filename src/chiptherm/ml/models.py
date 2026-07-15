@@ -848,6 +848,76 @@ class FeatureFusionFiLMMiniUNet(nn.Module):
             return output, global_features
         return output
 
+    def forward_profile(
+        self,
+        x: torch.Tensor,
+        metadata_embedding: torch.Tensor | None = None,
+        *,
+        disabled_fusion_scales: tuple[str, ...] | list[str] = (),
+        synchronize: object | None = None,
+        return_features: bool = False,
+    ) -> tuple[torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]], dict[str, float]]:
+        timings: dict[str, float] = {}
+
+        def tic() -> float:
+            if synchronize is not None:
+                synchronize()
+            return time.perf_counter()
+
+        def toc(name: str, start: float) -> None:
+            if synchronize is not None:
+                synchronize()
+            timings[name] = timings.get(name, 0.0) + time.perf_counter() - start
+
+        disabled = {str(scale) for scale in disabled_fusion_scales}
+        skips: list[torch.Tensor] = []
+        h = x
+        start = tic()
+        for index, encoder in enumerate(self.encoders):
+            h = encoder(h)
+            if index < len(self.encoders) - 1:
+                skips.append(h)
+                h = self.pool(h)
+        h = self.bottleneck_film(h, metadata_embedding)
+        toc("feature_fusion_local_encoder_bottleneck_s", start)
+
+        start = tic()
+        global_features = self.global_encoder(x)
+        toc("feature_fusion_global_encoder_s", start)
+
+        start = tic()
+        h = self.fuse16(h, global_features["16"], enabled="16" not in disabled and "all" not in disabled)
+        toc("feature_fusion_16_s", start)
+
+        skip32, skip64 = skips[-1], skips[0]
+        start = tic()
+        h = F.interpolate(h, size=skip32.shape[-2:], mode="bilinear", align_corners=False)
+        h = self.decoder32(torch.cat([h, skip32], dim=1))
+        h = self.decoder32_film(h, metadata_embedding)
+        toc("feature_fusion_decoder32_s", start)
+
+        start = tic()
+        h = self.fuse32(h, global_features["32"], enabled="32" not in disabled and "all" not in disabled)
+        toc("feature_fusion_32_s", start)
+
+        start = tic()
+        h = F.interpolate(h, size=skip64.shape[-2:], mode="bilinear", align_corners=False)
+        h = self.decoder64(torch.cat([h, skip64], dim=1))
+        h = self.decoder64_film(h, metadata_embedding)
+        toc("feature_fusion_decoder64_s", start)
+
+        start = tic()
+        h = self.fuse64(h, global_features["64"], enabled="64" not in disabled and "all" not in disabled)
+        toc("feature_fusion_64_s", start)
+
+        start = tic()
+        output = self.head(h)
+        toc("feature_fusion_centered_head_s", start)
+
+        if return_features:
+            return (output, global_features), timings
+        return output, timings
+
     def config(self) -> dict[str, object]:
         return {
             "feature_fusion_channels": list(self.channels),
@@ -1225,14 +1295,45 @@ class DecomposedMiniUNetWithFeatureFusion(nn.Module):
                 synchronize()
             timings[name] = timings.get(name, 0.0) + time.perf_counter() - start
 
+        if metadata is None:
+            raise ValueError("feature-fusion decomposed model requires metadata tensor")
         start = tic()
-        outputs = self.forward_components(
+        embedding = self.metadata_encoder(metadata)
+        toc("metadata_encoder_s", start)
+        start_total = tic()
+        coarse_result, coarse_timings = self.coarse_model.forward_profile(
             x,
-            metadata,
-            return_diagnostics=True,
+            embedding,
             disabled_fusion_scales=disabled_fusion_scales,
+            synchronize=synchronize,
+            return_features=True,
         )
-        toc("feature_fusion_cnn_branch_s", start)
+        timings.update(coarse_timings)
+        coarse, global_features = coarse_result
+        start = tic()
+        selected = x[:, list(self.refinement_channel_indices), :, :]
+        detail = self.refinement_model(torch.cat([selected, coarse], dim=1), embedding)
+        centered = coarse + detail
+        centered = centered - centered.mean(dim=(-2, -1), keepdim=True)
+        toc("feature_fusion_refinement_s", start)
+        start = tic()
+        pooled = x.mean(dim=(-2, -1))
+        mean_rise = self.mean_head(torch.cat([embedding, pooled], dim=1)).squeeze(1)
+        toc("feature_fusion_mean_head_s", start)
+        outputs = {
+            "mean_rise": mean_rise,
+            "centered_field": centered.squeeze(1),
+            "coarse_centered_field": (coarse - coarse.mean(dim=(-2, -1), keepdim=True)).squeeze(1),
+            "detail_field": detail.squeeze(1),
+        }
+        disabled = {str(scale) for scale in disabled_fusion_scales}
+        outputs["global_fusion_enabled_16"] = centered.new_full((centered.shape[0],), 0.0 if "all" in disabled or "16" in disabled else 1.0)
+        outputs["global_fusion_enabled_32"] = centered.new_full((centered.shape[0],), 0.0 if "all" in disabled or "32" in disabled else 1.0)
+        outputs["global_fusion_enabled_64"] = centered.new_full((centered.shape[0],), 0.0 if "all" in disabled or "64" in disabled else 1.0)
+        for scale, feature in global_features.items():
+            if scale in {"16", "32", "64"}:
+                outputs[f"global_feature_{scale}_abs_mean"] = feature.abs().mean(dim=(1, 2, 3))
+        toc("feature_fusion_cnn_branch_s", start_total)
         return outputs, timings
 
     def config(self) -> dict[str, object]:
@@ -1462,6 +1563,7 @@ class DecomposedMiniUNetWithGraph(nn.Module):
         centered = centered - centered.mean(dim=(-2, -1), keepdim=True)
         mean_delta = self.graph_mean_head(graph_outputs["graph_embedding"]).squeeze(1)
         outputs = dict(cnn_outputs)
+        outputs["cnn_mean_rise"] = cnn_outputs["mean_rise"]
         outputs["cnn_centered_field"] = cnn_centered
         outputs["graph_correction_field"] = correction
         outputs["scaled_graph_correction_field"] = scaled_correction
@@ -1529,12 +1631,13 @@ class DecomposedMiniUNetWithGraph(nn.Module):
 
         start = tic()
         if self.feature_fusion_enabled:
-            cnn_outputs = self.cnn_model(
+            cnn_outputs, cnn_timings = self.cnn_model.forward_profile(
                 x,
                 metadata,
-                return_diagnostics=True,
+                synchronize=synchronize,
                 disabled_fusion_scales=disabled_fusion_scales,
             )
+            timings.update(cnn_timings)
         elif self.global_branch_enabled:
             cnn_outputs = self.cnn_model(x, metadata, global_correction_scale=global_correction_scale)
         else:
@@ -1558,8 +1661,13 @@ class DecomposedMiniUNetWithGraph(nn.Module):
         correction = correction - correction.mean(dim=(-2, -1), keepdim=True)
         centered = cnn_centered + correction * float(graph_correction_scale)
         centered = centered - centered.mean(dim=(-2, -1), keepdim=True)
+        toc("fusion_head_s", start)
+        start = tic()
         mean_delta = self.graph_mean_head(graph_outputs["graph_embedding"]).squeeze(1)
+        toc("graph_mean_head_s", start)
+        start = tic()
         outputs = dict(cnn_outputs)
+        outputs["cnn_mean_rise"] = cnn_outputs["mean_rise"]
         outputs["cnn_centered_field"] = cnn_centered
         outputs["graph_correction_field"] = correction
         outputs["scaled_graph_correction_field"] = correction * float(graph_correction_scale)
@@ -1568,7 +1676,7 @@ class DecomposedMiniUNetWithGraph(nn.Module):
         outputs["graph_raster_features"] = graph_maps
         outputs["node_embeddings"] = graph_outputs["node_embeddings"]
         outputs["global_graph_embedding"] = graph_outputs["graph_embedding"]
-        toc("fusion_head_s", start)
+        toc("graph_final_reconstruction_s", start)
         return outputs, timings
 
     def config(self) -> dict[str, object]:
