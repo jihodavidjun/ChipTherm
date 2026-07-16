@@ -31,7 +31,8 @@ from scripts.build_full_source_superposition_base import (
     write_index,
 )
 from scripts.build_source_superposition_extension_splits import normalize_row_paths
-from scripts.merge_source_superposition_20case import repair_original_rows_from_canonical
+from scripts.merge_source_superposition_20case import build_original_cached_rows
+from scripts.merge_source_superposition_20case import validate_cached_required_paths, validate_live_required_paths
 
 
 def main() -> None:
@@ -42,6 +43,7 @@ def main() -> None:
     test_canonical_source_paths_use_explicit_extension_paths()
     test_extension_source_rows_keep_compatibility_physics_columns()
     test_20case_merge_rebases_original_general_paths_from_canonical_rows()
+    test_20case_cached_validator_allows_blank_legacy_paths_but_live_validator_reports_them()
     test_source_superposition_extension_row_with_blank_compatibility_paths_collates()
     print("full source-superposition base tests passed")
 
@@ -267,13 +269,19 @@ def test_20case_merge_rebases_original_general_paths_from_canonical_rows() -> No
             "graph_path": str(retained / "graph.npz"),
             "num_chiplets": "7",
         }
-        repaired, report = repair_original_rows_from_canonical([source_row], [canonical_row_for_uid])
+        repaired, report = build_original_cached_rows(
+            [source_row],
+            [canonical_row_for_uid],
+            root / "merged",
+            overwrite_targets=False,
+            write_targets=True,
+        )
         row = repaired[0]
         assert report["repaired_rows"] == 1
         assert row["x_path"] == canonical_row_for_uid["x_path"]
-        assert row["y_path"] == canonical_row_for_uid["y_path"]
-        assert row["prediction_path"] == canonical_row_for_uid["prediction_path"]
-        assert row["residual_path"] == canonical_row_for_uid["residual_path"]
+        assert row["y_path"].endswith("reconstructed_targets/train/case01/training_set_1k_case01_sample_000002_y.npy")
+        assert row["prediction_path"] == ""
+        assert row["residual_path"] == ""
         assert row["graph_path"] == canonical_row_for_uid["graph_path"]
         assert row["dataset_source"] == "clean"
         assert row["source_superposition_base_path"] == str(source_base)
@@ -281,6 +289,57 @@ def test_20case_merge_rebases_original_general_paths_from_canonical_rows() -> No
         assert row["source_checkpoint_sha256"] == "abc"
         assert row["source_count"] == "4"
         assert row["source_base_mode"] == "source_superposition_v1"
+        assert row["cached_training_ready"] == "1"
+        assert row["live_integrated_inference_ready"] == "0"
+        assert row["reconstructed_target"] == "1"
+        target = np.load(root / "merged/reconstructed_targets/train/case01/training_set_1k_case01_sample_000002_y.npy")
+        assert target.shape == (64, 64)
+        assert np.allclose(target, 0.0)
+
+
+def test_20case_cached_validator_allows_blank_legacy_paths_but_live_validator_reports_them() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        x = root / "x.npy"
+        y = root / "y.npy"
+        graph = root / "graph.npz"
+        base = root / "base.npy"
+        np.save(x, np.zeros((33, 64, 64), dtype=np.float32))
+        np.save(y, np.zeros((64, 64), dtype=np.float32))
+        np.save(base, np.zeros((64, 64), dtype=np.float32))
+        np.savez_compressed(
+            graph,
+            node_features=np.zeros((1, 24), dtype=np.float32),
+            edge_index=np.zeros((2, 0), dtype=np.int64),
+            edge_features=np.zeros((0, 15), dtype=np.float32),
+            chiplet_rects=np.zeros((1, 4), dtype=np.float32),
+            package_size=np.asarray([64, 64], dtype=np.float32),
+        )
+        row = {
+            "sample_uid": "uid_cached",
+            "case_id": "case01",
+            "split": "train",
+            "x_path": str(x),
+            "y_path": str(y),
+            "graph_path": str(graph),
+            "source_superposition_base_path": str(base),
+            "prediction_path": "",
+            "residual_path": "",
+            "layout_path": "",
+            "power_path": "",
+            "package_path": "",
+            "hotspot_path": "",
+            "source_dir": "",
+            "source_base_mode": "source_superposition_v1",
+        }
+        assert validate_cached_required_paths("p", "train", row) == []
+        live_failures = validate_live_required_paths("p", "train", row)
+        assert {failure["column"] for failure in live_failures} == {
+            "layout_path",
+            "power_path",
+            "package_path",
+            "source_dir",
+        }
 
 
 def test_source_superposition_extension_row_with_blank_compatibility_paths_collates() -> None:
