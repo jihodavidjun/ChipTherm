@@ -35,6 +35,7 @@ from scripts.build_full_source_superposition_base import (  # noqa: E402
     sha256_file,
     sidecar_path,
 )
+from scripts.evaluate_full_source_superposition_base import base_metrics, summarize_by_case, summarize_overall, write_csv  # noqa: E402
 
 
 def main() -> int:
@@ -79,6 +80,7 @@ def main() -> int:
         "manifest_checkpoint_sha256": manifest.get("source_checkpoint_sha256"),
         "splits": {},
     }
+    metric_records: list[dict[str, Any]] = []
     if manifest.get("source_checkpoint_sha256") != checkpoint_sha:
         errors.append("checkpoint sha256 does not match manifest")
 
@@ -116,6 +118,9 @@ def main() -> int:
             try:
                 validate_map_file(map_path)
                 validate_sidecar(map_path, generated, checkpoint_sha)
+                target = np.load(resolve_path(generated["y_path"], generated_path.parent)).astype(np.float64, copy=False)
+                base = np.load(map_path).astype(np.float64, copy=False)
+                metric_records.append(base_metrics(generated, split, base, target))
                 checked_maps += 1
             except Exception as exc:
                 split_errors.append(f"row {index} map validation failed: {exc}")
@@ -140,6 +145,8 @@ def main() -> int:
         if overlap:
             errors.append(f"{left}/{right} sample_uid overlap: {sorted(overlap)[:10]}")
     report["cross_split_uid_overlap_count"] = overlap_count
+    report["source_base_metrics"] = summarize_overall(metric_records)
+    write_csv(source_root / "source_base_metrics_by_case.csv", summarize_by_case(metric_records))
 
     if args.spot_check_count > 0 and spot_candidates:
         report["spot_checks"] = run_spot_checks(
@@ -163,6 +170,15 @@ def main() -> int:
     report["error_count"] = len(errors)
     report["errors"] = errors[:100]
     (source_root / "validation_report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    write_validation_markdown(source_root / "validation_report.md", report)
+    generation_manifest = dict(manifest)
+    generation_manifest["validation_summary"] = {
+        "ok": not errors,
+        "error_count": len(errors),
+        "spot_check_summary": report.get("spot_check_summary", {}),
+        "source_base_metrics": report.get("source_base_metrics", {}),
+    }
+    (source_root / "generation_manifest.json").write_text(json.dumps(generation_manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     if errors:
         print(f"Validation failed with {len(errors)} errors")
         for error in errors[:20]:
@@ -182,6 +198,34 @@ def main() -> int:
         )
     print(f"Report: {source_root / 'validation_report.json'}")
     return 0
+
+
+def write_validation_markdown(path: Path, report: dict[str, Any]) -> None:
+    lines = [
+        "# Source-Superposition Base Validation",
+        "",
+        f"OK: `{report['ok']}`",
+        f"Errors: {report['error_count']}",
+        "",
+        "## Splits",
+        "",
+        "| Split | Canonical rows | Generated rows | Checked maps |",
+        "|---|---:|---:|---:|",
+    ]
+    for split, item in sorted(report["splits"].items()):
+        lines.append(f"| {split} | {item['canonical_rows']} | {item['generated_rows']} | {item['checked_maps']} |")
+    lines.extend(["", "## Source-Base Metrics", ""])
+    metrics = report.get("source_base_metrics", {})
+    if metrics:
+        lines.extend(["| Split | Samples | MAE K | RMSE K | Centered MAE K |", "|---|---:|---:|---:|---:|"])
+        for split, item in sorted(metrics.items()):
+            lines.append(
+                f"| {split} | {item['num_samples']} | {item['mae_K']:.4f} | "
+                f"{item['rmse_K']:.4f} | {item['centered_field_mae_K']:.4f} |"
+            )
+    lines.extend(["", "## Errors", ""])
+    lines += [f"- {error}" for error in report.get("errors", [])] or ["- none"]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def validate_map_file(path: Path) -> None:

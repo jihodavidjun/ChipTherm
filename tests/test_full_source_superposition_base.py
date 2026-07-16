@@ -20,6 +20,7 @@ if str(SRC_ROOT) not in sys.path:
 from chiptherm.ml.dataset import ChipThermDataset
 from chiptherm.ml.source_response_dataset import SourceResponseNormalizationStats
 from scripts.build_full_source_superposition_base import (
+    canonical_source_paths,
     infer_package_maps,
     output_row,
     sidecar_path,
@@ -33,6 +34,7 @@ def main() -> None:
     test_write_index_preserves_order_and_columns()
     test_segment_sum_and_ambient_once()
     test_resume_rejects_stale_checkpoint()
+    test_canonical_source_paths_use_explicit_extension_paths()
     print("full source-superposition base tests passed")
 
 
@@ -153,6 +155,34 @@ def test_resume_rejects_stale_checkpoint() -> None:
         row = {"sample_uid": "uid_a", "case_id": "case01"}
         assert not valid_existing_map(map_path, sidecar_path(map_path), row, {"sha256": "new"})
         assert valid_existing_map(map_path, sidecar_path(map_path), row, {"sha256": "old"})
+
+
+def test_canonical_source_paths_use_explicit_extension_paths() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        source_dir = root / "extension_source"
+        source_dir.mkdir()
+        for name in ("layout.json", "power.yaml", "package.yaml", "hotspot.yaml"):
+            (source_dir / name).write_text("{}\n", encoding="utf-8")
+        x = root / "x.npy"
+        y = root / "y.npy"
+        g = root / "graph.npz"
+        np.save(x, np.zeros((13, 64, 64), dtype=np.float32))
+        np.save(y, np.zeros((64, 64), dtype=np.float32))
+        np.savez(g, node_features=np.zeros((1, 1), dtype=np.float32))
+        row = {
+            "sample_uid": "benchmark_extension_v1_case11_sample_000001",
+            "case_id": "case11",
+            "dataset_source": "benchmark_extension_v1_full",
+            "source_dir": str(source_dir),
+            "x_path": str(x),
+            "y_path": str(y),
+            "graph_path": str(g),
+        }
+        paths = canonical_source_paths(row)
+        assert paths["source_dir"] == source_dir
+        assert paths["layout"] == source_dir / "layout.json"
+        assert paths["power"] == source_dir / "power.yaml"
 
 
 def canonical_row(uid: str, root: Path) -> dict[str, str]:

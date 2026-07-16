@@ -40,10 +40,11 @@ MAP_DTYPE = "float32"
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Generate full canonical source-superposition base maps.")
-    parser.add_argument("--train-index", required=True, type=Path)
-    parser.add_argument("--val-index", required=True, type=Path)
-    parser.add_argument("--test-index", required=True, type=Path)
-    parser.add_argument("--checkpoint", required=True, type=Path)
+    parser.add_argument("--index", default=None, type=Path, help="Combined index with a split column; split-specific indexes are derived from it.")
+    parser.add_argument("--train-index", default=None, type=Path)
+    parser.add_argument("--val-index", default=None, type=Path)
+    parser.add_argument("--test-index", default=None, type=Path)
+    parser.add_argument("--checkpoint", "--source-checkpoint", dest="checkpoint", required=True, type=Path)
     parser.add_argument("--out-root", required=True, type=Path)
     parser.add_argument("--package-batch-size", default=8, type=int)
     parser.add_argument("--source-batch-size", default=64, type=int)
@@ -52,6 +53,12 @@ def main() -> int:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--max-samples", default=None, type=int)
+    parser.add_argument("--case-ids", nargs="+", default=None)
+    parser.add_argument("--precision", default="fp32", choices=["fp32"])
+    parser.add_argument("--device-summation", action="store_true", help="Reserved for compatibility; current implementation uses host float64 accumulation.")
+    parser.add_argument("--max-storage-gb", default=None, type=float)
+    parser.add_argument("--seed", default=0, type=int)
     args = parser.parse_args()
 
     if args.package_batch_size <= 0:
@@ -59,11 +66,18 @@ def main() -> int:
     if args.source_batch_size <= 0:
         raise SystemExit("--source-batch-size must be positive")
 
-    split_indices = {"train": args.train_index, "val": args.val_index, "test": args.test_index}
     out_root = args.out_root.expanduser().resolve()
     checkpoint = args.checkpoint.expanduser().resolve()
+    split_indices = prepare_split_indices(args, out_root)
     audit = audit_canonical_inputs(split_indices, checkpoint)
     print_audit(audit)
+    if args.max_storage_gb is not None:
+        estimated_gb = float(audit["estimated_map_storage_bytes"]) / (1024.0**3)
+        estimated_gb *= 2.0  # base map plus residual map
+        print(f"Estimated durable base+residual storage: {estimated_gb:.4f} GB")
+        print(f"Estimated temporary storage: <0.1 GB (microbatches are not persisted)")
+        if estimated_gb > args.max_storage_gb:
+            raise SystemExit(f"estimated storage {estimated_gb:.4f} GB exceeds --max-storage-gb {args.max_storage_gb:.4f}")
     if args.dry_run:
         out_root.mkdir(parents=True, exist_ok=True)
         (out_root / "alignment_report.json").write_text(json.dumps(audit, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -83,6 +97,7 @@ def main() -> int:
     checkpoint_identity = {
         "path": str(checkpoint),
         "sha256": checkpoint_sha,
+        "config_sha256": stable_json_sha256(checkpoint_payload.get("model_config", {})),
         "model_config": checkpoint_payload.get("model_config", {}),
     }
 
@@ -92,6 +107,7 @@ def main() -> int:
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "source_checkpoint": str(checkpoint),
         "source_checkpoint_sha256": checkpoint_sha,
+        "source_checkpoint_config_sha256": checkpoint_identity["config_sha256"],
         "source_model_config": checkpoint_payload.get("model_config", {}),
         "source_normalization": stats.to_dict(),
         "canonical_indices": {split: str(path.resolve()) for split, path in split_indices.items()},
@@ -101,6 +117,9 @@ def main() -> int:
         "map_dtype": MAP_DTYPE,
         "base_definition": "ambient_K + sum_i source_power_i * source_response_operator(source_i)",
         "generation_command": " ".join(sys.argv),
+        "precision": args.precision,
+        "device_summation_requested": bool(args.device_summation),
+        "device_summation_used": False,
         "git_commit": git_commit(),
         "splits": {},
     }
@@ -241,6 +260,50 @@ def print_audit(audit: dict[str, Any]) -> None:
         print("Problems:")
         for problem in audit["problems"]:
             print(f"  - {problem}")
+
+
+def prepare_split_indices(args: argparse.Namespace, out_root: Path) -> dict[str, Path]:
+    if args.index is not None:
+        _, rows = read_csv_with_fieldnames(args.index.expanduser().resolve())
+        if args.case_ids:
+            allowed = set(args.case_ids)
+            rows = [row for row in rows if row.get("case_id") in allowed]
+        if args.max_samples is not None:
+            rows = rows[: int(args.max_samples)]
+        if not rows:
+            raise SystemExit("--index selection produced zero rows")
+        split_dir = out_root / "_input_splits"
+        split_dir.mkdir(parents=True, exist_ok=True)
+        split_indices: dict[str, Path] = {}
+        fieldnames = list(rows[0].keys())
+        for split in SPLITS:
+            split_rows = [dict(row, split=split) for row in rows if row.get("split") == split]
+            path = split_dir / f"{split}_index.csv"
+            write_csv(path, split_rows, fieldnames)
+            split_indices[split] = path
+        return split_indices
+    missing = [name for name in ("train_index", "val_index", "test_index") if getattr(args, name) is None]
+    if missing:
+        raise SystemExit("provide either --index or all of --train-index/--val-index/--test-index")
+    split_indices = {"train": args.train_index, "val": args.val_index, "test": args.test_index}
+    filtered: dict[str, Path] = {}
+    if args.case_ids or args.max_samples is not None:
+        split_dir = out_root / "_input_splits"
+        split_dir.mkdir(parents=True, exist_ok=True)
+        allowed = set(args.case_ids or [])
+        remaining = args.max_samples
+        for split in SPLITS:
+            fields, rows = read_csv_with_fieldnames(split_indices[split])
+            if allowed:
+                rows = [row for row in rows if row.get("case_id") in allowed]
+            if remaining is not None:
+                rows = rows[: max(0, int(remaining))]
+                remaining -= len(rows)
+            path = split_dir / f"{split}_index.csv"
+            write_csv(path, rows, fields)
+            filtered[split] = path
+        return filtered
+    return {split: path.expanduser().resolve() for split, path in split_indices.items()}
 
 
 @torch.no_grad()
@@ -399,9 +462,9 @@ def save_map_and_sidecar(
 ) -> None:
     map_path.parent.mkdir(parents=True, exist_ok=True)
     residual_path.parent.mkdir(parents=True, exist_ok=True)
-    np.save(map_path, base_map.astype(np.float32, copy=False))
+    atomic_save_npy(map_path, base_map.astype(np.float32, copy=False))
     target = np.load(resolve_path(row["y_path"])).astype(np.float32, copy=False)
-    np.save(residual_path, (target - base_map).astype(np.float32, copy=False))
+    atomic_save_npy(residual_path, (target - base_map).astype(np.float32, copy=False))
     metadata = {
         "schema_version": 1,
         "sample_uid": row["sample_uid"],
@@ -460,7 +523,13 @@ def ensure_residual(row: dict[str, str], map_path: Path, residual_path: Path) ->
     target = np.load(resolve_path(row["y_path"])).astype(np.float32, copy=False)
     base = np.load(map_path).astype(np.float32, copy=False)
     residual_path.parent.mkdir(parents=True, exist_ok=True)
-    np.save(residual_path, (target - base).astype(np.float32, copy=False))
+    atomic_save_npy(residual_path, (target - base).astype(np.float32, copy=False))
+
+
+def atomic_save_npy(path: Path, array: np.ndarray) -> None:
+    tmp_path = path.with_name(path.name + ".tmp.npy")
+    np.save(tmp_path, array)
+    tmp_path.replace(path)
 
 
 def output_row(
@@ -475,6 +544,9 @@ def output_row(
     result["source_superposition_residual_path"] = repo_relative(residual_path)
     result["source_checkpoint"] = checkpoint_identity["path"]
     result["source_checkpoint_sha256"] = checkpoint_identity["sha256"]
+    result["source_checkpoint_config_sha256"] = str(
+        checkpoint_identity.get("config_sha256") or stable_json_sha256(checkpoint_identity.get("model_config", {}))
+    )
     result["source_count"] = str(row.get("num_chiplets", ""))
     result["source_model_version"] = str(checkpoint_identity["model_config"].get("architecture", "source_response_operator_v1"))
     result["source_base_units"] = "absolute_temperature_K"
@@ -502,6 +574,7 @@ def write_index(path: Path, canonical_rows: list[dict[str, str]], generated_rows
         "source_superposition_residual_path",
         "source_checkpoint",
         "source_checkpoint_sha256",
+        "source_checkpoint_config_sha256",
         "source_count",
         "source_model_version",
         "source_base_units",
@@ -551,10 +624,10 @@ def canonical_source_paths(row: dict[str, str]) -> dict[str, Path]:
     source_dir = source_dir_for_row(row)
     return {
         "source_dir": source_dir,
-        "layout": source_dir / "layout.json",
-        "power": source_dir / "power.yaml",
-        "package": source_dir / "package.yaml",
-        "hotspot": source_dir / "hotspot.yaml",
+        "layout": resolve_path(row.get("layout_path", ""), source_dir) if row.get("layout_path") else source_dir / "layout.json",
+        "power": resolve_path(row.get("power_path", ""), source_dir) if row.get("power_path") else source_dir / "power.yaml",
+        "package": resolve_path(row.get("package_path", ""), source_dir) if row.get("package_path") else source_dir / "package.yaml",
+        "hotspot": resolve_path(row.get("hotspot_path", ""), source_dir) if row.get("hotspot_path") else source_dir / "hotspot.yaml",
         "x": resolve_path(row["x_path"]),
         "y": resolve_path(row["y_path"]),
         "graph": resolve_path(row["graph_path"]) if row.get("graph_path") else source_dir,
@@ -562,6 +635,8 @@ def canonical_source_paths(row: dict[str, str]) -> dict[str, Path]:
 
 
 def source_dir_for_row(row: dict[str, str]) -> Path:
+    if row.get("source_dir"):
+        return resolve_path(row["source_dir"])
     case_id = row["case_id"]
     original = row.get("original_sample_uid") or row["sample_uid"]
     sample_name = original
@@ -650,6 +725,11 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: fp.read(1024 * 1024), b""):
             hasher.update(chunk)
     return hasher.hexdigest()
+
+
+def stable_json_sha256(payload: Any) -> str:
+    data = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(data).hexdigest()
 
 
 def repo_relative(path: Path) -> str:
