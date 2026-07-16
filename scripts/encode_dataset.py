@@ -212,7 +212,11 @@ def _write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
 
 
 def _rel(root: Path, path: Path) -> str:
-    return str(path.resolve().relative_to(root.resolve()))
+    resolved = path.resolve()
+    try:
+        return str(resolved.relative_to(REPO_ROOT))
+    except ValueError:
+        return str(resolved.relative_to(root.resolve()))
 
 
 def resolve_path(path_value: str, base: Path) -> Path:

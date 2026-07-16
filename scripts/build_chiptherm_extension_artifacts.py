@@ -9,8 +9,26 @@ import shlex
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+PATH_COLUMNS = (
+    "x_path",
+    "y_path",
+    "layout_path",
+    "power_path",
+    "package_path",
+    "hotspot_path",
+    "benchmark_path",
+    "source_dir",
+    "original_temp_path",
+    "temp_layer0_path",
+    "prediction_path",
+    "residual_path",
+    "graph_path",
+    "source_superposition_base_path",
+    "source_superposition_residual_path",
+)
 
 
 def main() -> int:
@@ -20,6 +38,8 @@ def main() -> int:
     parser.add_argument("--index-name", default="all_extension_index.csv")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--repair-indices-only", action="store_true", help="Rewrite existing artifact CSV path columns to the canonical repo-relative contract.")
+    parser.add_argument("--audit-paths-only", action="store_true", help="Audit existing artifact CSV path references without rebuilding tensors.")
     args = parser.parse_args()
 
     extension_root = args.extension_root.resolve()
@@ -27,6 +47,28 @@ def main() -> int:
     encoded_root = out_root / "encoded_package_plus_power"
     graph_root = out_root / "package_plus_power_graph"
     index = extension_root / args.index_name
+    if args.repair_indices_only:
+        changed = repair_artifact_indices(out_root)
+        audit = audit_artifact_paths(out_root)
+        print(f"Repaired CSV path values: {changed}")
+        print(f"Rows checked: {audit['rows_checked']}")
+        print(f"Path references checked: {audit['path_references_checked']}")
+        print(f"Unresolved paths: {audit['unresolved_count']}")
+        if audit["unresolved_count"]:
+            for item in audit["unresolved"][:20]:
+                print(f"  {item['csv']} {item['sample_uid']} {item['column']}: {item['value']}")
+            raise SystemExit(2)
+        return 0
+    if args.audit_paths_only:
+        audit = audit_artifact_paths(out_root)
+        print(f"Rows checked: {audit['rows_checked']}")
+        print(f"Path references checked: {audit['path_references_checked']}")
+        print(f"Unresolved paths: {audit['unresolved_count']}")
+        if audit["unresolved_count"]:
+            for item in audit["unresolved"][:20]:
+                print(f"  {item['csv']} {item['sample_uid']} {item['column']}: {item['value']}")
+            raise SystemExit(2)
+        return 0
     if not index.exists():
         raise SystemExit(f"missing extension index: {index}")
     out_root.mkdir(parents=True, exist_ok=True)
@@ -149,6 +191,77 @@ def finalize_encoded_dataset(encoded_root: Path) -> None:
     (encoded_root / "context_manifest.json").write_text(json.dumps(context_manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def repair_artifact_indices(artifact_root: Path, *, repo_root: Path = REPO_ROOT) -> int:
+    artifact_root = artifact_root.resolve()
+    changed = 0
+    for csv_path in sorted(artifact_root.rglob("*.csv")):
+        rows = read_rows(csv_path)
+        if not rows:
+            continue
+        fieldnames = list(rows[0].keys())
+        row_changed = False
+        for row in rows:
+            for column in PATH_COLUMNS:
+                value = row.get(column, "")
+                if not value:
+                    continue
+                resolved = resolve_artifact_path(value, csv_path.parent, artifact_root, repo_root=repo_root)
+                repaired = repo_relative_to(resolved, repo_root=repo_root)
+                if repaired != value:
+                    row[column] = repaired
+                    changed += 1
+                    row_changed = True
+        if row_changed:
+            write_rows(csv_path, rows, fieldnames)
+            jsonl_path = csv_path.with_suffix(".jsonl")
+            if jsonl_path.exists():
+                with jsonl_path.open("w", encoding="utf-8") as fp:
+                    for row in rows:
+                        fp.write(json.dumps(row, sort_keys=True) + "\n")
+    return changed
+
+
+def audit_artifact_paths(artifact_root: Path, *, repo_root: Path = REPO_ROOT) -> dict[str, Any]:
+    artifact_root = artifact_root.resolve()
+    unresolved: list[dict[str, str]] = []
+    rows_checked = 0
+    refs_checked = 0
+    for csv_path in sorted(artifact_root.rglob("*.csv")):
+        if csv_path.name in {"metadata_features.csv", "case_statistics.csv", "sample_statistics.csv", "source_validation_failures.csv", "hotspot_failures.csv"}:
+            continue
+        rows = read_rows(csv_path)
+        for row in rows:
+            if not any(column in row for column in PATH_COLUMNS):
+                continue
+            rows_checked += 1
+            for column in PATH_COLUMNS:
+                value = row.get(column, "")
+                if not value:
+                    continue
+                refs_checked += 1
+                resolved = resolve_artifact_path(value, csv_path.parent, artifact_root, repo_root=repo_root)
+                if not resolved.exists():
+                    unresolved.append(
+                        {
+                            "csv": repo_relative_to(csv_path, repo_root=repo_root),
+                            "sample_uid": row.get("sample_uid", ""),
+                            "column": column,
+                            "value": value,
+                            "resolved": str(resolved),
+                        }
+                    )
+    report = {
+        "schema_version": 1,
+        "artifact_root": repo_relative_to(artifact_root, repo_root=repo_root),
+        "rows_checked": rows_checked,
+        "path_references_checked": refs_checked,
+        "unresolved_count": len(unresolved),
+        "unresolved": unresolved,
+    }
+    (artifact_root / "path_audit_report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return report
+
+
 def resolve_index_path(path_value: str, dataset_root: Path) -> Path:
     path = Path(path_value).expanduser()
     if path.is_absolute():
@@ -160,10 +273,32 @@ def resolve_index_path(path_value: str, dataset_root: Path) -> Path:
     return candidates[0]
 
 
+def resolve_artifact_path(value: str, csv_root: Path, artifact_root: Path, *, repo_root: Path = REPO_ROOT) -> Path:
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return path
+    candidates = [
+        repo_root / path,
+        csv_root / path,
+        artifact_root / "encoded_package_plus_power" / path,
+        artifact_root / "package_plus_power_graph" / path,
+        artifact_root / path,
+        Path.cwd() / path,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
 def repo_relative(path: Path) -> str:
+    return repo_relative_to(path, repo_root=REPO_ROOT)
+
+
+def repo_relative_to(path: Path, *, repo_root: Path) -> str:
     path = path.resolve()
     try:
-        return str(path.relative_to(REPO_ROOT))
+        return str(path.relative_to(repo_root.resolve()))
     except ValueError:
         return str(path)
 

@@ -28,6 +28,24 @@ if str(SRC_ROOT) not in sys.path:
 from chiptherm.ml.graph_models import EDGE_FEATURE_NAMES, NODE_FEATURE_NAMES
 
 
+PATH_COLUMNS = (
+    "x_path",
+    "y_path",
+    "layout_path",
+    "power_path",
+    "package_path",
+    "hotspot_path",
+    "benchmark_path",
+    "source_dir",
+    "original_temp_path",
+    "temp_layer0_path",
+    "prediction_path",
+    "residual_path",
+    "source_superposition_base_path",
+    "source_superposition_residual_path",
+)
+
+
 TYPE_GROUPS = {
     "cpu": "cpu",
     "gpu": "gpu",
@@ -92,7 +110,7 @@ def main() -> int:
         bytes_written += out_path.stat().st_size
         node_counts[int(graph["node_features"].shape[0])] += 1
         edge_counts[int(graph["edge_features"].shape[0])] += 1
-        new_row = dict(row)
+        new_row = normalize_path_columns(row, source_root)
         new_row["graph_path"] = relative_to_repo(out_path)
         generated_rows.append(new_row)
 
@@ -256,6 +274,27 @@ def source_dir_for_row(row: dict[str, str]) -> Path:
     if sample_name.startswith(prefix):
         sample_name = sample_name[len(prefix) :]
     return REPO_ROOT / "data/runs/benchmarks" / row["dataset_source"] / case_id / sample_name / "source"
+
+
+def normalize_path_columns(row: dict[str, str], source_root: Path) -> dict[str, str]:
+    out = dict(row)
+    for column in PATH_COLUMNS:
+        value = out.get(column)
+        if not value:
+            continue
+        out[column] = relative_to_repo(resolve_path_value(value, source_root))
+    return out
+
+
+def resolve_path_value(value: str, base: Path) -> Path:
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return path
+    candidates = [REPO_ROOT / path, base / path, Path.cwd() / path]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
 
 
 def chiplet_power_map(power: dict[str, Any]) -> dict[str, float]:
