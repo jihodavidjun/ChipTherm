@@ -7,3 +7,5 @@ outputs/
 *.ttrace
 *.grid.steady
 *.grid.ttrace
+# Generated logs
+benchmark_extension_*.log
