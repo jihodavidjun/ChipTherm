@@ -27,6 +27,7 @@ from scripts.build_full_source_superposition_base import (
     valid_existing_map,
     write_index,
 )
+from scripts.build_source_superposition_extension_splits import normalize_row_paths
 
 
 def main() -> None:
@@ -35,6 +36,7 @@ def main() -> None:
     test_segment_sum_and_ambient_once()
     test_resume_rejects_stale_checkpoint()
     test_canonical_source_paths_use_explicit_extension_paths()
+    test_extension_source_rows_keep_compatibility_physics_columns()
     print("full source-superposition base tests passed")
 
 
@@ -183,6 +185,40 @@ def test_canonical_source_paths_use_explicit_extension_paths() -> None:
         assert paths["source_dir"] == source_dir
         assert paths["layout"] == source_dir / "layout.json"
         assert paths["power"] == source_dir / "power.yaml"
+
+
+def test_extension_source_rows_keep_compatibility_physics_columns() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        row = {
+            "sample_uid": "benchmark_extension_v1_case11_sample_000001",
+            "case_id": "case11",
+            "dataset_source": "benchmark_extension_v1_full",
+            "split": "train",
+            "x_path": str(root / "x.npy"),
+            "y_path": str(root / "y.npy"),
+            "graph_path": str(root / "graph.npz"),
+            "num_chiplets": "8",
+        }
+        result = output_row(
+            row,
+            root / "base.npy",
+            root / "residual.npy",
+            {"path": "ckpt.pt", "sha256": "abc", "model_config": {"architecture": "source_response_operator_v1"}},
+            "generated",
+        )
+        assert "prediction_path" in result
+        assert "residual_path" in result
+        assert result["prediction_path"] == ""
+        assert result["residual_path"] == ""
+        assert result["source_base_mode"] == "source_superposition_v1"
+
+        normalized = normalize_row_paths(result)
+        assert "prediction_path" in normalized
+        assert "residual_path" in normalized
+        assert normalized["prediction_path"] == ""
+        assert normalized["residual_path"] == ""
+        assert normalized["source_superposition_base_path"].endswith("base.npy")
 
 
 def canonical_row(uid: str, root: Path) -> dict[str, str]:

@@ -26,6 +26,8 @@ SPLITS = ("train", "val", "test")
 PATH_COLUMNS = (
     "x_path",
     "y_path",
+    "prediction_path",
+    "residual_path",
     "graph_path",
     "layout_path",
     "power_path",
@@ -246,6 +248,8 @@ def write_rows(path: Path, rows: list[dict[str, str]]) -> None:
 
 def normalize_row_paths(row: dict[str, str]) -> dict[str, str]:
     out = dict(row)
+    out.setdefault("prediction_path", "")
+    out.setdefault("residual_path", "")
     for column in PATH_COLUMNS:
         value = out.get(column, "")
         if value:

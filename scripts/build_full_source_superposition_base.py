@@ -540,6 +540,8 @@ def output_row(
     status: str,
 ) -> dict[str, str]:
     result = dict(row)
+    result.setdefault("prediction_path", "")
+    result.setdefault("residual_path", "")
     result["source_superposition_base_path"] = repo_relative(map_path)
     result["source_superposition_residual_path"] = repo_relative(residual_path)
     result["source_checkpoint"] = checkpoint_identity["path"]
@@ -570,6 +572,8 @@ def write_index(path: Path, canonical_rows: list[dict[str, str]], generated_rows
             raise ValueError(f"{path} row {index} sample_uid reordered: {left['sample_uid']} != {right['sample_uid']}")
     canonical_fields = list(canonical_rows[0].keys()) if canonical_rows else []
     appended = [
+        "prediction_path",
+        "residual_path",
         "source_superposition_base_path",
         "source_superposition_residual_path",
         "source_checkpoint",

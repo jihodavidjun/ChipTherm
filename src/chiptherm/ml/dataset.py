@@ -219,8 +219,8 @@ class ChipThermDataset(Dataset):
             "physics_runtime_s": self._optional_float(row.get("physics_runtime_s")),
             "x_path": row["x_path"],
             "y_path": row["y_path"],
-            "prediction_path": row["prediction_path"],
-            "residual_path": row["residual_path"],
+            "prediction_path": row.get("prediction_path", ""),
+            "residual_path": row.get("residual_path", ""),
             "effective_prediction_path": self._prediction_path_for_row(row),
             "effective_residual_path": self._residual_path_for_row(row),
             "ambient_K": self._ambient_for_row(row),
@@ -270,7 +270,7 @@ class ChipThermDataset(Dataset):
     def _physics_v1_path_for_row(self, row: dict[str, str]) -> str | None:
         mode = row.get("source_base_mode") or row.get("base_mode") or row.get("physics_input_mode")
         if mode == "source_superposition_v1":
-            return row.get("prediction_path")
+            return row.get("prediction_path") or None
         return None
 
     def _graph_for_row(self, row: dict[str, str]) -> dict[str, torch.Tensor] | None:
