@@ -209,7 +209,12 @@ def read_csv_rows(path: Path) -> tuple[list[str], list[dict[str, str]]]:
         reader = csv.DictReader(fp)
         fieldnames = list(reader.fieldnames or [])
         rows = [dict(row) for row in reader]
-    required = {"sample_uid", "original_sample_uid", "case_id", "dataset_source", "split", "x_path", "y_path", "prediction_path", "residual_path"}
+    for optional in ("prediction_path", "residual_path"):
+        if optional not in fieldnames:
+            fieldnames.append(optional)
+        for row in rows:
+            row.setdefault(optional, "")
+    required = {"sample_uid", "original_sample_uid", "case_id", "dataset_source", "split", "x_path", "y_path"}
     missing = sorted(required - set(fieldnames))
     if missing:
         raise SystemExit(f"{path} missing required columns: {', '.join(missing)}")
@@ -256,6 +261,19 @@ def find_context_manifest(source_root: Path) -> Path | None:
 
 
 def source_paths_for_row(row: dict[str, str]) -> tuple[Path, Path]:
+    explicit = (row.get("layout_path"), row.get("power_path"))
+    if all(explicit):
+        paths = tuple(resolve_repo_path(value) for value in explicit)
+        missing = [path for path in paths if not path.exists()]
+        if not missing:
+            return paths  # type: ignore[return-value]
+    if row.get("source_dir"):
+        source_dir = resolve_repo_path(row["source_dir"])
+        layout_path = source_dir / "layout.json"
+        power_path = source_dir / "power.yaml"
+        missing = [path for path in (layout_path, power_path) if not path.exists()]
+        if not missing:
+            return layout_path, power_path
     dataset_source = row["dataset_source"]
     case_id = row["case_id"]
     original_uid = row["original_sample_uid"]

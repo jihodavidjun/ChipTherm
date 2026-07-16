@@ -146,9 +146,9 @@ class ChipThermDataset(Dataset):
         return rows
 
     def _load_metadata_features(self) -> tuple[list[str], dict[str, dict[str, float]]]:
-        table_path = self.index_csv.parent / "metadata_features.csv"
-        manifest_path = self.index_csv.parent / "metadata_manifest.json"
-        if not table_path.exists() or not manifest_path.exists():
+        table_path = self._find_sidecar("metadata_features.csv")
+        manifest_path = self._find_sidecar("metadata_manifest.json")
+        if table_path is None or manifest_path is None:
             return [], {}
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         active_features = [str(name) for name in manifest.get("active_features", [])]
@@ -161,6 +161,13 @@ class ChipThermDataset(Dataset):
             for row in reader:
                 rows[row["sample_uid"]] = {name: float(row[name]) for name in active_features}
         return active_features, rows
+
+    def _find_sidecar(self, name: str) -> Path | None:
+        candidates = [self.index_csv.parent / name, self.index_csv.parent.parent / name]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return None
 
     def _load_graph_manifest(self) -> tuple[list[str], list[str]]:
         manifest_path = self._graph_manifest_path()
