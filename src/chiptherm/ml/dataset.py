@@ -216,20 +216,20 @@ class ChipThermDataset(Dataset):
     def _metadata(self, row: dict[str, str]) -> dict[str, Any]:
         payload = {
             "sample_uid": row["sample_uid"],
-            "original_sample_uid": row.get("original_sample_uid"),
+            "original_sample_uid": row.get("original_sample_uid", ""),
             "case_id": row["case_id"],
             "dataset_source": row["dataset_source"],
-            "split": row.get("split"),
-            "num_chiplets": self._optional_int(row.get("num_chiplets")),
-            "total_power_W": self._optional_float(row.get("total_power_W")),
-            "hotspot_runtime_s": self._optional_float(row.get("hotspot_runtime_s")),
-            "physics_runtime_s": self._optional_float(row.get("physics_runtime_s")),
+            "split": row.get("split", ""),
+            "num_chiplets": self._optional_int(row.get("num_chiplets"), default=-1),
+            "total_power_W": self._optional_float(row.get("total_power_W"), default=float("nan")),
+            "hotspot_runtime_s": self._optional_float(row.get("hotspot_runtime_s"), default=float("nan")),
+            "physics_runtime_s": self._optional_float(row.get("physics_runtime_s"), default=float("nan")),
             "x_path": row["x_path"],
             "y_path": row["y_path"],
             "prediction_path": row.get("prediction_path", ""),
             "residual_path": row.get("residual_path", ""),
             "effective_prediction_path": self._prediction_path_for_row(row),
-            "effective_residual_path": self._residual_path_for_row(row),
+            "effective_residual_path": self._residual_path_for_row(row) or "",
             "ambient_K": self._ambient_for_row(row),
         }
         if row.get("source_superposition_base_path"):
@@ -332,15 +332,15 @@ class ChipThermDataset(Dataset):
         return float(sum(numeric) / len(numeric))
 
     @staticmethod
-    def _optional_float(value: Any) -> float | None:
+    def _optional_float(value: Any, *, default: float | None = None) -> float | None:
         if value is None or value == "":
-            return None
+            return default
         return float(value)
 
     @staticmethod
-    def _optional_int(value: Any) -> int | None:
+    def _optional_int(value: Any, *, default: int | None = None) -> int | None:
         if value is None or value == "":
-            return None
+            return default
         return int(float(value))
 
 

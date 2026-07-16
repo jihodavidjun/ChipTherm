@@ -190,7 +190,15 @@ def checkpoint_smoke(source_root: Path, checkpoint: Path | None, smoke_cases: li
     write_rows(smoke_index, sample_rows, list(rows[0].keys()) if rows else [])
     try:
         dataset = ChipThermDataset(smoke_index, target="residual", return_metadata=True, return_graph=True)
-        batch = chiptherm_collate([dataset[index] for index in range(len(dataset))])
+        samples = [dataset[index] for index in range(len(dataset))]
+        none_paths = []
+        for index, sample in enumerate(samples):
+            none_paths.extend(f"sample[{index}].{path}" for path in find_none_paths(sample))
+        if none_paths:
+            errors.append("raw None values before collation: " + ", ".join(none_paths[:20]))
+            payload["checkpoint_forward_ok"] = False
+            return payload
+        batch = chiptherm_collate(samples)
         stats, model_config, state_dict = checkpoint_payload(checkpoint)
         model_input = build_model_input(
             batch["x"],
@@ -225,6 +233,24 @@ def checkpoint_smoke(source_root: Path, checkpoint: Path | None, smoke_cases: li
         if smoke_index.exists():
             smoke_index.unlink()
     return payload
+
+
+def find_none_paths(value: Any, prefix: str = "") -> list[str]:
+    if value is None:
+        return [prefix or "<root>"]
+    if isinstance(value, dict):
+        paths: list[str] = []
+        for key, item in value.items():
+            child = f"{prefix}.{key}" if prefix else str(key)
+            paths.extend(find_none_paths(item, child))
+        return paths
+    if isinstance(value, (list, tuple)):
+        paths = []
+        for index, item in enumerate(value):
+            child = f"{prefix}[{index}]" if prefix else f"[{index}]"
+            paths.extend(find_none_paths(item, child))
+        return paths
+    return []
 
 
 def checkpoint_payload(checkpoint: Path | None) -> tuple[NormalizationStats, dict[str, Any] | None, dict[str, Any] | None]:

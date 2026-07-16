@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from torch.utils.data import DataLoader
 
 import sys
 
@@ -17,7 +18,9 @@ if str(REPO_ROOT) not in sys.path:
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from chiptherm.ml.dataset import ChipThermDataset
+from chiptherm.ml.dataset import ChipThermDataset, chiptherm_collate
+from chiptherm.ml.models import build_model
+from chiptherm.ml.normalization import NormalizationStats, build_metadata_input, build_model_input
 from chiptherm.ml.source_response_dataset import SourceResponseNormalizationStats
 from scripts.build_full_source_superposition_base import (
     canonical_source_paths,
@@ -37,6 +40,7 @@ def main() -> None:
     test_resume_rejects_stale_checkpoint()
     test_canonical_source_paths_use_explicit_extension_paths()
     test_extension_source_rows_keep_compatibility_physics_columns()
+    test_source_superposition_extension_row_with_blank_compatibility_paths_collates()
     print("full source-superposition base tests passed")
 
 
@@ -219,6 +223,140 @@ def test_extension_source_rows_keep_compatibility_physics_columns() -> None:
         assert normalized["prediction_path"] == ""
         assert normalized["residual_path"] == ""
         assert normalized["source_superposition_base_path"].endswith("base.npy")
+
+
+def test_source_superposition_extension_row_with_blank_compatibility_paths_collates() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        x = np.zeros((33, 64, 64), dtype=np.float32)
+        x[0] = 1.0
+        y = np.full((64, 64), 320.0, dtype=np.float32)
+        base = np.full((64, 64), 319.0, dtype=np.float32)
+        residual = y - base
+        graph_path = root / "graph.npz"
+        np.save(root / "x.npy", x)
+        np.save(root / "y.npy", y)
+        np.save(root / "source_base.npy", base)
+        np.save(root / "source_residual.npy", residual)
+        np.savez_compressed(
+            graph_path,
+            node_features=np.zeros((2, 24), dtype=np.float32),
+            edge_index=np.asarray([[0, 1], [1, 0]], dtype=np.int64),
+            edge_features=np.zeros((2, 15), dtype=np.float32),
+            chiplet_rects=np.asarray([[0, 0, 1, 1], [2, 2, 1, 1]], dtype=np.float32),
+            package_size=np.asarray([64, 64], dtype=np.float32),
+        )
+        metadata_names = [
+            "package_width_mm",
+            "package_height_mm",
+            "cell_size_x_mm",
+            "cell_size_y_mm",
+            "total_power_W",
+            "chiplet_count",
+            "occupied_fraction",
+            "whitespace_fraction",
+            "mean_power_density_W_per_mm2",
+            "max_power_density_W_per_mm2",
+            "mean_chiplet_area_mm2",
+            "max_chiplet_area_mm2",
+            "mean_chiplet_aspect_ratio",
+            "spreader_side_m",
+            "sink_side_m",
+        ]
+        (root / "metadata_manifest.json").write_text(json.dumps({"active_features": metadata_names}) + "\n", encoding="utf-8")
+        with (root / "metadata_features.csv").open("w", newline="", encoding="utf-8") as fp:
+            writer = csv.DictWriter(fp, fieldnames=["sample_uid", *metadata_names])
+            writer.writeheader()
+            for idx in range(4):
+                writer.writerow({"sample_uid": f"uid_{idx}", **{name: "1.0" for name in metadata_names}})
+        rows = []
+        for idx in range(4):
+            rows.append(
+                {
+                    "sample_uid": f"uid_{idx}",
+                    "original_sample_uid": f"uid_{idx}",
+                    "case_id": "case11",
+                    "dataset_source": "synthetic_extension",
+                    "split": "test",
+                    "x_path": str(root / "x.npy"),
+                    "y_path": str(root / "y.npy"),
+                    "prediction_path": "",
+                    "residual_path": "",
+                    "source_superposition_base_path": str(root / "source_base.npy"),
+                    "source_superposition_residual_path": str(root / "source_residual.npy"),
+                    "source_base_mode": "source_superposition_v1",
+                    "graph_path": str(graph_path),
+                    "num_chiplets": "2",
+                    "total_power_W": "2.0",
+                    "hotspot_runtime_s": "",
+                    "physics_runtime_s": "",
+                }
+            )
+        index = root / "index.csv"
+        write_csv(index, rows)
+
+        dataset = ChipThermDataset(index, target="residual", return_metadata=True, return_graph=True)
+        sample = dataset[0]
+        assert torch.allclose(sample["physics"], torch.full((64, 64), 319.0))
+        assert "physics_v1" not in sample
+        assert sample["metadata_vector"].shape[0] == 15
+        assert sample["graph"]["node_features"].shape[-1] == 24
+        assert sample["graph"]["edge_features"].shape[-1] == 15
+        assert_no_none(sample)
+
+        batch = next(iter(DataLoader(dataset, batch_size=4, collate_fn=chiptherm_collate)))
+        stats = NormalizationStats(
+            schema_version=1,
+            power_density_mean=0.0,
+            power_density_std=1.0,
+            physics_mean=0.0,
+            physics_std=1.0,
+            residual_mean=0.0,
+            residual_std=1.0,
+            num_samples=4,
+            num_grid_cells=4 * 64 * 64,
+            input_channels=33,
+            context_channel_indices=tuple(range(8, 33)),
+            context_channel_means=tuple(0.0 for _ in range(25)),
+            context_channel_stds=tuple(1.0 for _ in range(25)),
+            metadata_feature_names=tuple(metadata_names),
+            metadata_means=tuple(0.0 for _ in metadata_names),
+            metadata_stds=tuple(1.0 for _ in metadata_names),
+        )
+        model_input = build_model_input(batch["x"], batch["physics"], stats, physics_input_mode="source_superposition_v1")
+        assert model_input.shape == (4, 34, 64, 64)
+        metadata_input = build_metadata_input(batch["metadata_vector"], stats)
+        assert metadata_input is not None and metadata_input.shape == (4, 15)
+
+        checkpoint = REPO_ROOT / "outputs/source_superposition_feature_fusion/source_superposition_cnn_feature_fusion_gnn_seed1/checkpoints/best.pt"
+        if checkpoint.exists():
+            payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+            model = build_model(payload["model_config"])
+            model.load_state_dict(payload["model_state_dict"])
+            model.eval()
+            with torch.no_grad():
+                output = model(model_input, metadata_input, batch["graph"])
+            if isinstance(output, dict):
+                output_tensor = output.get("final_temperature")
+                if output_tensor is None:
+                    output_tensor = output.get("prediction")
+                if output_tensor is None:
+                    output_tensor = next((value for value in output.values() if torch.is_tensor(value)), None)
+            else:
+                output_tensor = output
+            assert output_tensor is not None
+            assert torch.isfinite(output_tensor).all()
+
+
+def assert_no_none(value: object, path: str = "sample") -> None:
+    if value is None:
+        raise AssertionError(f"{path} is None")
+    if isinstance(value, dict):
+        for key, item in value.items():
+            assert_no_none(item, f"{path}.{key}")
+    elif isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            assert_no_none(item, f"{path}[{index}]")
 
 
 def canonical_row(uid: str, root: Path) -> dict[str, str]:
