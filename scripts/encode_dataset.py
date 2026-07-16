@@ -21,10 +21,23 @@ from chiptherm.ml.encoder import CHANNEL_NAMES, encode_sample
 
 INDEX_COLUMNS = [
     "sample_uid",
+    "original_sample_uid",
     "case_id",
+    "dataset_source",
+    "split",
     "x_path",
     "y_path",
+    "layout_path",
+    "power_path",
+    "package_path",
+    "hotspot_path",
+    "benchmark_path",
+    "source_dir",
     "original_temp_path",
+    "hotspot_runtime_s",
+    "physics_runtime_s",
+    "num_chiplets",
+    "total_power_W",
     "H",
     "W",
     "C",
@@ -110,6 +123,10 @@ def main() -> int:
     print(f"Encoded samples: {len(records)}")
     print(f"Failed samples: {len(failures)}")
     print(f"Cases encoded: {len({record['case_id'] for record in records})}")
+    if failures:
+        print("First concrete encoding failures:")
+        for item in failures[:20]:
+            print(f"  {item['sample_uid']}: {item['reason']}")
     if example_shape is not None:
         print(f"X shape: {example_shape[0]}")
         print(f"Y shape: {example_shape[1]}")
@@ -118,7 +135,9 @@ def main() -> int:
     if y_mins and y_maxs and y_means:
         print(f"Y min/max/mean: {min(y_mins):.2f} / {max(y_maxs):.2f} / {sum(y_means) / len(y_means):.2f} K")
     print(f"Output: {out_dir}")
-    return 0
+    if failures and len(failures) == len(failures) + len(records):
+        return 3
+    return 0 if not failures else 2
 
 
 def _encode_row(row: dict[str, str], dataset_root: Path, out_dir: Path) -> dict[str, Any]:
@@ -143,10 +162,23 @@ def _encode_row(row: dict[str, str], dataset_root: Path, out_dir: Path) -> dict[
 
     index_record = {
         "sample_uid": sample_uid,
+        "original_sample_uid": row.get("original_sample_uid", sample_uid),
         "case_id": case_id,
+        "dataset_source": row.get("dataset_source", ""),
+        "split": row.get("split", ""),
         "x_path": _rel(out_dir, x_path),
         "y_path": _rel(out_dir, y_path),
+        "layout_path": row.get("layout_path", ""),
+        "power_path": row.get("power_path", ""),
+        "package_path": row.get("package_path", ""),
+        "hotspot_path": row.get("hotspot_path", ""),
+        "benchmark_path": row.get("benchmark_path", ""),
+        "source_dir": row.get("source_dir", ""),
         "original_temp_path": temp_value,
+        "hotspot_runtime_s": row.get("hotspot_runtime_s", ""),
+        "physics_runtime_s": row.get("physics_runtime_s", ""),
+        "num_chiplets": row.get("num_chiplets", ""),
+        "total_power_W": row.get("total_power_W") or metadata.get("total_power_W", ""),
         "H": y.shape[0],
         "W": y.shape[1],
         "C": x.shape[0],
@@ -181,6 +213,17 @@ def _write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
 
 def _rel(root: Path, path: Path) -> str:
     return str(path.resolve().relative_to(root.resolve()))
+
+
+def resolve_path(path_value: str, base: Path) -> Path:
+    path = Path(path_value).expanduser()
+    if path.is_absolute():
+        return path
+    candidates = [REPO_ROOT / path, base / path, Path.cwd() / path]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
 
 
 if __name__ == "__main__":

@@ -17,6 +17,11 @@ CHANNEL_NAMES = [
     "IO_or_ANALOG_or_MEMS_mask",
     "normalized_x_coordinate",
     "normalized_y_coordinate",
+    "total_power_W",
+    "package_width_mm",
+    "package_height_mm",
+    "cell_size_x_mm",
+    "cell_size_y_mm",
 ]
 
 CPU_TYPES = {"CPU"}
@@ -53,6 +58,14 @@ def encode_sample(
     grid_y_mm = y_coords * height_mm
     x[6] = np.broadcast_to(x_coords.reshape(1, cols), (rows, cols))
     x[7] = np.broadcast_to(y_coords.reshape(rows, 1), (rows, cols))
+    total_power_W = float(sum(powers.values()))
+    cell_size_x_mm = width_mm / float(cols)
+    cell_size_y_mm = height_mm / float(rows)
+    x[8] = total_power_W
+    x[9] = width_mm
+    x[10] = height_mm
+    x[11] = cell_size_x_mm
+    x[12] = cell_size_y_mm
 
     chiplet_summaries: list[dict[str, Any]] = []
     for chiplet in layout.get("chiplets", []):
@@ -97,6 +110,9 @@ def encode_sample(
         "grid_cols": cols,
         "package_width_mm": width_mm,
         "package_height_mm": height_mm,
+        "total_power_W": total_power_W,
+        "cell_size_x_mm": cell_size_x_mm,
+        "cell_size_y_mm": cell_size_y_mm,
         "active_workload": power.get("active_workload"),
         "chiplets": chiplet_summaries,
     }
@@ -128,8 +144,8 @@ def type_channel_index(chiplet_type: str) -> int:
 
 
 def validate_encoded_tensors(x: np.ndarray, y: np.ndarray) -> None:
-    if x.shape != (8, 64, 64):
-        raise ValueError(f"X shape must be (8, 64, 64), got {x.shape}")
+    if x.shape != (13, 64, 64):
+        raise ValueError(f"X shape must be (13, 64, 64), got {x.shape}")
     if y.shape != (64, 64):
         raise ValueError(f"Y shape must be (64, 64), got {y.shape}")
     if x.dtype != np.float32:

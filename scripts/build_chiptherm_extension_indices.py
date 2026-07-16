@@ -26,7 +26,9 @@ def main() -> int:
     out_root.mkdir(parents=True, exist_ok=True)
     ext_rows = read_rows(ext_root / "all_extension_index.csv")
     if not ext_rows:
-        raise SystemExit(f"missing extension rows under {ext_root}")
+        ext_rows = read_rows(ext_root / "combined_encoded_index.csv")
+    if not ext_rows:
+        raise SystemExit(f"missing all_extension_index.csv or combined_encoded_index.csv under {ext_root}")
 
     sample_split_ext = split_per_case(ext_rows, args.train_frac, args.val_frac)
     write_index_tree(out_root / "sample_split_extension", sample_split_ext)
