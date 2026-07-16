@@ -31,6 +31,7 @@ from scripts.build_full_source_superposition_base import (
     write_index,
 )
 from scripts.build_source_superposition_extension_splits import normalize_row_paths
+from scripts.merge_source_superposition_20case import repair_original_rows_from_canonical
 
 
 def main() -> None:
@@ -40,6 +41,7 @@ def main() -> None:
     test_resume_rejects_stale_checkpoint()
     test_canonical_source_paths_use_explicit_extension_paths()
     test_extension_source_rows_keep_compatibility_physics_columns()
+    test_20case_merge_rebases_original_general_paths_from_canonical_rows()
     test_source_superposition_extension_row_with_blank_compatibility_paths_collates()
     print("full source-superposition base tests passed")
 
@@ -223,6 +225,62 @@ def test_extension_source_rows_keep_compatibility_physics_columns() -> None:
         assert normalized["prediction_path"] == ""
         assert normalized["residual_path"] == ""
         assert normalized["source_superposition_base_path"].endswith("base.npy")
+
+
+def test_20case_merge_rebases_original_general_paths_from_canonical_rows() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        stale = root / "deleted_training_set"
+        retained = root / "retained_clean_graph"
+        retained.mkdir()
+        source_base = root / "source_base.npy"
+        source_residual = root / "source_residual.npy"
+        np.save(source_base, np.zeros((64, 64), dtype=np.float32))
+        np.save(source_residual, np.zeros((64, 64), dtype=np.float32))
+        source_row = {
+            "sample_uid": "training_set_1k_case01_sample_000002",
+            "original_sample_uid": "training_set_1k_case01_sample_000002",
+            "case_id": "case01",
+            "dataset_source": "old",
+            "split": "train",
+            "x_path": str(stale / "x.npy"),
+            "y_path": str(stale / "y.npy"),
+            "prediction_path": str(stale / "physics.npy"),
+            "residual_path": str(stale / "residual.npy"),
+            "graph_path": str(stale / "graph.npz"),
+            "source_superposition_base_path": str(source_base),
+            "source_superposition_residual_path": str(source_residual),
+            "source_checkpoint_sha256": "abc",
+            "source_count": "4",
+            "source_base_mode": "source_superposition_v1",
+        }
+        canonical_row_for_uid = {
+            "sample_uid": "training_set_1k_case01_sample_000002",
+            "original_sample_uid": "training_set_1k_case01_sample_000002",
+            "case_id": "case01",
+            "dataset_source": "clean",
+            "split": "train",
+            "x_path": str(retained / "x.npy"),
+            "y_path": str(retained / "y.npy"),
+            "prediction_path": str(retained / "physics.npy"),
+            "residual_path": str(retained / "residual.npy"),
+            "graph_path": str(retained / "graph.npz"),
+            "num_chiplets": "7",
+        }
+        repaired, report = repair_original_rows_from_canonical([source_row], [canonical_row_for_uid])
+        row = repaired[0]
+        assert report["repaired_rows"] == 1
+        assert row["x_path"] == canonical_row_for_uid["x_path"]
+        assert row["y_path"] == canonical_row_for_uid["y_path"]
+        assert row["prediction_path"] == canonical_row_for_uid["prediction_path"]
+        assert row["residual_path"] == canonical_row_for_uid["residual_path"]
+        assert row["graph_path"] == canonical_row_for_uid["graph_path"]
+        assert row["dataset_source"] == "clean"
+        assert row["source_superposition_base_path"] == str(source_base)
+        assert row["source_superposition_residual_path"] == str(source_residual)
+        assert row["source_checkpoint_sha256"] == "abc"
+        assert row["source_count"] == "4"
+        assert row["source_base_mode"] == "source_superposition_v1"
 
 
 def test_source_superposition_extension_row_with_blank_compatibility_paths_collates() -> None:

@@ -26,9 +26,15 @@ PROTOCOLS = (
     "sample_split_20case",
     "family_split_20case",
 )
+EXPECTED_PROTOCOL_COUNTS = {
+    "sample_split_20case": {"train": 6400, "val": 800, "test": 810},
+    "family_split_20case": {"train": 5600, "val": 800, "test": 800},
+}
 PATH_COLUMNS = (
     "x_path",
     "y_path",
+    "prediction_path",
+    "residual_path",
     "graph_path",
     "layout_path",
     "power_path",
@@ -36,8 +42,62 @@ PATH_COLUMNS = (
     "hotspot_path",
     "benchmark_path",
     "source_dir",
+    "original_temp_path",
+    "temp_layer0_path",
     "source_superposition_base_path",
     "source_superposition_residual_path",
+    "source_layout_path",
+    "source_power_path",
+    "source_package_path",
+    "source_hotspot_path",
+)
+CANONICAL_GENERAL_COLUMNS = (
+    "original_sample_uid",
+    "dataset_source",
+    "x_path",
+    "y_path",
+    "prediction_path",
+    "residual_path",
+    "graph_path",
+    "layout_path",
+    "power_path",
+    "package_path",
+    "hotspot_path",
+    "benchmark_path",
+    "source_dir",
+    "original_temp_path",
+    "temp_layer0_path",
+    "hotspot_runtime_s",
+    "physics_runtime_s",
+    "num_chiplets",
+    "total_power_W",
+    "mean_temperature_K",
+    "max_temperature_K",
+    "temp_min_K",
+    "temp_mean_K",
+    "temp_max_K",
+    "C",
+    "H",
+    "W",
+    "channel_names",
+)
+SOURCE_BASE_COLUMNS = (
+    "source_superposition_base_path",
+    "source_superposition_residual_path",
+    "source_base_mode",
+    "source_checkpoint",
+    "source_checkpoint_sha256",
+    "source_checkpoint_config_sha256",
+    "source_checkpoint_epoch",
+    "source_checkpoint_best_metric",
+    "source_count",
+    "source_model_version",
+    "source_base_units",
+    "source_base_shape",
+    "source_base_dtype",
+    "source_generation_runtime_s",
+    "source_superposition_runtime_s",
+    "generation_status",
     "source_layout_path",
     "source_power_path",
     "source_package_path",
@@ -48,6 +108,12 @@ PATH_COLUMNS = (
 def main() -> int:
     parser = argparse.ArgumentParser(description="Merge original and extension source-superposition rows into 20-case protocols.")
     parser.add_argument("--original-source-root", default=REPO_ROOT / "data/runs/derived/source_superposition_base_v1_full", type=Path)
+    parser.add_argument(
+        "--original-canonical-root",
+        default=REPO_ROOT / "data/runs/benchmarks/dataset_v2_clean_impedance_graph/package_plus_power",
+        type=Path,
+        help="Authoritative retained case01-case10 graph/context dataset used to repair stale original source-base paths.",
+    )
     parser.add_argument("--extension-source-root", default=REPO_ROOT / "data/runs/derived/source_superposition_base_v1_extension", type=Path)
     parser.add_argument("--split-root", default=REPO_ROOT / "data/runs/benchmarks/benchmark_extension_v1_artifacts/indices", type=Path)
     parser.add_argument("--out-root", default=REPO_ROOT / "data/runs/derived/source_superposition_base_v1_20case", type=Path)
@@ -55,12 +121,15 @@ def main() -> int:
     args = parser.parse_args()
 
     original_root = args.original_source_root.expanduser().resolve()
+    original_canonical_root = args.original_canonical_root.expanduser().resolve()
     extension_root = args.extension_source_root.expanduser().resolve()
     split_root = args.split_root.expanduser().resolve()
     out_root = args.out_root.expanduser().resolve()
-    original_rows = read_all_source_rows(original_root)
+    original_rows_raw = read_all_source_rows(original_root)
+    original_canonical_rows = read_all_source_rows(original_canonical_root)
+    original_rows, canonical_report = repair_original_rows_from_canonical(original_rows_raw, original_canonical_rows)
     extension_rows = read_all_source_rows(extension_root)
-    by_uid = {row["sample_uid"]: normalize_row_paths(row) for row in [*original_rows, *extension_rows]}
+    by_uid = build_unique_uid_map([*original_rows, *extension_rows])
     if not args.validate_only:
         out_root.mkdir(parents=True, exist_ok=True)
         for protocol in PROTOCOLS:
@@ -71,16 +140,19 @@ def main() -> int:
             write_protocol(source_protocol, out_root / protocol, by_uid, all_name=all_name)
         original_test = original_root / "test_index.csv"
         if original_test.exists():
-            write_rows(out_root / "original_case01_case10_test_index.csv", [normalize_row_paths(row) for row in read_rows(original_test)])
+            test_uids = [row["sample_uid"] for row in read_rows(original_test)]
+            write_rows(out_root / "original_case01_case10_test_index.csv", [dict(by_uid[uid], split="test") for uid in test_uids if uid in by_uid])
     report = validate_outputs(out_root if out_root.exists() else split_root, by_uid)
     report.update(
         {
             "schema_version": 1,
             "created_at_utc": datetime.now(timezone.utc).isoformat(),
             "original_source_root": repo_relative(original_root),
+            "original_canonical_root": repo_relative(original_canonical_root),
             "extension_source_root": repo_relative(extension_root),
             "split_root": repo_relative(split_root),
             "out_root": repo_relative(out_root),
+            "canonical_repair": canonical_report,
         }
     )
     if not args.validate_only:
@@ -99,6 +171,72 @@ def main() -> int:
             print(f"  - {error}")
         return 2
     return 0
+
+
+def repair_original_rows_from_canonical(
+    source_rows: list[dict[str, str]], canonical_rows: list[dict[str, str]]
+) -> tuple[list[dict[str, str]], dict[str, Any]]:
+    """Overlay case01-case10 source-superposition rows with retained canonical dataset paths.
+
+    The original source-base rows carry source-superposition-specific artifacts,
+    but some general dataset paths may point at deleted upstream generation
+    trees.  The retained clean graph dataset is the authoritative source for
+    the regular x/y/graph/physics/path columns.
+    """
+    canonical_by_uid = index_rows_by_uid(canonical_rows, label="original canonical dataset")
+    missing: list[str] = []
+    repaired: list[dict[str, str]] = []
+    changed_columns: Counter[str] = Counter()
+    for row in source_rows:
+        uid = row.get("sample_uid", "")
+        canonical = canonical_by_uid.get(uid)
+        if canonical is None:
+            missing.append(uid)
+            continue
+        out = dict(row)
+        for column in CANONICAL_GENERAL_COLUMNS:
+            if column in canonical:
+                old_value = out.get(column, "")
+                out[column] = canonical[column]
+                if old_value != out[column]:
+                    changed_columns[column] += 1
+        for column in SOURCE_BASE_COLUMNS:
+            if column in row:
+                out[column] = row[column]
+        out["source_base_mode"] = out.get("source_base_mode") or "source_superposition_v1"
+        repaired.append(out)
+    if missing:
+        preview = ", ".join(sorted(missing)[:10])
+        raise SystemExit(
+            f"{len(missing)} original source-base UID(s) could not be matched to exactly one canonical row: {preview}"
+        )
+    return repaired, {
+        "original_source_rows": len(source_rows),
+        "canonical_rows": len(canonical_rows),
+        "repaired_rows": len(repaired),
+        "changed_columns": dict(sorted(changed_columns.items())),
+    }
+
+
+def index_rows_by_uid(rows: list[dict[str, str]], *, label: str) -> dict[str, dict[str, str]]:
+    counts = Counter(row.get("sample_uid", "") for row in rows)
+    duplicates = sorted(uid for uid, count in counts.items() if uid and count != 1)
+    if duplicates:
+        preview = ", ".join(duplicates[:10])
+        raise SystemExit(f"{label}: duplicate sample_uid entries; expected exactly one row per UID: {preview}")
+    missing_uid_count = counts.get("", 0)
+    if missing_uid_count:
+        raise SystemExit(f"{label}: {missing_uid_count} row(s) are missing sample_uid")
+    return {row["sample_uid"]: row for row in rows}
+
+
+def build_unique_uid_map(rows: list[dict[str, str]]) -> dict[str, dict[str, str]]:
+    counts = Counter(row.get("sample_uid", "") for row in rows)
+    duplicates = sorted(uid for uid, count in counts.items() if uid and count != 1)
+    if duplicates:
+        preview = ", ".join(duplicates[:10])
+        raise SystemExit(f"merged source-base rows contain duplicate sample_uid entries: {preview}")
+    return {row["sample_uid"]: normalize_row_paths(row) for row in rows}
 
 
 def write_protocol(source_protocol: Path, out_protocol: Path, by_uid: dict[str, dict[str, str]], *, all_name: str) -> None:
@@ -159,6 +297,9 @@ def validate_outputs(root: Path, by_uid: dict[str, dict[str, str]]) -> dict[str,
             "split_cases": split_cases,
             "case_counts": dict(Counter(row["case_id"] for split in ("train", "val", "test") for row in read_rows(protocol_root / f"{split}_index.csv"))),
         }
+        expected_counts = EXPECTED_PROTOCOL_COUNTS.get(protocol)
+        if expected_counts and split_counts != expected_counts:
+            errors.append(f"{protocol}: expected split counts {expected_counts}, found {split_counts}")
     smoke_errors = loader_smoke(root)
     errors.extend(smoke_errors)
     return {
@@ -177,7 +318,7 @@ def loader_smoke(root: Path) -> list[str]:
         root / "family_split_20case" / "val_index.csv",
         root / "family_split_20case" / "test_index.csv",
     ]
-    wanted = {"case01", "case11", "case17", "case19", "case20"}
+    wanted = {"case01", "case10", "case11", "case17", "case19", "case20"}
     checked = set()
     for path in candidates:
         if not path.exists():
