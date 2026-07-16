@@ -300,6 +300,9 @@ def test_source_superposition_extension_row_with_blank_compatibility_paths_colla
         assert torch.allclose(sample["physics"], torch.full((64, 64), 319.0))
         assert "physics_v1" not in sample
         assert sample["metadata_vector"].shape[0] == 15
+        assert torch.isfinite(sample["metadata_vector"]).all()
+        assert np.isfinite(float(sample["metadata"]["hotspot_runtime_s"]))
+        assert np.isfinite(float(sample["metadata"]["physics_runtime_s"]))
         assert sample["graph"]["node_features"].shape[-1] == 24
         assert sample["graph"]["edge_features"].shape[-1] == 15
         assert_no_none(sample)
@@ -325,8 +328,12 @@ def test_source_superposition_extension_row_with_blank_compatibility_paths_colla
         )
         model_input = build_model_input(batch["x"], batch["physics"], stats, physics_input_mode="source_superposition_v1")
         assert model_input.shape == (4, 34, 64, 64)
+        assert torch.isfinite(model_input).all()
         metadata_input = build_metadata_input(batch["metadata_vector"], stats)
         assert metadata_input is not None and metadata_input.shape == (4, 15)
+        assert torch.isfinite(metadata_input).all()
+        assert torch.isfinite(batch["graph"]["node_features"]).all()
+        assert torch.isfinite(batch["graph"]["edge_features"]).all()
 
         checkpoint = REPO_ROOT / "outputs/source_superposition_feature_fusion/source_superposition_cnn_feature_fusion_gnn_seed1/checkpoints/best.pt"
         if checkpoint.exists():

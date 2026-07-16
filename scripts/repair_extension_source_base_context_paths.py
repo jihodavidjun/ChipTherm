@@ -91,6 +91,10 @@ def main() -> int:
     print(f"Unresolved paths: {report['unresolved_path_count']}")
     print(f"X shape failures: {report['x_shape_failure_count']}")
     print(f"Model input channels: {report.get('model_input_channels')}")
+    if report.get("all_input_tensors_finite"):
+        print("All input tensors finite: True")
+    if report.get("checkpoint_forward_ok"):
+        print("Checkpoint forward smoke passed: True")
     if report["errors"]:
         for error in report["errors"][:20]:
             print(f"  - {error}")
@@ -176,6 +180,7 @@ def checkpoint_smoke(source_root: Path, checkpoint: Path | None, smoke_cases: li
     payload: dict[str, Any] = {
         "smoke_cases": [],
         "model_input_channels": None,
+        "input_tensor_summaries": {},
         "checkpoint_forward_ok": None,
         "errors": errors,
     }
@@ -208,23 +213,46 @@ def checkpoint_smoke(source_root: Path, checkpoint: Path | None, smoke_cases: li
             physics_v1=batch.get("physics_v1"),
         )
         payload["model_input_channels"] = int(model_input.shape[1])
+        metadata = build_metadata_input(batch.get("metadata_vector"), stats)
+        sample_uids = sample_uids_from_batch(batch)
+        tensor_summaries = audit_model_tensors(
+            batch=batch,
+            model_input=model_input,
+            metadata=metadata,
+            sample_uids=sample_uids,
+            metadata_feature_names=tuple(stats.metadata_feature_names),
+        )
+        payload["input_tensor_summaries"] = tensor_summaries
+        nonfinite = [
+            f"{name}: {summary['first_nonfinite']}"
+            for name, summary in tensor_summaries.items()
+            if int(summary["nan_count"]) or int(summary["inf_count"])
+        ]
+        if nonfinite:
+            errors.append("non-finite model input tensor(s): " + "; ".join(nonfinite))
+            payload["checkpoint_forward_ok"] = False
+            payload["all_input_tensors_finite"] = False
+            return payload
+        payload["all_input_tensors_finite"] = True
         if int(model_input.shape[1]) != 34:
             errors.append(f"model input channels are {model_input.shape[1]}")
         if checkpoint is not None and model_config is not None and state_dict is not None:
             model = build_model(model_config)
             model.load_state_dict(state_dict)
             model.eval()
-            metadata = build_metadata_input(batch.get("metadata_vector"), stats)
             with torch.no_grad():
                 output = model(model_input, metadata, batch.get("graph"))
-            if isinstance(output, dict):
-                value = output.get("final_temperature")
-                if value is None:
-                    value = output.get("prediction")
-            else:
-                value = output
-            if value is None or not torch.isfinite(value).all():
-                errors.append("checkpoint forward returned non-finite or empty output")
+            output_summary = audit_output_tensors(output)
+            payload["output_tensor_summaries"] = output_summary
+            bad_outputs = [
+                f"{name}: {summary['first_nonfinite']}"
+                for name, summary in output_summary.items()
+                if int(summary["nan_count"]) or int(summary["inf_count"])
+            ]
+            if not output_summary:
+                errors.append("checkpoint forward returned empty output")
+            elif bad_outputs:
+                errors.append("checkpoint forward returned non-finite output tensor(s): " + "; ".join(bad_outputs))
             payload["checkpoint_forward_ok"] = not errors
     except Exception as exc:
         errors.append(f"checkpoint/data smoke failed: {exc}")
@@ -233,6 +261,164 @@ def checkpoint_smoke(source_root: Path, checkpoint: Path | None, smoke_cases: li
         if smoke_index.exists():
             smoke_index.unlink()
     return payload
+
+
+def sample_uids_from_batch(batch: dict[str, Any]) -> list[str]:
+    metadata = batch.get("metadata")
+    if isinstance(metadata, dict):
+        values = metadata.get("sample_uid")
+        if isinstance(values, list):
+            return [str(value) for value in values]
+        if isinstance(values, tuple):
+            return [str(value) for value in values]
+    size = int(batch["x"].shape[0]) if "x" in batch else 0
+    return [f"sample_index_{index}" for index in range(size)]
+
+
+def audit_model_tensors(
+    *,
+    batch: dict[str, Any],
+    model_input: torch.Tensor,
+    metadata: torch.Tensor | None,
+    sample_uids: list[str],
+    metadata_feature_names: tuple[str, ...],
+) -> dict[str, dict[str, Any]]:
+    summaries: dict[str, dict[str, Any]] = {
+        "model_input": tensor_summary(model_input, sample_uids=sample_uids),
+        "source_superposition_base": tensor_summary(batch["physics"], sample_uids=sample_uids),
+        "x": tensor_summary(batch["x"], sample_uids=sample_uids),
+        "temperature": tensor_summary(batch["temperature"], sample_uids=sample_uids),
+        "target": tensor_summary(batch["target"], sample_uids=sample_uids),
+        "residual": tensor_summary(batch["residual"], sample_uids=sample_uids),
+    }
+    if metadata is not None:
+        summaries["metadata_tensor"] = tensor_summary(
+            metadata,
+            sample_uids=sample_uids,
+            feature_names=metadata_feature_names,
+        )
+    raw_metadata = batch.get("metadata_vector")
+    if raw_metadata is not None:
+        summaries["metadata_feature_tensor_raw"] = tensor_summary(
+            raw_metadata,
+            sample_uids=sample_uids,
+            feature_names=metadata_feature_names,
+        )
+    graph = batch.get("graph")
+    if isinstance(graph, dict):
+        node_batch = graph.get("node_batch")
+        summaries["graph.node_features"] = tensor_summary(
+            graph["node_features"],
+            sample_uids=sample_uids,
+            feature_names=graph_feature_names("node"),
+            sample_index_for_rows=node_batch,
+        )
+        summaries["graph.edge_features"] = tensor_summary(
+            graph["edge_features"],
+            sample_uids=sample_uids,
+            feature_names=graph_feature_names("edge"),
+            sample_index_for_rows=edge_sample_indices(graph),
+        )
+        summaries["graph.chiplet_rects"] = tensor_summary(
+            graph["chiplet_rects"],
+            sample_uids=sample_uids,
+            sample_index_for_rows=node_batch,
+        )
+        summaries["graph.package_size"] = tensor_summary(graph["package_size"], sample_uids=sample_uids)
+    return summaries
+
+
+def graph_feature_names(kind: str) -> tuple[str, ...]:
+    try:
+        from chiptherm.ml.graph_models import EDGE_FEATURE_NAMES, NODE_FEATURE_NAMES
+    except Exception:
+        return ()
+    if kind == "node":
+        return tuple(str(name) for name in NODE_FEATURE_NAMES)
+    return tuple(str(name) for name in EDGE_FEATURE_NAMES)
+
+
+def edge_sample_indices(graph: dict[str, torch.Tensor]) -> torch.Tensor | None:
+    edge_index = graph.get("edge_index")
+    node_batch = graph.get("node_batch")
+    if edge_index is None or node_batch is None or edge_index.numel() == 0:
+        return None
+    source_nodes = edge_index[0].long()
+    return node_batch[source_nodes]
+
+
+def audit_output_tensors(output: Any) -> dict[str, dict[str, Any]]:
+    if torch.is_tensor(output):
+        return {"output": tensor_summary(output)}
+    if not isinstance(output, dict):
+        return {}
+    summaries = {}
+    for key, value in output.items():
+        if torch.is_tensor(value) and value.is_floating_point():
+            summaries[str(key)] = tensor_summary(value)
+    return summaries
+
+
+def tensor_summary(
+    tensor: torch.Tensor,
+    *,
+    sample_uids: list[str] | None = None,
+    feature_names: tuple[str, ...] = (),
+    sample_index_for_rows: torch.Tensor | None = None,
+) -> dict[str, Any]:
+    value = tensor.detach()
+    finite = torch.isfinite(value)
+    nan_mask = torch.isnan(value)
+    inf_mask = torch.isinf(value)
+    if finite.any():
+        finite_values = value[finite].float()
+        minimum = float(finite_values.min().item())
+        maximum = float(finite_values.max().item())
+        mean = float(finite_values.mean().item())
+    else:
+        minimum = maximum = mean = None
+    first = first_nonfinite(value, finite, sample_uids=sample_uids, feature_names=feature_names, sample_index_for_rows=sample_index_for_rows)
+    return {
+        "shape": list(value.shape),
+        "dtype": str(value.dtype),
+        "min": minimum,
+        "max": maximum,
+        "mean": mean,
+        "nan_count": int(nan_mask.sum().item()),
+        "inf_count": int(inf_mask.sum().item()),
+        "first_nonfinite": first,
+    }
+
+
+def first_nonfinite(
+    tensor: torch.Tensor,
+    finite: torch.Tensor,
+    *,
+    sample_uids: list[str] | None,
+    feature_names: tuple[str, ...],
+    sample_index_for_rows: torch.Tensor | None,
+) -> dict[str, Any] | None:
+    if bool(finite.all().item()):
+        return None
+    index = torch.nonzero(~finite, as_tuple=False)[0].tolist()
+    result: dict[str, Any] = {"index": [int(item) for item in index]}
+    if sample_index_for_rows is not None and index:
+        row_index = int(index[0])
+        sample_index = int(sample_index_for_rows[row_index].item())
+        result["sample_index"] = sample_index
+        if sample_uids and sample_index < len(sample_uids):
+            result["sample_uid"] = sample_uids[sample_index]
+    elif sample_uids and index:
+        sample_index = int(index[0])
+        result["sample_index"] = sample_index
+        if sample_index < len(sample_uids):
+            result["sample_uid"] = sample_uids[sample_index]
+    if len(index) > 1 and feature_names:
+        feature_index = int(index[1])
+        result["feature_index"] = feature_index
+        if feature_index < len(feature_names):
+            result["feature_name"] = feature_names[feature_index]
+    return result
 
 
 def find_none_paths(value: Any, prefix: str = "") -> list[str]:

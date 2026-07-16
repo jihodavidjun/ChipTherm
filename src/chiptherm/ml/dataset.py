@@ -221,9 +221,9 @@ class ChipThermDataset(Dataset):
             "dataset_source": row["dataset_source"],
             "split": row.get("split", ""),
             "num_chiplets": self._optional_int(row.get("num_chiplets"), default=-1),
-            "total_power_W": self._optional_float(row.get("total_power_W"), default=float("nan")),
-            "hotspot_runtime_s": self._optional_float(row.get("hotspot_runtime_s"), default=float("nan")),
-            "physics_runtime_s": self._optional_float(row.get("physics_runtime_s"), default=float("nan")),
+            "total_power_W": self._optional_float(row.get("total_power_W"), default=0.0),
+            "hotspot_runtime_s": self._optional_float(row.get("hotspot_runtime_s"), default=0.0),
+            "physics_runtime_s": self._optional_float(row.get("physics_runtime_s"), default=0.0),
             "x_path": row["x_path"],
             "y_path": row["y_path"],
             "prediction_path": row.get("prediction_path", ""),
@@ -250,7 +250,12 @@ class ChipThermDataset(Dataset):
         values = self.metadata_feature_rows.get(row["sample_uid"])
         if values is None:
             raise ValueError(f"metadata_features.csv missing sample_uid {row['sample_uid']}")
-        return torch.tensor([float(values[name]) for name in self.metadata_feature_names], dtype=torch.float32)
+        vector = torch.tensor([float(values[name]) for name in self.metadata_feature_names], dtype=torch.float32)
+        if not torch.isfinite(vector).all():
+            bad_indices = torch.nonzero(~torch.isfinite(vector), as_tuple=False).flatten().tolist()
+            bad_names = [self.metadata_feature_names[index] for index in bad_indices]
+            raise ValueError(f"metadata_features.csv has non-finite values for {row['sample_uid']}: {bad_names}")
+        return vector
 
     def _ambient_for_row(self, row: dict[str, str]) -> float:
         if self.metadata_feature_rows and "ambient_K" in self.metadata_feature_rows.get(row["sample_uid"], {}):
