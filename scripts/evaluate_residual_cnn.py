@@ -22,7 +22,7 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from chiptherm.ml.dataset import ChipThermDataset, DIMENSIONLESS_V1_TRANSFORMS, chiptherm_collate
+from chiptherm.ml.dataset import ChipThermDataset, DIMENSIONLESS_V1_TRANSFORMS, DIMENSIONLESS_V2_TRANSFORMS, chiptherm_collate
 from chiptherm.ml.graph_models import chiplet_metric_values, move_graph_to_device, normalize_graph_batch
 from chiptherm.ml.models import build_model, count_parameters
 from chiptherm.ml.normalization import NormalizationStats, build_metadata_input, build_model_input, unnormalize_residual
@@ -114,7 +114,7 @@ def main() -> int:
     physical_representation = str(checkpoint["model_config"].get("physical_representation", "dimensional"))
     if mean_head_mode not in {"direct_k", "residual_resistance"}:
         raise SystemExit(f"unsupported checkpoint mean_head_mode: {mean_head_mode}")
-    if physical_representation not in {"dimensional", "dimensionless_v1"}:
+    if physical_representation not in {"dimensional", "dimensionless_v1", "dimensionless_v2"}:
         raise SystemExit(f"unsupported checkpoint physical_representation: {physical_representation}")
     if physics_input_mode not in {
         "v1",
@@ -234,6 +234,7 @@ def main() -> int:
             "mean_head_mode": mean_head_mode,
             "physical_representation": physical_representation,
             "dimensionless_v1_transforms": DIMENSIONLESS_V1_TRANSFORMS if physical_representation == "dimensionless_v1" else {},
+            "dimensionless_v2_transforms": DIMENSIONLESS_V2_TRANSFORMS if physical_representation == "dimensionless_v2" else {},
             "parameter_count": count_parameters(model),
         },
         "num_samples": metrics["num_samples"],

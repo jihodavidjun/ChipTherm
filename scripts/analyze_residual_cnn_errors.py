@@ -25,7 +25,13 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from chiptherm.ml.dataset import ChipThermDataset, DIMENSIONLESS_V1_TRANSFORMS, chiptherm_collate, collate_graphs
+from chiptherm.ml.dataset import (
+    ChipThermDataset,
+    DIMENSIONLESS_V1_TRANSFORMS,
+    DIMENSIONLESS_V2_TRANSFORMS,
+    chiptherm_collate,
+    collate_graphs,
+)
 from chiptherm.ml.graph_models import move_graph_to_device, normalize_graph_batch
 from chiptherm.ml.models import build_model
 from chiptherm.ml.normalization import NormalizationStats, build_metadata_input, build_model_input, unnormalize_residual
@@ -99,7 +105,7 @@ def main() -> int:
     model_info = architecture_info(checkpoint["model_config"])
     if model_info["mean_head_mode"] not in {"direct_k", "residual_resistance"}:
         raise SystemExit(f"unsupported mean_head_mode: {model_info['mean_head_mode']}")
-    if model_info["physical_representation"] not in {"dimensional", "dimensionless_v1"}:
+    if model_info["physical_representation"] not in {"dimensional", "dimensionless_v1", "dimensionless_v2"}:
         raise SystemExit(f"unsupported physical_representation: {model_info['physical_representation']}")
 
     dataset = ChipThermDataset(
@@ -622,6 +628,7 @@ def build_summary(
             "top_power_regions": "Top fraction is computed among positive power-density cells.",
             "cnn_error_sign": "CNN signed error is T_pred - HotSpot.",
             "dimensionless_v1_transforms": DIMENSIONLESS_V1_TRANSFORMS,
+            "dimensionless_v2_transforms": DIMENSIONLESS_V2_TRANSFORMS,
         },
     }
 

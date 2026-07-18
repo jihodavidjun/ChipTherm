@@ -23,7 +23,7 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from chiptherm.ml.dataset import ChipThermDataset, DIMENSIONLESS_V1_TRANSFORMS, chiptherm_collate
+from chiptherm.ml.dataset import ChipThermDataset, DIMENSIONLESS_V1_TRANSFORMS, DIMENSIONLESS_V2_TRANSFORMS, chiptherm_collate
 from chiptherm.ml.graph_models import (
     chiplet_mean_loss,
     chiplet_metric_values,
@@ -96,8 +96,8 @@ def main() -> int:
     parser.add_argument(
         "--physical-representation",
         default="dimensional",
-        choices=["dimensional", "dimensionless_v1"],
-        help="Input physical representation. dimensionless_v1 replaces selected dimensional raster channels with per-sample physical ratios before train-only standardization.",
+        choices=["dimensional", "dimensionless_v1", "dimensionless_v2"],
+        help="Input physical representation. dimensionless_v1 applies aggressive physical ratios; dimensionless_v2 applies geometry-only package-relative ratios before train-only standardization.",
     )
     parser.add_argument(
         "--physics-input",
@@ -302,8 +302,11 @@ def main() -> int:
         "physics_input_mode": args.physics_input,
         "physical_representation": args.physical_representation,
         "dimensionless_v1_transforms": DIMENSIONLESS_V1_TRANSFORMS if args.physical_representation == "dimensionless_v1" else {},
+        "dimensionless_v2_transforms": DIMENSIONLESS_V2_TRANSFORMS if args.physical_representation == "dimensionless_v2" else {},
         "dimensionless_v1_characteristic_length": "L_char_mm = sqrt(package_width_mm * package_height_mm)",
         "dimensionless_v1_characteristic_power_density": "total_power_W / occupied_area_mm2, with occupied_area from occupancy cells * cell_size_x_mm * cell_size_y_mm",
+        "dimensionless_v2_characteristic_length": "L_char_mm = sqrt(package_width_mm * package_height_mm)",
+        "dimensionless_v2_note": "Geometry-only hybrid: power, thermal, fixed-radius physics, package width/height, cell size, and source base remain dimensional.",
         "model_input_channels": model_input_channels,
         "physics_gate_hidden_dim": args.physics_gate_hidden_dim,
         "physics_gate_init": args.physics_gate_init,
@@ -416,8 +419,11 @@ def main() -> int:
         "physics_input_mode": args.physics_input,
         "physical_representation": args.physical_representation,
         "dimensionless_v1_transforms": DIMENSIONLESS_V1_TRANSFORMS if args.physical_representation == "dimensionless_v1" else {},
+        "dimensionless_v2_transforms": DIMENSIONLESS_V2_TRANSFORMS if args.physical_representation == "dimensionless_v2" else {},
         "dimensionless_v1_characteristic_length": "L_char_mm = sqrt(package_width_mm * package_height_mm)",
         "dimensionless_v1_characteristic_power_density": "total_power_W / occupied_area_mm2",
+        "dimensionless_v2_characteristic_length": "L_char_mm = sqrt(package_width_mm * package_height_mm)",
+        "dimensionless_v2_note": "Geometry-only hybrid; all power/thermal/package-scale channels remain dimensional.",
         "model_input_channels": model_input_channels,
         "dataset_input_channels": dataset_input_channels,
         "physics_gate_hidden_dim": args.physics_gate_hidden_dim,
@@ -484,8 +490,11 @@ def main() -> int:
             "physics_input_mode": args.physics_input,
             "physical_representation": args.physical_representation,
             "dimensionless_v1_transforms": DIMENSIONLESS_V1_TRANSFORMS if args.physical_representation == "dimensionless_v1" else {},
+            "dimensionless_v2_transforms": DIMENSIONLESS_V2_TRANSFORMS if args.physical_representation == "dimensionless_v2" else {},
             "dimensionless_v1_characteristic_length": "L_char_mm = sqrt(package_width_mm * package_height_mm)",
             "dimensionless_v1_characteristic_power_density": "total_power_W / occupied_area_mm2",
+            "dimensionless_v2_characteristic_length": "L_char_mm = sqrt(package_width_mm * package_height_mm)",
+            "dimensionless_v2_note": "Geometry-only hybrid; all power/thermal/package-scale channels remain dimensional.",
             "model_input_channels": model_input_channels,
             "dataset_input_channels": dataset_input_channels,
             "physics_gate_hidden_dim": args.physics_gate_hidden_dim,

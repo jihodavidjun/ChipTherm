@@ -13,7 +13,7 @@ from torch.utils.data import Dataset
 
 
 TargetName = Literal["residual", "temperature"]
-PhysicalRepresentation = Literal["dimensional", "dimensionless_v1"]
+PhysicalRepresentation = Literal["dimensional", "dimensionless_v1", "dimensionless_v2"]
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -44,6 +44,18 @@ DIMENSIONLESS_V1_TRANSFORMS = {
     "chiplet_area_mm2": "chiplet_area_mm2 / package_area_mm2",
     "chiplet_power_density_W_per_mm2": "chiplet_power_density_W_per_mm2 / (total_power_W / occupied_area_mm2)",
     "thermal_crowding_W_per_mm": "thermal_crowding_W_per_mm / (total_power_W / L_char_mm)",
+}
+
+
+DIMENSIONLESS_V2_TRANSFORMS = {
+    "chiplet_width_mm": "chiplet_width_mm / package_width_mm",
+    "chiplet_height_mm": "chiplet_height_mm / package_height_mm",
+    "chiplet_area_mm2": "chiplet_area_mm2 / (package_width_mm * package_height_mm)",
+    "distance_to_left_edge_mm": "distance_to_left_edge_mm / package_width_mm",
+    "distance_to_right_edge_mm": "distance_to_right_edge_mm / package_width_mm",
+    "distance_to_bottom_edge_mm": "distance_to_bottom_edge_mm / package_height_mm",
+    "distance_to_top_edge_mm": "distance_to_top_edge_mm / package_height_mm",
+    "minimum_distance_to_package_edge_mm": "minimum_distance_to_package_edge_mm / sqrt(package_width_mm * package_height_mm)",
 }
 
 
@@ -139,6 +151,60 @@ def build_dimensionless_v1_input(
     return out
 
 
+def build_dimensionless_v2_input(
+    x: torch.Tensor,
+    channel_indices: dict[str, int],
+    *,
+    sample_uid: str = "",
+) -> torch.Tensor:
+    """Apply geometry-only package-relative ratios to the original dimensional tensor."""
+    out = x.float().clone()
+
+    def has(name: str) -> bool:
+        return name in channel_indices and int(channel_indices[name]) < int(out.shape[0])
+
+    def channel(name: str) -> torch.Tensor:
+        return out[int(channel_indices[name])]
+
+    def scalar(name: str) -> torch.Tensor:
+        return channel(name).reshape(-1)[0].clone()
+
+    def require_positive(name: str, value: torch.Tensor) -> torch.Tensor:
+        if not torch.isfinite(value).all() or torch.any(value <= 0.0):
+            raise ValueError(f"{sample_uid or 'sample'} has invalid positive denominator for {name}: {value}")
+        return value
+
+    required = ["package_width_mm", "package_height_mm"]
+    missing = [name for name in required if not has(name)]
+    if missing:
+        raise ValueError(f"dimensionless_v2 requires channels missing from sample {sample_uid or '<unknown>'}: {missing}")
+
+    package_width = require_positive("package_width_mm", scalar("package_width_mm"))
+    package_height = require_positive("package_height_mm", scalar("package_height_mm"))
+    package_area = require_positive("package_area_mm2", package_width * package_height)
+    l_char = require_positive("L_char_mm", torch.sqrt(package_area))
+
+    if has("chiplet_width_mm"):
+        out[channel_indices["chiplet_width_mm"]] = channel("chiplet_width_mm") / package_width
+    if has("chiplet_height_mm"):
+        out[channel_indices["chiplet_height_mm"]] = channel("chiplet_height_mm") / package_height
+    if has("chiplet_area_mm2"):
+        out[channel_indices["chiplet_area_mm2"]] = channel("chiplet_area_mm2") / package_area
+    for name in ("distance_to_left_edge_mm", "distance_to_right_edge_mm"):
+        if has(name):
+            out[channel_indices[name]] = channel(name) / package_width
+    for name in ("distance_to_bottom_edge_mm", "distance_to_top_edge_mm"):
+        if has(name):
+            out[channel_indices[name]] = channel(name) / package_height
+    if has("minimum_distance_to_package_edge_mm"):
+        out[channel_indices["minimum_distance_to_package_edge_mm"]] = channel("minimum_distance_to_package_edge_mm") / l_char
+    if not torch.isfinite(out).all():
+        bad = torch.nonzero(~torch.isfinite(out), as_tuple=False)
+        first = bad[0].tolist() if bad.numel() else []
+        raise ValueError(f"dimensionless_v2 produced non-finite input for {sample_uid or '<unknown>'}: first bad index {first}")
+    return out
+
+
 class ChipThermDataset(Dataset):
     """Lazy PyTorch dataset for ChipTherm encoded benchmark samples."""
 
@@ -161,7 +227,7 @@ class ChipThermDataset(Dataset):
         self.physical_representation = str(physical_representation)
         if target not in {"residual", "temperature"}:
             raise ValueError("target must be 'residual' or 'temperature'")
-        if self.physical_representation not in {"dimensional", "dimensionless_v1"}:
+        if self.physical_representation not in {"dimensional", "dimensionless_v1", "dimensionless_v2"}:
             raise ValueError(f"unsupported physical_representation: {self.physical_representation}")
         if not self.index_csv.exists():
             raise FileNotFoundError(self.index_csv)
@@ -328,7 +394,9 @@ class ChipThermDataset(Dataset):
     def _apply_physical_representation(self, row: dict[str, str], x: torch.Tensor) -> torch.Tensor:
         if self.physical_representation == "dimensional":
             return x
-        return build_dimensionless_v1_input(x, self._channel_index_map(x), sample_uid=row.get("sample_uid", ""))
+        if self.physical_representation == "dimensionless_v1":
+            return build_dimensionless_v1_input(x, self._channel_index_map(x), sample_uid=row.get("sample_uid", ""))
+        return build_dimensionless_v2_input(x, self._channel_index_map(x), sample_uid=row.get("sample_uid", ""))
 
     def _channel_index_map(self, x: torch.Tensor) -> dict[str, int]:
         names = self.channel_names
