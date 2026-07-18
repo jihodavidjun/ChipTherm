@@ -141,12 +141,19 @@ def load_normalization_stats(path: str | Path) -> NormalizationStats:
 
 
 def context_channel_names(dataset: Dataset[Any], indices: tuple[int, ...]) -> tuple[str, ...]:
+    dataset_names = getattr(dataset, "channel_names", None)
+    if isinstance(dataset_names, list) and len(dataset_names) > max(indices, default=-1):
+        return tuple(str(dataset_names[index]) for index in indices)
     index_csv = getattr(dataset, "index_csv", None)
     if index_csv is None:
         return tuple(f"channel_{index}" for index in indices)
-    manifest_path = Path(index_csv).parent / "feature_manifest.json"
-    if not manifest_path.exists():
-        manifest_path = Path(index_csv).parent / "context_manifest.json"
+    manifest_candidates = [
+        Path(index_csv).parent / "feature_manifest.json",
+        Path(index_csv).parent.parent / "feature_manifest.json",
+        Path(index_csv).parent / "context_manifest.json",
+        Path(index_csv).parent.parent / "context_manifest.json",
+    ]
+    manifest_path = next((candidate for candidate in manifest_candidates if candidate.exists()), manifest_candidates[0])
     if not manifest_path.exists():
         return tuple(f"channel_{index}" for index in indices)
     try:

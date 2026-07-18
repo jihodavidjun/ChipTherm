@@ -25,7 +25,7 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from chiptherm.ml.dataset import ChipThermDataset, chiptherm_collate, collate_graphs
+from chiptherm.ml.dataset import ChipThermDataset, DIMENSIONLESS_V1_TRANSFORMS, chiptherm_collate, collate_graphs
 from chiptherm.ml.graph_models import move_graph_to_device, normalize_graph_batch
 from chiptherm.ml.models import build_model
 from chiptherm.ml.normalization import NormalizationStats, build_metadata_input, build_model_input, unnormalize_residual
@@ -36,6 +36,7 @@ SAMPLE_COLUMNS = [
     "sample_uid",
     "case_id",
     "dataset_source",
+    "physical_representation",
     "total_power_W",
     "hotspot_mean_K",
     "hotspot_max_K",
@@ -98,8 +99,16 @@ def main() -> int:
     model_info = architecture_info(checkpoint["model_config"])
     if model_info["mean_head_mode"] not in {"direct_k", "residual_resistance"}:
         raise SystemExit(f"unsupported mean_head_mode: {model_info['mean_head_mode']}")
+    if model_info["physical_representation"] not in {"dimensional", "dimensionless_v1"}:
+        raise SystemExit(f"unsupported physical_representation: {model_info['physical_representation']}")
 
-    dataset = ChipThermDataset(args.index, target="residual", return_metadata=True, return_graph=bool(model_info.get("graph_enabled")))
+    dataset = ChipThermDataset(
+        args.index,
+        target="residual",
+        return_metadata=True,
+        return_graph=bool(model_info.get("graph_enabled")),
+        physical_representation=str(model_info.get("physical_representation", "dimensional")),
+    )
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -195,6 +204,7 @@ def architecture_info(model_config: dict[str, Any]) -> dict[str, Any]:
         "metadata_dim": int(model_config.get("metadata_dim", 0) or 0),
         "physics_input_mode": physics_input_mode,
         "mean_head_mode": str(model_config.get("mean_head_mode", "direct_k")),
+        "physical_representation": str(model_config.get("physical_representation", "dimensional")),
     }
 
 
@@ -327,6 +337,7 @@ def analyze(
                 "sample_uid": str(sample_uids[i]),
                 "case_id": str(case_ids[i]),
                 "dataset_source": str(dataset_sources[i]),
+                "physical_representation": str(model_info.get("physical_representation", "dimensional")),
                 "total_power_W": total_powers[i] if i < len(total_powers) else None,
                 "hotspot_mean_K": float(y.mean()),
                 "hotspot_max_K": float(y.max()),
@@ -589,6 +600,7 @@ def build_summary(
         "checkpoint": str(args.checkpoint.resolve()),
         "index": str(args.index.resolve()),
         "out_dir": str(args.out_dir.resolve()),
+        "physical_representation": records[0].get("physical_representation") if records else "unknown",
         "num_samples": len(records),
         "overall": overall,
         "metrics_by_case": by_case,
@@ -609,6 +621,7 @@ def build_summary(
             "boundary_definition": "4-neighbor occupancy transition: occupied adjacent to empty, or empty adjacent to occupied.",
             "top_power_regions": "Top fraction is computed among positive power-density cells.",
             "cnn_error_sign": "CNN signed error is T_pred - HotSpot.",
+            "dimensionless_v1_transforms": DIMENSIONLESS_V1_TRANSFORMS,
         },
     }
 

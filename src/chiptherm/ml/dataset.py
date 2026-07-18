@@ -13,8 +13,130 @@ from torch.utils.data import Dataset
 
 
 TargetName = Literal["residual", "temperature"]
+PhysicalRepresentation = Literal["dimensional", "dimensionless_v1"]
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
+DIMENSIONLESS_V1_TRANSFORMS = {
+    "power_density_W_per_mm2": "power_density_W_per_mm2 / (total_power_W / occupied_area_mm2)",
+    "total_power_W": "total_power_W / total_power_W = 1",
+    "package_width_mm": "package_width_mm / sqrt(package_width_mm * package_height_mm)",
+    "package_height_mm": "package_height_mm / sqrt(package_width_mm * package_height_mm)",
+    "cell_size_x_mm": "cell_size_x_mm / package_width_mm",
+    "cell_size_y_mm": "cell_size_y_mm / package_height_mm",
+    "finite_source_L0p5mm": "finite_source_L0p5mm / (total_power_W / L_char_mm)",
+    "finite_source_L1mm": "finite_source_L1mm / (total_power_W / L_char_mm)",
+    "finite_source_L2mm": "finite_source_L2mm / (total_power_W / L_char_mm)",
+    "finite_source_L4mm": "finite_source_L4mm / (total_power_W / L_char_mm)",
+    "enclosed_power_R2mm_W": "enclosed_power_R2mm_W / total_power_W",
+    "enclosed_power_R4mm_W": "enclosed_power_R4mm_W / total_power_W",
+    "enclosed_power_R8mm_W": "enclosed_power_R8mm_W / total_power_W",
+    "enclosed_power_R16mm_W": "enclosed_power_R16mm_W / total_power_W",
+    "distance_to_left_edge_mm": "distance_to_left_edge_mm / package_width_mm",
+    "distance_to_right_edge_mm": "distance_to_right_edge_mm / package_width_mm",
+    "distance_to_bottom_edge_mm": "distance_to_bottom_edge_mm / package_height_mm",
+    "distance_to_top_edge_mm": "distance_to_top_edge_mm / package_height_mm",
+    "minimum_distance_to_package_edge_mm": "minimum_distance_to_package_edge_mm / L_char_mm",
+    "chiplet_total_power_W": "chiplet_total_power_W / total_power_W",
+    "chiplet_width_mm": "chiplet_width_mm / package_width_mm",
+    "chiplet_height_mm": "chiplet_height_mm / package_height_mm",
+    "chiplet_area_mm2": "chiplet_area_mm2 / package_area_mm2",
+    "chiplet_power_density_W_per_mm2": "chiplet_power_density_W_per_mm2 / (total_power_W / occupied_area_mm2)",
+    "thermal_crowding_W_per_mm": "thermal_crowding_W_per_mm / (total_power_W / L_char_mm)",
+}
+
+
+def build_dimensionless_v1_input(
+    x: torch.Tensor,
+    channel_indices: dict[str, int],
+    *,
+    sample_uid: str = "",
+) -> torch.Tensor:
+    """Replace selected dimensional context channels with dimensionless ratios.
+
+    The source-superposition base is not part of ``x`` and remains an absolute
+    Kelvin channel when ``build_model_input`` appends it later.
+    """
+    out = x.float().clone()
+
+    def has(name: str) -> bool:
+        return name in channel_indices and int(channel_indices[name]) < int(out.shape[0])
+
+    def channel(name: str) -> torch.Tensor:
+        return out[int(channel_indices[name])]
+
+    def scalar(name: str) -> torch.Tensor:
+        value = channel(name)
+        return value.reshape(-1)[0].clone()
+
+    def require_positive(name: str, value: torch.Tensor) -> torch.Tensor:
+        if not torch.isfinite(value).all() or torch.any(value <= 0.0):
+            raise ValueError(f"{sample_uid or 'sample'} has invalid positive denominator for {name}: {value}")
+        return value
+
+    required = ["occupancy_mask", "total_power_W", "package_width_mm", "package_height_mm", "cell_size_x_mm", "cell_size_y_mm"]
+    missing = [name for name in required if not has(name)]
+    if missing:
+        raise ValueError(f"dimensionless_v1 requires channels missing from sample {sample_uid or '<unknown>'}: {missing}")
+
+    package_width = require_positive("package_width_mm", scalar("package_width_mm"))
+    package_height = require_positive("package_height_mm", scalar("package_height_mm"))
+    cell_size_x = require_positive("cell_size_x_mm", scalar("cell_size_x_mm"))
+    cell_size_y = require_positive("cell_size_y_mm", scalar("cell_size_y_mm"))
+    total_power = require_positive("total_power_W", scalar("total_power_W"))
+    package_area = require_positive("package_area_mm2", package_width * package_height)
+    l_char = require_positive("L_char_mm", torch.sqrt(package_area))
+    occupancy = channel("occupancy_mask") > 0.5
+    occupied_area = require_positive(
+        "occupied_area_mm2",
+        occupancy.to(out.dtype).sum() * cell_size_x * cell_size_y,
+    )
+    characteristic_power_density = require_positive(
+        "characteristic_power_density_W_per_mm2",
+        total_power / occupied_area,
+    )
+    power_per_length = require_positive("total_power_W / L_char_mm", total_power / l_char)
+
+    if has("power_density_W_per_mm2"):
+        out[channel_indices["power_density_W_per_mm2"]] = channel("power_density_W_per_mm2") / characteristic_power_density
+    out[channel_indices["total_power_W"]] = channel("total_power_W") / total_power
+    out[channel_indices["package_width_mm"]] = channel("package_width_mm") / l_char
+    out[channel_indices["package_height_mm"]] = channel("package_height_mm") / l_char
+    out[channel_indices["cell_size_x_mm"]] = channel("cell_size_x_mm") / package_width
+    out[channel_indices["cell_size_y_mm"]] = channel("cell_size_y_mm") / package_height
+
+    for name in ("finite_source_L0p5mm", "finite_source_L1mm", "finite_source_L2mm", "finite_source_L4mm"):
+        if has(name):
+            out[channel_indices[name]] = channel(name) / power_per_length
+    for name in ("enclosed_power_R2mm_W", "enclosed_power_R4mm_W", "enclosed_power_R8mm_W", "enclosed_power_R16mm_W"):
+        if has(name):
+            out[channel_indices[name]] = channel(name) / total_power
+    for name in ("distance_to_left_edge_mm", "distance_to_right_edge_mm"):
+        if has(name):
+            out[channel_indices[name]] = channel(name) / package_width
+    for name in ("distance_to_bottom_edge_mm", "distance_to_top_edge_mm"):
+        if has(name):
+            out[channel_indices[name]] = channel(name) / package_height
+    if has("minimum_distance_to_package_edge_mm"):
+        out[channel_indices["minimum_distance_to_package_edge_mm"]] = channel("minimum_distance_to_package_edge_mm") / l_char
+    if has("chiplet_total_power_W"):
+        out[channel_indices["chiplet_total_power_W"]] = channel("chiplet_total_power_W") / total_power
+    if has("chiplet_width_mm"):
+        out[channel_indices["chiplet_width_mm"]] = channel("chiplet_width_mm") / package_width
+    if has("chiplet_height_mm"):
+        out[channel_indices["chiplet_height_mm"]] = channel("chiplet_height_mm") / package_height
+    if has("chiplet_area_mm2"):
+        out[channel_indices["chiplet_area_mm2"]] = channel("chiplet_area_mm2") / package_area
+    if has("chiplet_power_density_W_per_mm2"):
+        out[channel_indices["chiplet_power_density_W_per_mm2"]] = channel("chiplet_power_density_W_per_mm2") / characteristic_power_density
+    if has("thermal_crowding_W_per_mm"):
+        out[channel_indices["thermal_crowding_W_per_mm"]] = channel("thermal_crowding_W_per_mm") / power_per_length
+    if not torch.isfinite(out).all():
+        bad = torch.nonzero(~torch.isfinite(out), as_tuple=False)
+        first = bad[0].tolist() if bad.numel() else []
+        raise ValueError(f"dimensionless_v1 produced non-finite input for {sample_uid or '<unknown>'}: first bad index {first}")
+    return out
 
 
 class ChipThermDataset(Dataset):
@@ -28,6 +150,7 @@ class ChipThermDataset(Dataset):
         return_metadata: bool = True,
         graph_root: str | Path | None = None,
         return_graph: bool = True,
+        physical_representation: PhysicalRepresentation = "dimensional",
     ) -> None:
         self.index_csv = Path(index_csv).expanduser().resolve()
         self.transform = transform
@@ -35,11 +158,15 @@ class ChipThermDataset(Dataset):
         self.return_metadata = return_metadata
         self.graph_root = Path(graph_root).expanduser().resolve() if graph_root is not None else None
         self.return_graph = bool(return_graph)
+        self.physical_representation = str(physical_representation)
         if target not in {"residual", "temperature"}:
             raise ValueError("target must be 'residual' or 'temperature'")
+        if self.physical_representation not in {"dimensional", "dimensionless_v1"}:
+            raise ValueError(f"unsupported physical_representation: {self.physical_representation}")
         if not self.index_csv.exists():
             raise FileNotFoundError(self.index_csv)
         self.rows = self._read_rows(self.index_csv)
+        self.channel_names = self._load_channel_names()
         self.metadata_feature_names, self.metadata_feature_rows = self._load_metadata_features()
         self.graph_node_feature_names, self.graph_edge_feature_names = self._load_graph_manifest()
 
@@ -52,6 +179,7 @@ class ChipThermDataset(Dataset):
         row = self.rows[index]
 
         x = self._load_tensor(row["x_path"], expected_ndim=3)
+        x = self._apply_physical_representation(row, x)
         temperature = self._load_tensor(row["y_path"], expected_ndim=2)
         physics_path_value = self._prediction_path_for_row(row)
         physics = self._load_tensor(physics_path_value, expected_ndim=2)
@@ -108,6 +236,7 @@ class ChipThermDataset(Dataset):
             "input_shape": self._array_shape("x_path"),
             "target_shape": self._array_shape("residual_path" if self.target == "residual" else "y_path"),
             "target": self.target,
+            "physical_representation": self.physical_representation,
             "mean_hotspot_temperature_K": self._mean("mean_temperature_K"),
             "mean_power_W": self._mean("total_power_W"),
             "mean_chiplet_count": self._mean("num_chiplets"),
@@ -169,6 +298,53 @@ class ChipThermDataset(Dataset):
             if candidate.exists():
                 return candidate
         return None
+
+    def _load_channel_names(self) -> list[str]:
+        manifest_path = self._find_sidecar("feature_manifest.json") or self._find_sidecar("context_manifest.json")
+        if manifest_path is None:
+            return []
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        channel_names = manifest.get("channel_names")
+        if isinstance(channel_names, list):
+            return [str(name) for name in channel_names]
+        context_channels = manifest.get("context_channels")
+        if isinstance(context_channels, list):
+            base = [
+                "power_density_W_per_mm2",
+                "occupancy_mask",
+                "CPU_mask",
+                "GPU_or_NPU_mask",
+                "memory_mask",
+                "IO_or_ANALOG_or_MEMS_mask",
+                "normalized_x_coordinate",
+                "normalized_y_coordinate",
+            ]
+            return [*base, *[str(name) for name in context_channels]]
+        return []
+
+    def _apply_physical_representation(self, row: dict[str, str], x: torch.Tensor) -> torch.Tensor:
+        if self.physical_representation == "dimensional":
+            return x
+        return build_dimensionless_v1_input(x, self._channel_index_map(x), sample_uid=row.get("sample_uid", ""))
+
+    def _channel_index_map(self, x: torch.Tensor) -> dict[str, int]:
+        names = self.channel_names
+        if len(names) < int(x.shape[0]):
+            names = [
+                "power_density_W_per_mm2",
+                "occupancy_mask",
+                "CPU_mask",
+                "GPU_or_NPU_mask",
+                "memory_mask",
+                "IO_or_ANALOG_or_MEMS_mask",
+                "normalized_x_coordinate",
+                "normalized_y_coordinate",
+                *[f"channel_{index}" for index in range(8, int(x.shape[0]))],
+            ]
+        return {name: index for index, name in enumerate(names[: int(x.shape[0])])}
 
     def _load_graph_manifest(self) -> tuple[list[str], list[str]]:
         manifest_path = self._graph_manifest_path()

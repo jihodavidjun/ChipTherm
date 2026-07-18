@@ -22,7 +22,7 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from chiptherm.ml.dataset import ChipThermDataset, chiptherm_collate
+from chiptherm.ml.dataset import ChipThermDataset, DIMENSIONLESS_V1_TRANSFORMS, chiptherm_collate
 from chiptherm.ml.graph_models import chiplet_metric_values, move_graph_to_device, normalize_graph_batch
 from chiptherm.ml.models import build_model, count_parameters
 from chiptherm.ml.normalization import NormalizationStats, build_metadata_input, build_model_input, unnormalize_residual
@@ -111,8 +111,11 @@ def main() -> int:
     graph_stats = checkpoint["model_config"].get("graph_normalization")
     physics_input_mode = str(checkpoint["model_config"].get("physics_input_mode", "v1"))
     mean_head_mode = str(checkpoint["model_config"].get("mean_head_mode", "direct_k"))
+    physical_representation = str(checkpoint["model_config"].get("physical_representation", "dimensional"))
     if mean_head_mode not in {"direct_k", "residual_resistance"}:
         raise SystemExit(f"unsupported checkpoint mean_head_mode: {mean_head_mode}")
+    if physical_representation not in {"dimensional", "dimensionless_v1"}:
+        raise SystemExit(f"unsupported checkpoint physical_representation: {physical_representation}")
     if physics_input_mode not in {
         "v1",
         "none",
@@ -122,7 +125,13 @@ def main() -> int:
     }:
         raise SystemExit(f"unsupported checkpoint physics_input_mode: {physics_input_mode}")
 
-    dataset = ChipThermDataset(args.index, target="residual", return_metadata=True, return_graph=graph_enabled)
+    dataset = ChipThermDataset(
+        args.index,
+        target="residual",
+        return_metadata=True,
+        return_graph=graph_enabled,
+        physical_representation=physical_representation,
+    )
     dataset_input_channels = int(dataset[0]["x"].shape[0])
     actual_input_channels = dataset_input_channels + physics_input_channel_count(physics_input_mode)
     expected_input_channels = int(checkpoint["model_config"].get("input_channels", actual_input_channels))
@@ -223,6 +232,8 @@ def main() -> int:
             "config": checkpoint["model_config"],
             "physics_input_mode": physics_input_mode,
             "mean_head_mode": mean_head_mode,
+            "physical_representation": physical_representation,
+            "dimensionless_v1_transforms": DIMENSIONLESS_V1_TRANSFORMS if physical_representation == "dimensionless_v1" else {},
             "parameter_count": count_parameters(model),
         },
         "num_samples": metrics["num_samples"],
@@ -296,6 +307,7 @@ def main() -> int:
     print(f"Samples: {metrics['num_samples']}")
     print(f"Physics input mode: {physics_input_mode}")
     print(f"Mean head mode: {mean_head_mode}")
+    print(f"Physical representation: {physical_representation}")
     print(f"CNN-side inference runtime/sample: {cnn_runtime_per_sample:.6f} s")
     if args.measure_end_to_end:
         if physics_runtime_s is None:
