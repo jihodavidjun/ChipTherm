@@ -1444,8 +1444,14 @@ class DecomposedMiniUNetWithGraph(nn.Module):
         global_hidden_channels: int = 32,
         global_blocks: int = 3,
         global_pool_size: int = 8,
+        mean_head_mode: str = "direct_k",
+        delta_R_eff_mean_K_per_W: float = 0.0,
+        delta_R_eff_std_K_per_W: float = 1.0,
+        graph_mean_correction_enabled: bool = True,
     ) -> None:
         super().__init__()
+        if mean_head_mode not in {"direct_k", "residual_resistance"}:
+            raise ValueError(f"unsupported mean_head_mode: {mean_head_mode}")
         self.architecture = str(architecture)
         self.input_channels = input_channels
         self.output_channels = output_channels
@@ -1470,6 +1476,10 @@ class DecomposedMiniUNetWithGraph(nn.Module):
         self.graph_use_edge_features = bool(graph_use_edge_features)
         self.graph_rasterizer_mode = str(graph_rasterizer_mode)
         self.freeze_cnn = bool(freeze_cnn)
+        self.mean_head_mode = str(mean_head_mode)
+        self.delta_R_eff_mean_K_per_W = float(delta_R_eff_mean_K_per_W)
+        self.delta_R_eff_std_K_per_W = float(delta_R_eff_std_K_per_W)
+        self.graph_mean_correction_enabled = bool(graph_mean_correction_enabled)
         self.global_branch_enabled = self.architecture == "miniunet_refine_conditioned_decomposed_global_graph"
         self.feature_fusion_enabled = self.architecture == "miniunet_refine_conditioned_decomposed_feature_fusion_graph"
         if self.feature_fusion_enabled:
@@ -1493,6 +1503,9 @@ class DecomposedMiniUNetWithGraph(nn.Module):
                 global_hidden_channels=global_hidden_channels,
                 global_pool_size=global_pool_size,
                 global_context_blocks=global_blocks,
+                mean_head_mode=mean_head_mode,
+                delta_R_eff_mean_K_per_W=delta_R_eff_mean_K_per_W,
+                delta_R_eff_std_K_per_W=delta_R_eff_std_K_per_W,
             )
         elif self.global_branch_enabled:
             self.cnn_model = DecomposedMiniUNetWithGlobalBranch(
@@ -1573,6 +1586,7 @@ class DecomposedMiniUNetWithGraph(nn.Module):
         global_correction_scale: float = 1.0,
         disabled_fusion_scales: tuple[str, ...] | list[str] = (),
         ambient: torch.Tensor | None = None,
+        total_power_W: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         if graph is None:
             raise ValueError("graph architecture requires graph batch")
@@ -1582,6 +1596,7 @@ class DecomposedMiniUNetWithGraph(nn.Module):
                 metadata,
                 return_diagnostics=return_diagnostics,
                 disabled_fusion_scales=disabled_fusion_scales,
+                total_power_W=total_power_W,
             )
         elif self.global_branch_enabled:
             cnn_outputs = self.cnn_model(x, metadata, global_correction_scale=global_correction_scale)
@@ -1603,7 +1618,10 @@ class DecomposedMiniUNetWithGraph(nn.Module):
         centered_before_projection = cnn_centered + scaled_correction
         centered = centered_before_projection
         centered = centered - centered.mean(dim=(-2, -1), keepdim=True)
-        mean_delta = self.graph_mean_head(graph_outputs["graph_embedding"]).squeeze(1)
+        if self.graph_mean_correction_enabled:
+            mean_delta = self.graph_mean_head(graph_outputs["graph_embedding"]).squeeze(1)
+        else:
+            mean_delta = graph_outputs["graph_embedding"].new_zeros(graph_outputs["graph_embedding"].shape[0])
         outputs = dict(cnn_outputs)
         outputs["cnn_mean_rise"] = cnn_outputs["mean_rise"]
         outputs["cnn_centered_field"] = cnn_centered
@@ -1613,6 +1631,7 @@ class DecomposedMiniUNetWithGraph(nn.Module):
         outputs["graph_correction_abs_mean"] = correction.abs().mean(dim=(-2, -1))
         outputs["graph_correction_abs_max"] = correction.abs().amax(dim=(-2, -1))
         outputs["graph_mean_delta"] = mean_delta
+        outputs["graph_mean_correction_enabled"] = mean_delta.new_full(mean_delta.shape, 1.0 if self.graph_mean_correction_enabled else 0.0)
         outputs["mean_rise"] = cnn_outputs["mean_rise"] + mean_delta
         outputs["centered_field"] = centered
         if return_diagnostics:
@@ -1620,9 +1639,9 @@ class DecomposedMiniUNetWithGraph(nn.Module):
             outputs["graph_raster_features"] = graph_maps
             outputs["node_embeddings"] = graph_outputs["node_embeddings"]
             outputs["global_graph_embedding"] = graph_outputs["graph_embedding"]
-            if ambient is not None:
+            if ambient is not None and self.mean_head_mode == "direct_k":
                 outputs["final_temperature"] = ambient[:, None, None] + outputs["mean_rise"][:, None, None] + centered
-                outputs["cnn_only_temperature"] = ambient[:, None, None] + outputs["mean_rise"][:, None, None] + cnn_centered
+                outputs["cnn_only_temperature"] = ambient[:, None, None] + outputs["cnn_mean_rise"][:, None, None] + cnn_centered
         return outputs
 
     def forward(
@@ -1636,6 +1655,7 @@ class DecomposedMiniUNetWithGraph(nn.Module):
         global_correction_scale: float = 1.0,
         disabled_fusion_scales: tuple[str, ...] | list[str] = (),
         ambient: torch.Tensor | None = None,
+        total_power_W: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         return self.forward_components(
             x,
@@ -1646,6 +1666,7 @@ class DecomposedMiniUNetWithGraph(nn.Module):
             global_correction_scale=global_correction_scale,
             disabled_fusion_scales=disabled_fusion_scales,
             ambient=ambient,
+            total_power_W=total_power_W,
         )
 
     def forward_profile(
@@ -1658,6 +1679,7 @@ class DecomposedMiniUNetWithGraph(nn.Module):
         graph_correction_scale: float = 1.0,
         global_correction_scale: float = 1.0,
         disabled_fusion_scales: tuple[str, ...] | list[str] = (),
+        total_power_W: torch.Tensor | None = None,
     ) -> tuple[dict[str, torch.Tensor], dict[str, float]]:
         timings: dict[str, float] = {}
 
@@ -1678,6 +1700,7 @@ class DecomposedMiniUNetWithGraph(nn.Module):
                 metadata,
                 synchronize=synchronize,
                 disabled_fusion_scales=disabled_fusion_scales,
+                total_power_W=total_power_W,
             )
             timings.update(cnn_timings)
         elif self.global_branch_enabled:
@@ -1705,7 +1728,10 @@ class DecomposedMiniUNetWithGraph(nn.Module):
         centered = centered - centered.mean(dim=(-2, -1), keepdim=True)
         toc("fusion_head_s", start)
         start = tic()
-        mean_delta = self.graph_mean_head(graph_outputs["graph_embedding"]).squeeze(1)
+        if self.graph_mean_correction_enabled:
+            mean_delta = self.graph_mean_head(graph_outputs["graph_embedding"]).squeeze(1)
+        else:
+            mean_delta = graph_outputs["graph_embedding"].new_zeros(graph_outputs["graph_embedding"].shape[0])
         toc("graph_mean_head_s", start)
         start = tic()
         outputs = dict(cnn_outputs)
@@ -1714,6 +1740,8 @@ class DecomposedMiniUNetWithGraph(nn.Module):
         outputs["graph_correction_field"] = correction
         outputs["scaled_graph_correction_field"] = correction * float(graph_correction_scale)
         outputs["centered_field"] = centered
+        outputs["graph_mean_delta"] = mean_delta
+        outputs["graph_mean_correction_enabled"] = mean_delta.new_full(mean_delta.shape, 1.0 if self.graph_mean_correction_enabled else 0.0)
         outputs["mean_rise"] = cnn_outputs["mean_rise"] + mean_delta
         outputs["graph_raster_features"] = graph_maps
         outputs["node_embeddings"] = graph_outputs["node_embeddings"]
@@ -1739,7 +1767,12 @@ class DecomposedMiniUNetWithGraph(nn.Module):
             "metadata_embedding_dim": self.metadata_embedding_dim,
             "conditioned": True,
             "physics_input_mode": self.physics_input_mode,
+            "mean_head_mode": self.mean_head_mode,
+            "delta_R_eff_target_mean_K_per_W": self.delta_R_eff_mean_K_per_W,
+            "delta_R_eff_target_std_K_per_W": self.delta_R_eff_std_K_per_W,
+            "delta_R_eff_target_units": "K/W",
             "graph_enabled": True,
+            "graph_mean_correction_enabled": self.graph_mean_correction_enabled,
             "global_branch_enabled": self.global_branch_enabled,
             "feature_fusion_enabled": self.feature_fusion_enabled,
             "graph_node_feature_dim": self.graph_node_feature_dim,
@@ -2394,6 +2427,14 @@ def build_model(config: dict[str, object]) -> nn.Module:
             global_hidden_channels=int(config.get("global_hidden_channels", config.get("global_branch_hidden_channels", 32))),
             global_blocks=int(config.get("global_blocks", config.get("global_branch_blocks", 3))),
             global_pool_size=int(config.get("global_pool_size", config.get("global_branch_pool_size", 8))),
+            mean_head_mode=str(config.get("mean_head_mode", "direct_k")),
+            delta_R_eff_mean_K_per_W=float(
+                config.get("delta_R_eff_target_mean_K_per_W", config.get("delta_R_eff_mean_K_per_W", 0.0))
+            ),
+            delta_R_eff_std_K_per_W=float(
+                config.get("delta_R_eff_target_std_K_per_W", config.get("delta_R_eff_std_K_per_W", 1.0))
+            ),
+            graph_mean_correction_enabled=bool(config.get("graph_mean_correction_enabled", True)),
         )
     if architecture == "miniunet_refine_conditioned_decomposed_pairwise":
         return DecomposedMiniUNetWithPairwiseOperator(

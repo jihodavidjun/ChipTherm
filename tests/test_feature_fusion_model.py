@@ -157,9 +157,100 @@ def test_feature_fusion_graph_freezes_entire_cnn_branch_and_forwards() -> None:
     assert torch.allclose(outputs["centered_field"].mean(dim=(-2, -1)), torch.zeros(2), atol=1.0e-6)
 
 
+def test_feature_fusion_graph_supports_frozen_residual_resistance_cnn() -> None:
+    torch.manual_seed(4)
+    config = base_config("miniunet_refine_conditioned_decomposed_feature_fusion_graph")
+    config.update(
+        {
+            "graph_node_feature_dim": 6,
+            "graph_edge_feature_dim": 4,
+            "graph_hidden_dim": 8,
+            "graph_edge_hidden_dim": 8,
+            "graph_layers": 1,
+            "graph_raster_channels": 4,
+            "freeze_cnn": True,
+            "mean_head_mode": "residual_resistance",
+            "delta_R_eff_target_mean_K_per_W": 0.25,
+            "delta_R_eff_target_std_K_per_W": 0.5,
+            "graph_mean_correction_enabled": False,
+        }
+    )
+    model = build_model(config)
+    assert model.mean_head_mode == "residual_resistance"
+    assert model.cnn_model.mean_head_mode == "residual_resistance"
+    assert model.graph_mean_correction_enabled is False
+    assert all(not parameter.requires_grad for parameter in model.cnn_model.parameters())
+
+    x = torch.randn(2, 12, 64, 64)
+    metadata = torch.randn(2, 5)
+    total_power = torch.tensor([10.0, 20.0])
+    graph = small_graph(2)
+    with torch.no_grad():
+        outputs = model(x, metadata, graph, return_diagnostics=True, total_power_W=total_power)
+
+    assert torch.allclose(outputs["graph_mean_delta"], torch.zeros(2), atol=0.0, rtol=0.0)
+    assert torch.allclose(outputs["mean_rise"], outputs["cnn_mean_rise"], atol=0.0, rtol=0.0)
+    assert outputs["delta_R_eff"].shape == (2,)
+    assert torch.allclose(outputs["mean_rise"], total_power * outputs["delta_R_eff"], atol=1.0e-5)
+
+    source_base = torch.randn(2, 64, 64)
+    t_cnn = source_base + outputs["cnn_mean_rise"][:, None, None] + outputs["cnn_centered_field"]
+    t_cnn_gnn = source_base + outputs["mean_rise"][:, None, None] + outputs["centered_field"]
+    expected = t_cnn + outputs["scaled_graph_correction_field"]
+    expected = expected - expected.mean(dim=(-2, -1), keepdim=True) + t_cnn.mean(dim=(-2, -1), keepdim=True)
+    assert t_cnn.shape == t_cnn_gnn.shape == (2, 64, 64)
+    assert torch.isfinite(t_cnn_gnn).all()
+
+    with torch.no_grad():
+        try:
+            model(x, metadata, graph)
+        except ValueError as exc:
+            assert "total_power_W" in str(exc)
+        else:
+            raise AssertionError("residual-resistance graph model should require total_power_W")
+
+
+def test_frozen_feature_fusion_cnn_weights_stay_bitwise_unchanged_after_graph_step() -> None:
+    torch.manual_seed(5)
+    config = base_config("miniunet_refine_conditioned_decomposed_feature_fusion_graph")
+    config.update(
+        {
+            "graph_node_feature_dim": 6,
+            "graph_edge_feature_dim": 4,
+            "graph_hidden_dim": 8,
+            "graph_edge_hidden_dim": 8,
+            "graph_layers": 1,
+            "graph_raster_channels": 4,
+            "freeze_cnn": True,
+            "mean_head_mode": "residual_resistance",
+            "delta_R_eff_target_mean_K_per_W": 0.1,
+            "delta_R_eff_target_std_K_per_W": 0.2,
+            "graph_mean_correction_enabled": False,
+        }
+    )
+    model = build_model(config)
+    before = {name: tensor.detach().clone() for name, tensor in model.cnn_model.state_dict().items()}
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1.0e-3)
+    x = torch.randn(2, 12, 64, 64)
+    metadata = torch.randn(2, 5)
+    total_power = torch.tensor([10.0, 20.0])
+    outputs = model(x, metadata, small_graph(2), total_power_W=total_power)
+    target = torch.randn_like(outputs["centered_field"])
+    loss = torch.nn.functional.smooth_l1_loss(outputs["centered_field"], target)
+    loss.backward()
+    optimizer.step()
+
+    after = model.cnn_model.state_dict()
+    for name, tensor in before.items():
+        assert torch.equal(tensor, after[name]), name
+    assert any(parameter.grad is not None for parameter in model.fusion_head.parameters())
+
+
 if __name__ == "__main__":
     test_feature_fusion_forward_shapes_and_zero_mean()
     test_feature_fusion_residual_path_receives_gradients()
     test_feature_fusion_checkpoint_round_trip()
     test_feature_fusion_graph_freezes_entire_cnn_branch_and_forwards()
+    test_feature_fusion_graph_supports_frozen_residual_resistance_cnn()
+    test_frozen_feature_fusion_cnn_weights_stay_bitwise_unchanged_after_graph_step()
     print("feature fusion model tests passed")

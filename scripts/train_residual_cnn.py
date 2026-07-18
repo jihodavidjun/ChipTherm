@@ -116,6 +116,16 @@ def main() -> int:
     parser.add_argument("--graph-halo-decay-mm", default=4.0, type=float)
     parser.add_argument("--graph-rasterizer-mode", default="vectorized", choices=["vectorized", "legacy"])
     parser.add_argument("--graph-use-edge-features", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--graph-mean-correction",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Allow graph branch to add a scalar package-mean correction. "
+            "Use --no-graph-mean-correction for matched frozen-CNN correction experiments "
+            "where final output is exactly T_cnn + graph_correction_K."
+        ),
+    )
     parser.add_argument("--lambda-graph", default=0.0, type=float)
     parser.add_argument("--global-hidden-channels", default=32, type=int)
     parser.add_argument("--global-blocks", default=3, type=int)
@@ -365,6 +375,7 @@ def main() -> int:
                 "graph_halo_decay_mm": args.graph_halo_decay_mm,
                 "graph_rasterizer_mode": args.graph_rasterizer_mode,
                 "graph_use_edge_features": args.graph_use_edge_features,
+                "graph_mean_correction_enabled": args.graph_mean_correction,
                 "freeze_cnn": args.freeze_cnn,
                 "graph_node_feature_names": list(getattr(train_dataset, "graph_node_feature_names", ()) or []),
                 "graph_edge_feature_names": list(getattr(train_dataset, "graph_edge_feature_names", ()) or []),
@@ -454,6 +465,7 @@ def main() -> int:
         "graph_halo_decay_mm": args.graph_halo_decay_mm,
         "graph_rasterizer_mode": args.graph_rasterizer_mode,
         "graph_use_edge_features": args.graph_use_edge_features,
+        "graph_mean_correction_enabled": args.graph_mean_correction,
         "lambda_graph": args.lambda_graph,
         "global_hidden_channels": args.global_hidden_channels,
         "global_blocks": args.global_blocks,
@@ -520,6 +532,7 @@ def main() -> int:
             "lambda_chiplet_mean": args.lambda_chiplet_mean,
             "graph_node_feature_names": list(getattr(train_dataset, "graph_node_feature_names", ()) or []),
             "graph_edge_feature_names": list(getattr(train_dataset, "graph_edge_feature_names", ()) or []),
+            "graph_mean_correction_enabled": args.graph_mean_correction,
         }
     )
     if is_global_arch or is_feature_fusion_arch:
@@ -562,6 +575,8 @@ def main() -> int:
         print(f"Global physical channel names: {', '.join(global_channel_names)}")
     if init_summary:
         print(f"Initialized from {args.init_checkpoint}: {init_summary}")
+    if is_graph_arch:
+        print(f"Graph mean correction enabled: {args.graph_mean_correction}")
     print(f"Trainable parameters: {count_parameters(model)}")
 
     log_path = out_dir / "train_log.csv"
@@ -1187,10 +1202,11 @@ def evaluate_model(
                 cnn_centered = outputs["cnn_centered_field"]
                 cnn_centered_abs_acc.update(cnn_centered.abs().mean(dim=(-2, -1)))
                 final_centered_abs_acc.update(outputs["centered_field"].abs().mean(dim=(-2, -1)))
+                cnn_mean_rise = outputs.get("cnn_mean_rise", outputs["mean_rise"])
                 if mean_head_mode == "residual_resistance":
-                    cnn_only_temperature = physics + outputs["mean_rise"][:, None, None] + cnn_centered
+                    cnn_only_temperature = physics + cnn_mean_rise[:, None, None] + cnn_centered
                 else:
-                    cnn_only_temperature = ambient[:, None, None] + outputs["mean_rise"][:, None, None] + cnn_centered
+                    cnn_only_temperature = ambient[:, None, None] + cnn_mean_rise[:, None, None] + cnn_centered
                 cnn_only_centered = cnn_centered
                 cnn_only_final_acc.update(cnn_only_temperature, temperature)
                 cnn_only_centered_acc.update(cnn_only_centered, centered_target)
@@ -1447,7 +1463,10 @@ def call_model(
     total_power_W: torch.Tensor | None = None,
 ) -> Any:
     if graph_enabled:
-        return model(model_input, metadata_input, graph_batch)
+        kwargs: dict[str, Any] = {}
+        if getattr(model, "mean_head_mode", "direct_k") == "residual_resistance":
+            kwargs["total_power_W"] = total_power_W
+        return model(model_input, metadata_input, graph_batch, **kwargs)
     if conditioned:
         if getattr(model, "mean_head_mode", "direct_k") == "residual_resistance":
             return model(model_input, metadata_input, total_power_W=total_power_W)

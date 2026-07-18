@@ -111,7 +111,8 @@ def main() -> int:
     graph_stats = checkpoint["model_config"].get("graph_normalization")
     physics_input_mode = str(checkpoint["model_config"].get("physics_input_mode", "v1"))
     mean_head_mode = str(checkpoint["model_config"].get("mean_head_mode", "direct_k"))
-    physical_representation = str(checkpoint["model_config"].get("physical_representation", "dimensional"))
+    physical_representation_value = checkpoint["model_config"].get("physical_representation", "dimensional")
+    physical_representation = "dimensional" if physical_representation_value in {None, "", "None"} else str(physical_representation_value)
     if mean_head_mode not in {"direct_k", "residual_resistance"}:
         raise SystemExit(f"unsupported checkpoint mean_head_mode: {mean_head_mode}")
     if physical_representation not in {"dimensional", "dimensionless_v1", "dimensionless_v2"}:
@@ -550,10 +551,11 @@ def evaluate(
                 cnn_centered = outputs["cnn_centered_field"]
                 cnn_centered_abs_acc.update(cnn_centered.abs().mean(dim=(-2, -1)))
                 final_centered_abs_acc.update(outputs["centered_field"].abs().mean(dim=(-2, -1)))
+                cnn_mean_rise = outputs.get("cnn_mean_rise", outputs["mean_rise"])
                 if mean_head_mode == "residual_resistance":
-                    cnn_only_temperature = physics + outputs["mean_rise"][:, None, None] + cnn_centered
+                    cnn_only_temperature = physics + cnn_mean_rise[:, None, None] + cnn_centered
                 else:
-                    cnn_only_temperature = ambient[:, None, None] + outputs["mean_rise"][:, None, None] + cnn_centered
+                    cnn_only_temperature = ambient[:, None, None] + cnn_mean_rise[:, None, None] + cnn_centered
                 cnn_only_centered = cnn_centered - cnn_centered.mean(dim=(-2, -1), keepdim=True)
                 cnn_only_final_acc.update(cnn_only_temperature, temperature)
                 cnn_only_centered_acc.update(cnn_only_centered, centered_target)
@@ -1000,6 +1002,8 @@ def call_model(
             kwargs["global_correction_scale"] = global_correction_scale
         if getattr(model, "feature_fusion_enabled", False):
             kwargs["disabled_fusion_scales"] = disabled_fusion_scales
+        if getattr(model, "mean_head_mode", "direct_k") == "residual_resistance":
+            kwargs["total_power_W"] = total_power_W
         return model(model_input, metadata_input, graph_batch, **kwargs)
     if conditioned:
         if getattr(model, "architecture", "") == "miniunet_refine_conditioned_decomposed_feature_fusion":

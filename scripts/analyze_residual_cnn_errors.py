@@ -173,6 +173,12 @@ def architecture_info(model_config: dict[str, Any]) -> dict[str, Any]:
         "source_superposition_plus_physics_v1",
     }:
         raise ValueError(f"unsupported physics_input_mode: {physics_input_mode}")
+    physical_representation_value = model_config.get("physical_representation", "dimensional")
+    physical_representation = (
+        "dimensional"
+        if physical_representation_value in {None, "", "None"}
+        else str(physical_representation_value)
+    )
     return {
         "architecture": architecture,
         "conditioned": architecture in {
@@ -210,7 +216,7 @@ def architecture_info(model_config: dict[str, Any]) -> dict[str, Any]:
         "metadata_dim": int(model_config.get("metadata_dim", 0) or 0),
         "physics_input_mode": physics_input_mode,
         "mean_head_mode": str(model_config.get("mean_head_mode", "direct_k")),
-        "physical_representation": str(model_config.get("physical_representation", "dimensional")),
+        "physical_representation": physical_representation,
     }
 
 
@@ -407,7 +413,10 @@ def predict_temperature(
         raise ValueError("conditioned checkpoint requires metadata tensor; build metadata_features.csv first")
     if decomposed:
         if bool(model_info.get("graph_enabled")):
-            outputs = model(model_input, metadata_input, graph_batch)
+            kwargs: dict[str, Any] = {}
+            if getattr(model, "mean_head_mode", "direct_k") == "residual_resistance":
+                kwargs["total_power_W"] = total_power
+            outputs = model(model_input, metadata_input, graph_batch, **kwargs)
         else:
             if conditioned and getattr(model, "mean_head_mode", "direct_k") == "residual_resistance":
                 outputs = model(model_input, metadata_input, total_power_W=total_power)
