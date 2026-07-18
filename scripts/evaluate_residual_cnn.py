@@ -89,6 +89,7 @@ def main() -> int:
         "miniunet_refine_conditioned_decomposed",
         "miniunet_refine_conditioned_decomposed_global",
         "miniunet_refine_conditioned_decomposed_feature_fusion",
+        "miniunet_refine_conditioned_decomposed_feature_fusion_resistance_mean",
         "miniunet_refine_conditioned_decomposed_graph",
         "miniunet_refine_conditioned_decomposed_global_graph",
         "miniunet_refine_conditioned_decomposed_feature_fusion_graph",
@@ -100,6 +101,7 @@ def main() -> int:
         "miniunet_refine_conditioned_decomposed",
         "miniunet_refine_conditioned_decomposed_global",
         "miniunet_refine_conditioned_decomposed_feature_fusion",
+        "miniunet_refine_conditioned_decomposed_feature_fusion_resistance_mean",
         "miniunet_refine_conditioned_decomposed_graph",
         "miniunet_refine_conditioned_decomposed_global_graph",
         "miniunet_refine_conditioned_decomposed_feature_fusion_graph",
@@ -108,6 +110,9 @@ def main() -> int:
     }
     graph_stats = checkpoint["model_config"].get("graph_normalization")
     physics_input_mode = str(checkpoint["model_config"].get("physics_input_mode", "v1"))
+    mean_head_mode = str(checkpoint["model_config"].get("mean_head_mode", "direct_k"))
+    if mean_head_mode not in {"direct_k", "residual_resistance"}:
+        raise SystemExit(f"unsupported checkpoint mean_head_mode: {mean_head_mode}")
     if physics_input_mode not in {
         "v1",
         "none",
@@ -146,6 +151,7 @@ def main() -> int:
         decomposed=decomposed,
         conditioned=conditioned,
         physics_input_mode=physics_input_mode,
+        mean_head_mode=mean_head_mode,
         graph_enabled=graph_enabled,
         graph_stats=graph_stats,
         graph_correction_scale=args.graph_correction_scale,
@@ -216,6 +222,7 @@ def main() -> int:
         "model": {
             "config": checkpoint["model_config"],
             "physics_input_mode": physics_input_mode,
+            "mean_head_mode": mean_head_mode,
             "parameter_count": count_parameters(model),
         },
         "num_samples": metrics["num_samples"],
@@ -238,6 +245,8 @@ def main() -> int:
         "cnn_residual": metrics["cnn_residual"],
         "coarse_final_temperature": metrics.get("coarse_final_temperature"),
         "mean_rise": metrics.get("mean_rise"),
+        "delta_R_eff": metrics.get("delta_R_eff"),
+        "worse_than_physics_baseline_fraction": metrics.get("worse_than_physics_baseline_fraction"),
         "centered_field": metrics.get("centered_field"),
         "mean_bias_removed": metrics.get("mean_bias_removed"),
         "chiplet_mean_temperature": metrics.get("chiplet_mean_temperature"),
@@ -272,6 +281,7 @@ def main() -> int:
             device,
             conditioned=conditioned,
             physics_input_mode=physics_input_mode,
+            mean_head_mode=mean_head_mode,
             graph_stats=graph_stats,
             graph_correction_scale=args.graph_correction_scale,
             global_correction_scale=args.global_correction_scale,
@@ -285,6 +295,7 @@ def main() -> int:
     print("Residual CNN evaluation complete")
     print(f"Samples: {metrics['num_samples']}")
     print(f"Physics input mode: {physics_input_mode}")
+    print(f"Mean head mode: {mean_head_mode}")
     print(f"CNN-side inference runtime/sample: {cnn_runtime_per_sample:.6f} s")
     if args.measure_end_to_end:
         if physics_runtime_s is None:
@@ -357,6 +368,11 @@ def main() -> int:
     if metrics.get("physics_v1_auxiliary"):
         aux = metrics["physics_v1_auxiliary"]
         print(f"Physics-v1 auxiliary raw MAE/RMSE: {aux['mae_K']:.3f} / {aux['rmse_K']:.3f} K")
+    if metrics.get("delta_R_eff"):
+        delta_r = metrics["delta_R_eff"]
+        print(f"Delta R_eff MAE/RMSE: {delta_r['mae_K_per_W']:.6f} / {delta_r['rmse_K_per_W']:.6f} K/W")
+    if metrics.get("worse_than_physics_baseline_fraction") is not None:
+        print(f"Fraction worse than physics/base: {metrics['worse_than_physics_baseline_fraction']:.3f}")
     print(f"CNN final MAE/RMSE: {final_mae:.3f} / {final_rmse:.3f} K")
     print(f"Parameter count: {count_parameters(model)}")
     print(f"Improvement: MAE {improvement['mae_percent']:.2f}% / RMSE {improvement['rmse_percent']:.2f}%")
@@ -395,6 +411,7 @@ def evaluate(
     graph_correction_scale: float = 1.0,
     global_correction_scale: float = 1.0,
     disabled_fusion_scales: tuple[str, ...] = (),
+    mean_head_mode: str = "direct_k",
 ) -> tuple[dict[str, Any], dict[str, dict[str, dict[str, float]]], float, float | None, float | None, float]:
     residual_acc = MetricAccumulator()
     final_acc = MetricAccumulator()
@@ -403,6 +420,7 @@ def evaluate(
     physics_v1_acc = MetricAccumulator()
     coarse_final_acc = MetricAccumulator()
     mean_acc = ScalarMetricAccumulator()
+    delta_R_acc = ScalarMetricAccumulator()
     centered_acc = MetricAccumulator()
     cnn_only_centered_acc = MetricAccumulator()
     mean_bias_removed_acc = MetricAccumulator()
@@ -448,6 +466,7 @@ def evaluate(
     inference_runtime_s = 0.0
     gate_runtime_s = 0.0
     num_samples = 0
+    worse_than_physics_count = 0
 
     for batch in loader:
         x = batch["x"].to(device, non_blocking=True)
@@ -458,6 +477,7 @@ def evaluate(
         residual = batch["residual"].to(device, non_blocking=True)
         temperature = batch["temperature"].to(device, non_blocking=True)
         ambient = batch["ambient_K"].to(device, non_blocking=True).float()
+        total_power = batch["total_power_W"].to(device, non_blocking=True).float()
         metadata_input = build_metadata_input(batch.get("metadata_vector"), stats)
         if metadata_input is not None:
             metadata_input = metadata_input.to(device, non_blocking=True)
@@ -491,13 +511,17 @@ def evaluate(
                 graph_correction_scale=graph_correction_scale,
                 global_correction_scale=global_correction_scale,
                 disabled_fusion_scales=disabled_fusion_scales,
+                total_power_W=total_power,
             )
-            pred_temperature = reconstruct_decomposed_temperature(outputs, ambient)
+            pred_temperature = reconstruct_decomposed_temperature(outputs, ambient, physics, mean_head_mode=mean_head_mode)
             pred_residual = pred_temperature - physics
-            centered_pred = pred_temperature - pred_temperature.mean(dim=(-2, -1), keepdim=True)
-            centered_target = temperature - temperature.mean(dim=(-2, -1), keepdim=True)
-            mean_target = (temperature - ambient[:, None, None]).mean(dim=(-2, -1))
+            targets = decomposed_targets(temperature, ambient, physics, total_power, mean_head_mode=mean_head_mode)
+            centered_pred = outputs["centered_field"]
+            centered_target = targets["centered_field_K"]
+            mean_target = targets["mean_correction_K"]
             mean_acc.update(outputs["mean_rise"], mean_target)
+            if "delta_R_eff" in outputs:
+                delta_R_acc.update(outputs["delta_R_eff"], targets["delta_R_eff_K_per_W"])
             centered_acc.update(centered_pred, centered_target)
             mean_bias_removed_acc.update(centered_pred, centered_target)
             alpha = outputs.get("physics_gate_alpha")
@@ -513,8 +537,11 @@ def evaluate(
                 cnn_centered = outputs["cnn_centered_field"]
                 cnn_centered_abs_acc.update(cnn_centered.abs().mean(dim=(-2, -1)))
                 final_centered_abs_acc.update(outputs["centered_field"].abs().mean(dim=(-2, -1)))
-                cnn_only_temperature = ambient[:, None, None] + outputs["mean_rise"][:, None, None] + cnn_centered
-                cnn_only_centered = cnn_only_temperature - cnn_only_temperature.mean(dim=(-2, -1), keepdim=True)
+                if mean_head_mode == "residual_resistance":
+                    cnn_only_temperature = physics + outputs["mean_rise"][:, None, None] + cnn_centered
+                else:
+                    cnn_only_temperature = ambient[:, None, None] + outputs["mean_rise"][:, None, None] + cnn_centered
+                cnn_only_centered = cnn_centered - cnn_centered.mean(dim=(-2, -1), keepdim=True)
                 cnn_only_final_acc.update(cnn_only_temperature, temperature)
                 cnn_only_centered_acc.update(cnn_only_centered, centered_target)
             global_correction = outputs.get("global_correction_field")
@@ -566,6 +593,9 @@ def evaluate(
 
         batch_size = int(x.shape[0])
         num_samples += batch_size
+        final_sample_mae = (pred_temperature - temperature).abs().reshape(batch_size, -1).mean(dim=1)
+        physics_sample_mae = (physics - temperature).abs().reshape(batch_size, -1).mean(dim=1)
+        worse_than_physics_count += int((final_sample_mae > physics_sample_mae).sum().item())
         case_ids = metadata_values(batch["metadata"], "case_id", batch_size)
         sample_uids = metadata_values(batch["metadata"], "sample_uid", batch_size)
         hotspot_runtimes.extend(
@@ -653,8 +683,12 @@ def evaluate(
         metrics["coarse_final_temperature"] = coarse_final_acc.compute()
     if decomposed:
         metrics["mean_rise"] = mean_acc.compute()
+        delta_summary = delta_R_acc.compute()
+        if delta_summary:
+            metrics["delta_R_eff"] = rename_scalar_metric_units(delta_summary, "K_per_W")
         metrics["centered_field"] = centered_acc.compute()
         metrics["mean_bias_removed"] = mean_bias_removed_acc.compute()
+        metrics["worse_than_physics_baseline_fraction"] = worse_than_physics_count / max(num_samples, 1)
     chiplet_mean_summary = chiplet_mean_acc.compute()
     if chiplet_mean_summary:
         metrics["chiplet_mean_temperature"] = chiplet_mean_summary
@@ -732,10 +766,63 @@ def evaluate(
     return metrics, case_payload, inference_runtime_s, hotspot_runtime_s, physics_runtime_s, gate_runtime_s
 
 
-def reconstruct_decomposed_temperature(outputs: dict[str, torch.Tensor], ambient: torch.Tensor) -> torch.Tensor:
+def decomposed_targets(
+    temperature: torch.Tensor,
+    ambient: torch.Tensor,
+    physics: torch.Tensor,
+    total_power: torch.Tensor,
+    *,
+    mean_head_mode: str,
+) -> dict[str, torch.Tensor]:
+    if mean_head_mode == "residual_resistance":
+        total_power_flat = total_power.to(device=temperature.device, dtype=temperature.dtype).view(-1)
+        if torch.any(total_power_flat <= 0.0):
+            raise ValueError("residual_resistance target requires strictly positive total_power_W")
+        residual = temperature - physics
+        mean_correction = residual.mean(dim=(-2, -1))
+        centered = residual - mean_correction[:, None, None]
+        return {
+            "mean_correction_K": mean_correction,
+            "centered_field_K": centered,
+            "delta_R_eff_K_per_W": mean_correction / total_power_flat,
+        }
+    if mean_head_mode != "direct_k":
+        raise ValueError(f"unsupported mean_head_mode: {mean_head_mode}")
+    mean_rise = (temperature - ambient[:, None, None]).mean(dim=(-2, -1))
+    centered = temperature - temperature.mean(dim=(-2, -1), keepdim=True)
+    return {
+        "mean_correction_K": mean_rise,
+        "centered_field_K": centered,
+        "delta_R_eff_K_per_W": torch.zeros_like(mean_rise),
+    }
+
+
+def reconstruct_decomposed_temperature(
+    outputs: dict[str, torch.Tensor],
+    ambient: torch.Tensor,
+    physics: torch.Tensor | None = None,
+    *,
+    mean_head_mode: str = "direct_k",
+) -> torch.Tensor:
     centered = outputs["centered_field"]
     centered = centered - centered.mean(dim=(-2, -1), keepdim=True)
+    if mean_head_mode == "residual_resistance":
+        if physics is None:
+            raise ValueError("residual_resistance reconstruction requires the physics/base tensor")
+        return physics + outputs["mean_rise"][:, None, None] + centered
+    if mean_head_mode != "direct_k":
+        raise ValueError(f"unsupported mean_head_mode: {mean_head_mode}")
     return ambient[:, None, None] + outputs["mean_rise"][:, None, None] + centered
+
+
+def rename_scalar_metric_units(metrics: dict[str, float], suffix: str) -> dict[str, float]:
+    renamed: dict[str, float] = {}
+    for key, value in metrics.items():
+        if key.endswith("_K"):
+            renamed[f"{key[:-2]}_{suffix}"] = value
+        else:
+            renamed[key] = value
+    return renamed
 
 
 @torch.no_grad()
@@ -749,6 +836,7 @@ def profile_components(
     physics_input_mode: str,
     graph_stats: Any | None,
     graph_correction_scale: float,
+    mean_head_mode: str,
     global_correction_scale: float = 1.0,
     disabled_fusion_scales: tuple[str, ...] = (),
     warmup_batches: int = 2,
@@ -771,6 +859,7 @@ def profile_components(
         prep_start = time.perf_counter()
         x = batch["x"].to(device, non_blocking=True)
         physics = batch["physics"].to(device, non_blocking=True)
+        total_power = batch["total_power_W"].to(device, non_blocking=True).float()
         physics_v1 = batch.get("physics_v1")
         if physics_v1 is not None:
             physics_v1 = physics_v1.to(device, non_blocking=True)
@@ -808,6 +897,8 @@ def profile_components(
             profile_kwargs["global_correction_scale"] = global_correction_scale
         if getattr(model, "feature_fusion_enabled", False):
             profile_kwargs["disabled_fusion_scales"] = disabled_fusion_scales
+        if mean_head_mode == "residual_resistance":
+            profile_kwargs["total_power_W"] = total_power
         _outputs, component_times = model.forward_profile(model_input, metadata_input, graph_batch, **profile_kwargs)
         sync()
         total_time = time.perf_counter() - forward_start
@@ -885,6 +976,7 @@ def call_model(
     graph_correction_scale: float = 1.0,
     global_correction_scale: float = 1.0,
     disabled_fusion_scales: tuple[str, ...] = (),
+    total_power_W: torch.Tensor | None = None,
 ) -> Any:
     if graph_enabled:
         kwargs = {
@@ -903,6 +995,7 @@ def call_model(
                 metadata_input,
                 return_diagnostics=True,
                 disabled_fusion_scales=disabled_fusion_scales,
+                total_power_W=total_power_W,
             )
         if hasattr(model, "global_branch"):
             return model(

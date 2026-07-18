@@ -70,6 +70,7 @@ class ChipThermDataset(Dataset):
             "temperature": temperature,
             "residual": residual,
             "ambient_K": torch.tensor(self._ambient_for_row(row), dtype=torch.float32),
+            "total_power_W": torch.tensor(self._total_power_for_row(row), dtype=torch.float32),
         }
         physics_v1_path_value = self._physics_v1_path_for_row(row)
         if physics_v1_path_value is not None:
@@ -261,6 +262,21 @@ class ChipThermDataset(Dataset):
         if self.metadata_feature_rows and "ambient_K" in self.metadata_feature_rows.get(row["sample_uid"], {}):
             return float(self.metadata_feature_rows[row["sample_uid"]]["ambient_K"])
         return 318.15
+
+    def _total_power_for_row(self, row: dict[str, str]) -> float:
+        value = row.get("total_power_W", "")
+        if value not in {"", None}:
+            total_power = float(value)
+            if not np.isfinite(total_power):
+                raise ValueError(f"row {row.get('sample_uid')} has non-finite total_power_W={value!r}")
+            return total_power
+        values = self.metadata_feature_rows.get(row["sample_uid"], {}) if self.metadata_feature_rows else {}
+        if "total_power_W" in values:
+            total_power = float(values["total_power_W"])
+            if not np.isfinite(total_power):
+                raise ValueError(f"metadata_features.csv has non-finite total_power_W for {row.get('sample_uid')}")
+            return total_power
+        raise ValueError(f"row {row.get('sample_uid')} is missing total_power_W required for package mean diagnostics")
 
     def _prediction_path_for_row(self, row: dict[str, str]) -> str:
         mode = row.get("source_base_mode") or row.get("base_mode") or row.get("physics_input_mode")

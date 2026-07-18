@@ -74,6 +74,7 @@ def main() -> int:
             "miniunet_refine_conditioned_decomposed",
             "miniunet_refine_conditioned_decomposed_global",
             "miniunet_refine_conditioned_decomposed_feature_fusion",
+            "miniunet_refine_conditioned_decomposed_feature_fusion_resistance_mean",
             "miniunet_refine_conditioned_decomposed_graph",
             "miniunet_refine_conditioned_decomposed_global_graph",
             "miniunet_refine_conditioned_decomposed_feature_fusion_graph",
@@ -86,6 +87,12 @@ def main() -> int:
     parser.add_argument("--metadata-conditioning", action="store_true")
     parser.add_argument("--metadata-hidden-dim", default=64, type=int)
     parser.add_argument("--metadata-embedding-dim", default=64, type=int)
+    parser.add_argument(
+        "--mean-head-mode",
+        default="direct_k",
+        choices=["direct_k", "residual_resistance"],
+        help="Scalar decomposed mean head. direct_k preserves existing behavior; residual_resistance predicts normalized delta_R_eff in K/W and reconstructs mean correction with total_power_W.",
+    )
     parser.add_argument(
         "--physics-input",
         default="v1",
@@ -181,6 +188,7 @@ def main() -> int:
     }
     is_feature_fusion_arch = args.model_architecture in {
         "miniunet_refine_conditioned_decomposed_feature_fusion",
+        "miniunet_refine_conditioned_decomposed_feature_fusion_resistance_mean",
         "miniunet_refine_conditioned_decomposed_feature_fusion_graph",
     }
     is_generic_graph_arch = args.model_architecture in {
@@ -196,6 +204,7 @@ def main() -> int:
         "miniunet_refine_conditioned_decomposed",
         "miniunet_refine_conditioned_decomposed_global",
         "miniunet_refine_conditioned_decomposed_feature_fusion",
+        "miniunet_refine_conditioned_decomposed_feature_fusion_resistance_mean",
         "miniunet_refine_conditioned_decomposed_graph",
         "miniunet_refine_conditioned_decomposed_global_graph",
         "miniunet_refine_conditioned_decomposed_feature_fusion_graph",
@@ -207,6 +216,7 @@ def main() -> int:
         "miniunet_refine_conditioned_decomposed",
         "miniunet_refine_conditioned_decomposed_global",
         "miniunet_refine_conditioned_decomposed_feature_fusion",
+        "miniunet_refine_conditioned_decomposed_feature_fusion_resistance_mean",
         "miniunet_refine_conditioned_decomposed_graph",
         "miniunet_refine_conditioned_decomposed_global_graph",
         "miniunet_refine_conditioned_decomposed_feature_fusion_graph",
@@ -217,6 +227,11 @@ def main() -> int:
         raise SystemExit("--physics-input gated_v1 requires a metadata-conditioned architecture")
     if args.metadata_conditioning and not is_conditioned_arch:
         print("--metadata-conditioning requested; using architecture-selected behavior only.")
+    if args.model_architecture == "miniunet_refine_conditioned_decomposed_feature_fusion_resistance_mean":
+        args.model_architecture = "miniunet_refine_conditioned_decomposed_feature_fusion"
+        args.mean_head_mode = "residual_resistance"
+    if args.mean_head_mode == "residual_resistance" and not is_decomposed_arch:
+        raise SystemExit("--mean-head-mode residual_resistance requires a decomposed architecture")
 
     set_seed(args.seed)
     device = select_device(args.device)
@@ -239,6 +254,7 @@ def main() -> int:
     )
     stats = compute_normalization_stats(stats_dataset, batch_size=args.batch_size, num_workers=args.num_workers)
     graph_stats = compute_graph_normalization_stats(train_dataset) if is_graph_arch else None
+    delta_R_stats = compute_delta_R_eff_target_stats(train_eval_loader) if args.mean_head_mode == "residual_resistance" else None
     metadata_dim = len(stats.metadata_feature_names)
     if is_conditioned_arch and metadata_dim <= 0:
         raise SystemExit("metadata-conditioned architecture requires metadata_features.csv/metadata_manifest.json")
@@ -263,6 +279,7 @@ def main() -> int:
         "model_input_channels": model_input_channels,
         "physics_gate_hidden_dim": args.physics_gate_hidden_dim,
         "physics_gate_init": args.physics_gate_init,
+        "mean_head_mode": args.mean_head_mode,
         "output_channels": 1,
         "base_channels": args.base_channels,
         "depth": args.depth,
@@ -341,6 +358,20 @@ def main() -> int:
                 "global_pool_size": args.global_pool_size,
             }
         )
+    if args.mean_head_mode == "residual_resistance":
+        assert delta_R_stats is not None
+        model_config.update(
+            {
+                "delta_R_eff_target_mean_K_per_W": delta_R_stats["mean_K_per_W"],
+                "delta_R_eff_target_std_K_per_W": delta_R_stats["std_K_per_W"],
+                "delta_R_eff_target_units": "K/W",
+                "delta_R_eff_target_normalization": "raw_head * train_std + train_mean; statistics fit on train split only",
+            }
+        )
+        (out_dir / "delta_R_eff_normalization.json").write_text(
+            json.dumps(delta_R_stats, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
 
     config = {
         "schema_version": 1,
@@ -358,6 +389,8 @@ def main() -> int:
         "model_input_channels": model_input_channels,
         "dataset_input_channels": dataset_input_channels,
         "physics_gate_hidden_dim": args.physics_gate_hidden_dim,
+        "mean_head_mode": args.mean_head_mode,
+        "delta_R_eff_target_normalization": delta_R_stats,
         "physics_gate_init": args.physics_gate_init,
         "physics_gate_regularization": args.physics_gate_regularization,
         "graph_hidden_dim": args.graph_hidden_dim,
@@ -449,6 +482,13 @@ def main() -> int:
 
     print(f"Model architecture: {args.model_architecture}")
     print(f"Physics input mode: {args.physics_input}")
+    print(f"Mean head mode: {args.mean_head_mode}")
+    if delta_R_stats is not None:
+        print(
+            "Delta R_eff train target mean/std/min/max: "
+            f"{delta_R_stats['mean_K_per_W']:.6f} / {delta_R_stats['std_K_per_W']:.6f} / "
+            f"{delta_R_stats['min_K_per_W']:.6f} / {delta_R_stats['max_K_per_W']:.6f} K/W"
+        )
     print(f"Model input channels: {model_input_channels}")
     if args.model_architecture == "miniunet_refine":
         print(f"Refinement channels: {list(refinement_channel_indices)}")
@@ -489,6 +529,7 @@ def main() -> int:
             graph_stats=graph_stats,
             lambda_graph=args.lambda_graph,
             lambda_chiplet_mean=args.lambda_chiplet_mean,
+            mean_head_mode=args.mean_head_mode,
         )
         val_metrics, val_by_case = evaluate_model(
             model,
@@ -504,6 +545,7 @@ def main() -> int:
             graph_enabled=is_graph_arch,
             graph_stats=graph_stats,
             lambda_chiplet_mean=args.lambda_chiplet_mean,
+            mean_head_mode=args.mean_head_mode,
         )
         train_final_mae_K: float | None = None
         if should_compute_train_mae(epoch, args.epochs, args.train_mae_every):
@@ -521,6 +563,7 @@ def main() -> int:
                 graph_enabled=is_graph_arch,
                 graph_stats=graph_stats,
                 lambda_chiplet_mean=args.lambda_chiplet_mean,
+                mean_head_mode=args.mean_head_mode,
             )
             train_final_mae_K = float(train_metrics["final_temperature"]["mae_K"])
         epoch_runtime_s = time.perf_counter() - epoch_start
@@ -714,6 +757,7 @@ def train_one_epoch(
     graph_stats: Any | None = None,
     lambda_graph: float = 0.0,
     lambda_chiplet_mean: float = 0.0,
+    mean_head_mode: str = "direct_k",
 ) -> dict[str, float]:
     model.train()
     total_loss = 0.0
@@ -744,6 +788,7 @@ def train_one_epoch(
         residual = batch["residual"].to(device, non_blocking=True)
         temperature = batch["temperature"].to(device, non_blocking=True)
         ambient = batch["ambient_K"].to(device, non_blocking=True).float()
+        total_power = batch["total_power_W"].to(device, non_blocking=True).float()
         metadata_input = build_metadata_input(batch.get("metadata_vector"), stats)
         if metadata_input is not None:
             metadata_input = metadata_input.to(device, non_blocking=True)
@@ -759,9 +804,18 @@ def train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
         if decomposed:
-            outputs = call_model(model, model_input, metadata_input, graph_batch, conditioned=conditioned, graph_enabled=graph_enabled)
-            pred_temperature = reconstruct_decomposed_temperature(outputs, ambient)
-            mean_target = (temperature - ambient[:, None, None]).mean(dim=(-2, -1))
+            outputs = call_model(
+                model,
+                model_input,
+                metadata_input,
+                graph_batch,
+                conditioned=conditioned,
+                graph_enabled=graph_enabled,
+                total_power_W=total_power,
+            )
+            pred_temperature = reconstruct_decomposed_temperature(outputs, ambient, physics, mean_head_mode=mean_head_mode)
+            targets = decomposed_targets(temperature, ambient, physics, total_power, mean_head_mode=mean_head_mode)
+            mean_target = targets["mean_correction_K"]
             final_loss = temp_criterion(pred_temperature, temperature)
             mean_loss = temp_criterion(outputs["mean_rise"], mean_target)
             residual_loss = final_loss
@@ -921,6 +975,7 @@ def evaluate_model(
     graph_enabled: bool = False,
     graph_stats: Any | None = None,
     lambda_chiplet_mean: float = 0.0,
+    mean_head_mode: str = "direct_k",
 ) -> tuple[dict[str, Any], dict[str, dict[str, float]]]:
     model.eval()
     residual_acc = MetricAccumulator()
@@ -929,6 +984,7 @@ def evaluate_model(
     centered_acc = MetricAccumulator()
     cnn_only_centered_acc = MetricAccumulator()
     mean_acc = ScalarMetricAccumulator()
+    delta_R_acc = ScalarMetricAccumulator()
     mean_bias_removed_acc = MetricAccumulator()
     gate_acc = ScalarSummaryAccumulator()
     graph_correction_acc = ScalarSummaryAccumulator()
@@ -967,6 +1023,7 @@ def evaluate_model(
     )
     total_loss = 0.0
     total_samples = 0
+    worse_than_physics_count = 0
 
     for batch in loader:
         x = batch["x"].to(device, non_blocking=True)
@@ -977,6 +1034,7 @@ def evaluate_model(
         residual = batch["residual"].to(device, non_blocking=True)
         temperature = batch["temperature"].to(device, non_blocking=True)
         ambient = batch["ambient_K"].to(device, non_blocking=True).float()
+        total_power = batch["total_power_W"].to(device, non_blocking=True).float()
         metadata_input = build_metadata_input(batch.get("metadata_vector"), stats)
         if metadata_input is not None:
             metadata_input = metadata_input.to(device, non_blocking=True)
@@ -989,16 +1047,27 @@ def evaluate_model(
             physics_v1=physics_v1,
         )
         if decomposed:
-            outputs = call_model(model, model_input, metadata_input, graph_batch, conditioned=conditioned, graph_enabled=graph_enabled)
-            pred_temperature = reconstruct_decomposed_temperature(outputs, ambient)
+            outputs = call_model(
+                model,
+                model_input,
+                metadata_input,
+                graph_batch,
+                conditioned=conditioned,
+                graph_enabled=graph_enabled,
+                total_power_W=total_power,
+            )
+            pred_temperature = reconstruct_decomposed_temperature(outputs, ambient, physics, mean_head_mode=mean_head_mode)
             pred_residual = pred_temperature - physics
-            mean_target = (temperature - ambient[:, None, None]).mean(dim=(-2, -1))
+            targets = decomposed_targets(temperature, ambient, physics, total_power, mean_head_mode=mean_head_mode)
+            mean_target = targets["mean_correction_K"]
             final_loss = torch.nn.functional.smooth_l1_loss(pred_temperature, temperature)
             mean_loss = torch.nn.functional.smooth_l1_loss(outputs["mean_rise"], mean_target)
             loss = float(lambda_final) * final_loss + float(lambda_mean) * mean_loss
-            centered_pred = pred_temperature - pred_temperature.mean(dim=(-2, -1), keepdim=True)
-            centered_target = temperature - temperature.mean(dim=(-2, -1), keepdim=True)
+            centered_pred = outputs["centered_field"]
+            centered_target = targets["centered_field_K"]
             mean_acc.update(outputs["mean_rise"], mean_target)
+            if "delta_R_eff" in outputs:
+                delta_R_acc.update(outputs["delta_R_eff"], targets["delta_R_eff_K_per_W"])
             centered_acc.update(centered_pred, centered_target)
             mean_bias_removed_acc.update(centered_pred, centered_target)
             alpha = outputs.get("physics_gate_alpha")
@@ -1014,8 +1083,11 @@ def evaluate_model(
                 cnn_centered = outputs["cnn_centered_field"]
                 cnn_centered_abs_acc.update(cnn_centered.abs().mean(dim=(-2, -1)))
                 final_centered_abs_acc.update(outputs["centered_field"].abs().mean(dim=(-2, -1)))
-                cnn_only_temperature = ambient[:, None, None] + outputs["mean_rise"][:, None, None] + cnn_centered
-                cnn_only_centered = cnn_only_temperature - cnn_only_temperature.mean(dim=(-2, -1), keepdim=True)
+                if mean_head_mode == "residual_resistance":
+                    cnn_only_temperature = physics + outputs["mean_rise"][:, None, None] + cnn_centered
+                else:
+                    cnn_only_temperature = ambient[:, None, None] + outputs["mean_rise"][:, None, None] + cnn_centered
+                cnn_only_centered = cnn_centered
                 cnn_only_final_acc.update(cnn_only_temperature, temperature)
                 cnn_only_centered_acc.update(cnn_only_centered, centered_target)
             global_correction = outputs.get("global_correction_field")
@@ -1047,6 +1119,9 @@ def evaluate_model(
         batch_size = int(x.shape[0])
         total_loss += float(loss.item()) * batch_size
         total_samples += batch_size
+        final_sample_mae = (pred_temperature - temperature).abs().reshape(batch_size, -1).mean(dim=1)
+        physics_sample_mae = (physics - temperature).abs().reshape(batch_size, -1).mean(dim=1)
+        worse_than_physics_count += int((final_sample_mae > physics_sample_mae).sum().item())
         residual_acc.update(pred_residual, residual)
         final_acc.update(pred_temperature, temperature)
         chiplet_metrics = None
@@ -1072,9 +1147,13 @@ def evaluate_model(
         "normalized_residual_loss": total_loss / max(total_samples, 1),
         "residual": residual_acc.compute(),
         "final_temperature": final_acc.compute(),
+        "worse_than_physics_baseline_fraction": worse_than_physics_count / max(total_samples, 1),
     }
     if decomposed:
         metrics["mean_rise"] = mean_acc.compute()
+        delta_summary = delta_R_acc.compute()
+        if delta_summary:
+            metrics["delta_R_eff"] = rename_scalar_metric_units(delta_summary, "K_per_W")
         metrics["centered_field"] = centered_acc.compute()
         metrics["mean_bias_removed"] = mean_bias_removed_acc.compute()
     cnn_only_summary = cnn_only_final_acc.compute()
@@ -1140,10 +1219,102 @@ def evaluate_model(
     return metrics, case_metrics
 
 
-def reconstruct_decomposed_temperature(outputs: dict[str, torch.Tensor], ambient: torch.Tensor) -> torch.Tensor:
+@torch.no_grad()
+def compute_delta_R_eff_target_stats(loader: DataLoader[dict[str, Any]]) -> dict[str, Any]:
+    """Fit train-only scalar target statistics for residual effective resistance."""
+    values: list[torch.Tensor] = []
+    total_power_values: list[torch.Tensor] = []
+    for batch in loader:
+        temperature = batch["temperature"].float()
+        physics = batch["physics"].float()
+        total_power = batch["total_power_W"].float().view(-1)
+        if torch.any(total_power <= 0.0):
+            bad = torch.nonzero(total_power <= 0.0, as_tuple=False).flatten().tolist()
+            raise ValueError(f"residual_resistance target requires strictly positive total_power_W; bad batch indices={bad}")
+        mean_residual = (temperature - physics).mean(dim=(-2, -1))
+        values.append(mean_residual / total_power)
+        total_power_values.append(total_power)
+    if not values:
+        raise ValueError("cannot fit delta_R_eff target normalization on an empty training loader")
+    stacked = torch.cat(values).double()
+    power = torch.cat(total_power_values).double()
+    std = float(stacked.std(unbiased=False).item())
+    if not np.isfinite(std) or std <= 1.0e-12:
+        std = 1.0
+    return {
+        "target_name": "delta_R_eff_true_K_per_W",
+        "units": "K/W",
+        "normalization_mode": "train_split_standardization",
+        "fit_scope": "train split only",
+        "count": int(stacked.numel()),
+        "mean_K_per_W": float(stacked.mean().item()),
+        "std_K_per_W": std,
+        "min_K_per_W": float(stacked.min().item()),
+        "max_K_per_W": float(stacked.max().item()),
+        "total_power_min_W": float(power.min().item()),
+        "total_power_max_W": float(power.max().item()),
+        "total_power_mean_W": float(power.mean().item()),
+        "formula": "mean(HotSpot_K - source_superposition_base_K) / total_power_W",
+    }
+
+
+def decomposed_targets(
+    temperature: torch.Tensor,
+    ambient: torch.Tensor,
+    physics: torch.Tensor,
+    total_power: torch.Tensor,
+    *,
+    mean_head_mode: str,
+) -> dict[str, torch.Tensor]:
+    if mean_head_mode == "residual_resistance":
+        total_power_flat = total_power.to(device=temperature.device, dtype=temperature.dtype).view(-1)
+        if torch.any(total_power_flat <= 0.0):
+            raise ValueError("residual_resistance target requires strictly positive total_power_W")
+        residual = temperature - physics
+        mean_correction = residual.mean(dim=(-2, -1))
+        centered = residual - mean_correction[:, None, None]
+        return {
+            "mean_correction_K": mean_correction,
+            "centered_field_K": centered,
+            "delta_R_eff_K_per_W": mean_correction / total_power_flat,
+        }
+    if mean_head_mode != "direct_k":
+        raise ValueError(f"unsupported mean_head_mode: {mean_head_mode}")
+    mean_rise = (temperature - ambient[:, None, None]).mean(dim=(-2, -1))
+    centered = temperature - temperature.mean(dim=(-2, -1), keepdim=True)
+    return {
+        "mean_correction_K": mean_rise,
+        "centered_field_K": centered,
+        "delta_R_eff_K_per_W": torch.zeros_like(mean_rise),
+    }
+
+
+def reconstruct_decomposed_temperature(
+    outputs: dict[str, torch.Tensor],
+    ambient: torch.Tensor,
+    physics: torch.Tensor | None = None,
+    *,
+    mean_head_mode: str = "direct_k",
+) -> torch.Tensor:
     centered = outputs["centered_field"]
     centered = centered - centered.mean(dim=(-2, -1), keepdim=True)
+    if mean_head_mode == "residual_resistance":
+        if physics is None:
+            raise ValueError("residual_resistance reconstruction requires the physics/base tensor")
+        return physics + outputs["mean_rise"][:, None, None] + centered
+    if mean_head_mode != "direct_k":
+        raise ValueError(f"unsupported mean_head_mode: {mean_head_mode}")
     return ambient[:, None, None] + outputs["mean_rise"][:, None, None] + centered
+
+
+def rename_scalar_metric_units(metrics: dict[str, float], suffix: str) -> dict[str, float]:
+    renamed: dict[str, float] = {}
+    for key, value in metrics.items():
+        if key.endswith("_K"):
+            renamed[f"{key[:-2]}_{suffix}"] = value
+        else:
+            renamed[key] = value
+    return renamed
 
 
 def prepare_graph_batch(
@@ -1169,10 +1340,13 @@ def call_model(
     *,
     conditioned: bool,
     graph_enabled: bool,
+    total_power_W: torch.Tensor | None = None,
 ) -> Any:
     if graph_enabled:
         return model(model_input, metadata_input, graph_batch)
     if conditioned:
+        if getattr(model, "mean_head_mode", "direct_k") == "residual_resistance":
+            return model(model_input, metadata_input, total_power_W=total_power_W)
         return model(model_input, metadata_input)
     return model(model_input)
 
@@ -1535,6 +1709,10 @@ def init_train_log(path: Path) -> None:
                 "val_residual_rmse_K",
                 "val_final_mae_K",
                 "val_final_rmse_K",
+                "val_mean_correction_mae_K",
+                "val_delta_R_eff_mae_K_per_W",
+                "val_delta_R_eff_rmse_K_per_W",
+                "val_worse_than_physics_fraction",
                 "val_cnn_only_mae_K",
                 "val_cnn_only_rmse_K",
                 "val_graph_improvement_K",
@@ -1615,6 +1793,10 @@ def append_train_log(
                 val_metrics["residual"]["rmse_K"],
                 val_metrics["final_temperature"]["mae_K"],
                 val_metrics["final_temperature"]["rmse_K"],
+                val_metrics.get("mean_rise", {}).get("mae_K", ""),
+                val_metrics.get("delta_R_eff", {}).get("mae_K_per_W", ""),
+                val_metrics.get("delta_R_eff", {}).get("rmse_K_per_W", ""),
+                val_metrics.get("worse_than_physics_baseline_fraction", ""),
                 val_metrics.get("cnn_only_final_temperature", {}).get("mae_K", ""),
                 val_metrics.get("cnn_only_final_temperature", {}).get("rmse_K", ""),
                 val_metrics.get("graph_delta_val_mae_K", ""),

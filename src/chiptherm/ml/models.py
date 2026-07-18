@@ -1147,8 +1147,15 @@ class DecomposedMiniUNetWithFeatureFusion(nn.Module):
         global_hidden_channels: int = 32,
         global_pool_size: int = 8,
         global_context_blocks: int = 3,
+        mean_head_mode: str = "direct_k",
+        delta_R_eff_mean_K_per_W: float = 0.0,
+        delta_R_eff_std_K_per_W: float = 1.0,
     ) -> None:
         super().__init__()
+        if mean_head_mode not in {"direct_k", "residual_resistance"}:
+            raise ValueError(f"unsupported mean_head_mode: {mean_head_mode}")
+        if delta_R_eff_std_K_per_W <= 0.0:
+            raise ValueError("delta_R_eff_std_K_per_W must be positive")
         indices = tuple(int(index) for index in refinement_channel_indices)
         if not indices:
             raise ValueError("DecomposedMiniUNetWithFeatureFusion requires refinement_channel_indices")
@@ -1170,6 +1177,9 @@ class DecomposedMiniUNetWithFeatureFusion(nn.Module):
         self.global_hidden_channels = int(global_hidden_channels)
         self.global_pool_size = int(global_pool_size)
         self.global_context_blocks = int(global_context_blocks)
+        self.mean_head_mode = str(mean_head_mode)
+        self.delta_R_eff_mean_K_per_W = float(delta_R_eff_mean_K_per_W)
+        self.delta_R_eff_std_K_per_W = float(delta_R_eff_std_K_per_W)
         self.metadata_encoder = MetadataEncoder(metadata_dim, metadata_hidden_dim, metadata_embedding_dim)
         self.physics_gate = (
             PhysicsReliabilityGate(metadata_embedding_dim, self.physics_gate_hidden_dim, self.physics_gate_init)
@@ -1208,6 +1218,7 @@ class DecomposedMiniUNetWithFeatureFusion(nn.Module):
         return_diagnostics: bool = False,
         disabled_fusion_scales: tuple[str, ...] | list[str] = (),
         ambient: torch.Tensor | None = None,
+        total_power_W: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         if metadata is None:
             raise ValueError("feature-fusion decomposed model requires metadata tensor")
@@ -1234,13 +1245,17 @@ class DecomposedMiniUNetWithFeatureFusion(nn.Module):
         centered = coarse + detail
         centered = centered - centered.mean(dim=(-2, -1), keepdim=True)
         pooled = x.mean(dim=(-2, -1))
-        mean_rise = self.mean_head(torch.cat([embedding, pooled], dim=1)).squeeze(1)
+        mean_head_raw = self.mean_head(torch.cat([embedding, pooled], dim=1)).squeeze(1)
+        mean_rise, delta_r_eff = self._mean_outputs(mean_head_raw, total_power_W)
         output = {
             "mean_rise": mean_rise,
+            "mean_head_raw": mean_head_raw,
             "centered_field": centered.squeeze(1),
             "coarse_centered_field": (coarse - coarse.mean(dim=(-2, -1), keepdim=True)).squeeze(1),
             "detail_field": detail.squeeze(1),
         }
+        if delta_r_eff is not None:
+            output["delta_R_eff"] = delta_r_eff
         if alpha is not None:
             output["physics_gate_alpha"] = alpha.view(-1)
         if return_diagnostics:
@@ -1251,7 +1266,7 @@ class DecomposedMiniUNetWithFeatureFusion(nn.Module):
             for scale, feature in global_features.items():
                 if scale in {"16", "32", "64"}:
                     output[f"global_feature_{scale}_abs_mean"] = feature.abs().mean(dim=(1, 2, 3))
-            if ambient is not None:
+            if ambient is not None and self.mean_head_mode == "direct_k":
                 output["final_temperature"] = ambient[:, None, None] + mean_rise[:, None, None] + output["centered_field"]
         return output
 
@@ -1263,6 +1278,7 @@ class DecomposedMiniUNetWithFeatureFusion(nn.Module):
         return_diagnostics: bool = False,
         disabled_fusion_scales: tuple[str, ...] | list[str] = (),
         ambient: torch.Tensor | None = None,
+        total_power_W: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         return self.forward_components(
             x,
@@ -1270,6 +1286,7 @@ class DecomposedMiniUNetWithFeatureFusion(nn.Module):
             return_diagnostics=return_diagnostics,
             disabled_fusion_scales=disabled_fusion_scales,
             ambient=ambient,
+            total_power_W=total_power_W,
         )
 
     def forward_profile(
@@ -1281,6 +1298,7 @@ class DecomposedMiniUNetWithFeatureFusion(nn.Module):
         synchronize: object | None = None,
         graph_correction_scale: float = 1.0,
         disabled_fusion_scales: tuple[str, ...] | list[str] = (),
+        total_power_W: torch.Tensor | None = None,
     ) -> tuple[dict[str, torch.Tensor], dict[str, float]]:
         del graph, graph_correction_scale
         timings: dict[str, float] = {}
@@ -1318,14 +1336,18 @@ class DecomposedMiniUNetWithFeatureFusion(nn.Module):
         toc("feature_fusion_refinement_s", start)
         start = tic()
         pooled = x.mean(dim=(-2, -1))
-        mean_rise = self.mean_head(torch.cat([embedding, pooled], dim=1)).squeeze(1)
+        mean_head_raw = self.mean_head(torch.cat([embedding, pooled], dim=1)).squeeze(1)
+        mean_rise, delta_r_eff = self._mean_outputs(mean_head_raw, total_power_W)
         toc("feature_fusion_mean_head_s", start)
         outputs = {
             "mean_rise": mean_rise,
+            "mean_head_raw": mean_head_raw,
             "centered_field": centered.squeeze(1),
             "coarse_centered_field": (coarse - coarse.mean(dim=(-2, -1), keepdim=True)).squeeze(1),
             "detail_field": detail.squeeze(1),
         }
+        if delta_r_eff is not None:
+            outputs["delta_R_eff"] = delta_r_eff
         disabled = {str(scale) for scale in disabled_fusion_scales}
         outputs["global_fusion_enabled_16"] = centered.new_full((centered.shape[0],), 0.0 if "all" in disabled or "16" in disabled else 1.0)
         outputs["global_fusion_enabled_32"] = centered.new_full((centered.shape[0],), 0.0 if "all" in disabled or "32" in disabled else 1.0)
@@ -1335,6 +1357,21 @@ class DecomposedMiniUNetWithFeatureFusion(nn.Module):
                 outputs[f"global_feature_{scale}_abs_mean"] = feature.abs().mean(dim=(1, 2, 3))
         toc("feature_fusion_cnn_branch_s", start_total)
         return outputs, timings
+
+    def _mean_outputs(
+        self,
+        raw: torch.Tensor,
+        total_power_W: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if self.mean_head_mode == "direct_k":
+            return raw, None
+        if total_power_W is None:
+            raise ValueError("residual_resistance mean head requires total_power_W")
+        total_power = total_power_W.to(device=raw.device, dtype=raw.dtype).view(-1)
+        if torch.any(total_power <= 0.0):
+            raise ValueError("residual_resistance mean head requires strictly positive total_power_W")
+        delta_r = raw * raw.new_tensor(self.delta_R_eff_std_K_per_W) + raw.new_tensor(self.delta_R_eff_mean_K_per_W)
+        return total_power * delta_r, delta_r
 
     def config(self) -> dict[str, object]:
         coarse_config = self.coarse_model.config()
@@ -1353,6 +1390,11 @@ class DecomposedMiniUNetWithFeatureFusion(nn.Module):
             "metadata_embedding_dim": self.metadata_embedding_dim,
             "conditioned": True,
             "physics_input_mode": self.physics_input_mode,
+            "mean_head_mode": self.mean_head_mode,
+            "delta_R_eff_target_mean_K_per_W": self.delta_R_eff_mean_K_per_W,
+            "delta_R_eff_target_std_K_per_W": self.delta_R_eff_std_K_per_W,
+            "delta_R_eff_target_units": "K/W",
+            "delta_R_eff_target_normalization": "raw_head * train_std + train_mean; statistics fit on train split only",
             "feature_fusion_enabled": True,
             "metadata_parameters": count_parameters(self.metadata_encoder),
             "coarse_parameters": count_parameters(self.coarse_model),
@@ -2276,7 +2318,10 @@ def build_model(config: dict[str, object]) -> nn.Module:
             global_blocks=int(config.get("global_blocks", config.get("global_branch_blocks", 3))),
             global_pool_size=int(config.get("global_pool_size", config.get("global_branch_pool_size", 8))),
         )
-    if architecture == "miniunet_refine_conditioned_decomposed_feature_fusion":
+    if architecture in {
+        "miniunet_refine_conditioned_decomposed_feature_fusion",
+        "miniunet_refine_conditioned_decomposed_feature_fusion_resistance_mean",
+    }:
         return DecomposedMiniUNetWithFeatureFusion(
             input_channels=int(config.get("input_channels", 34)),
             output_channels=int(config.get("output_channels", 1)),
@@ -2297,6 +2342,20 @@ def build_model(config: dict[str, object]) -> nn.Module:
             global_hidden_channels=int(config.get("global_hidden_channels", config.get("global_branch_hidden_channels", 32))),
             global_pool_size=int(config.get("global_pool_size", config.get("global_branch_pool_size", 8))),
             global_context_blocks=int(config.get("global_blocks", config.get("global_branch_context_blocks", 3))),
+            mean_head_mode=str(
+                config.get(
+                    "mean_head_mode",
+                    "residual_resistance"
+                    if architecture == "miniunet_refine_conditioned_decomposed_feature_fusion_resistance_mean"
+                    else "direct_k",
+                )
+            ),
+            delta_R_eff_mean_K_per_W=float(
+                config.get("delta_R_eff_target_mean_K_per_W", config.get("delta_R_eff_mean_K_per_W", 0.0))
+            ),
+            delta_R_eff_std_K_per_W=float(
+                config.get("delta_R_eff_target_std_K_per_W", config.get("delta_R_eff_std_K_per_W", 1.0))
+            ),
         )
     if architecture in {
         "miniunet_refine_conditioned_decomposed_graph",

@@ -66,6 +66,8 @@ SAMPLE_COLUMNS = [
     "power_top_10pct_mae_K",
     "mean_rise_error_K",
     "mean_rise_abs_error_K",
+    "delta_R_eff_error_K_per_W",
+    "delta_R_eff_abs_error_K_per_W",
     "centered_field_mae_K",
     "centered_field_rmse_K",
     "mean_bias_removed_mae_K",
@@ -94,6 +96,8 @@ def main() -> int:
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
     model_info = architecture_info(checkpoint["model_config"])
+    if model_info["mean_head_mode"] not in {"direct_k", "residual_resistance"}:
+        raise SystemExit(f"unsupported mean_head_mode: {model_info['mean_head_mode']}")
 
     dataset = ChipThermDataset(args.index, target="residual", return_metadata=True, return_graph=bool(model_info.get("graph_enabled")))
     loader = DataLoader(
@@ -161,6 +165,7 @@ def architecture_info(model_config: dict[str, Any]) -> dict[str, Any]:
             "miniunet_refine_conditioned_decomposed",
             "miniunet_refine_conditioned_decomposed_global",
             "miniunet_refine_conditioned_decomposed_feature_fusion",
+            "miniunet_refine_conditioned_decomposed_feature_fusion_resistance_mean",
             "miniunet_refine_conditioned_decomposed_graph",
             "miniunet_refine_conditioned_decomposed_global_graph",
             "miniunet_refine_conditioned_decomposed_feature_fusion_graph",
@@ -172,6 +177,7 @@ def architecture_info(model_config: dict[str, Any]) -> dict[str, Any]:
             "miniunet_refine_conditioned_decomposed",
             "miniunet_refine_conditioned_decomposed_global",
             "miniunet_refine_conditioned_decomposed_feature_fusion",
+            "miniunet_refine_conditioned_decomposed_feature_fusion_resistance_mean",
             "miniunet_refine_conditioned_decomposed_graph",
             "miniunet_refine_conditioned_decomposed_global_graph",
             "miniunet_refine_conditioned_decomposed_feature_fusion_graph",
@@ -188,6 +194,7 @@ def architecture_info(model_config: dict[str, Any]) -> dict[str, Any]:
         "graph_normalization": model_config.get("graph_normalization"),
         "metadata_dim": int(model_config.get("metadata_dim", 0) or 0),
         "physics_input_mode": physics_input_mode,
+        "mean_head_mode": str(model_config.get("mean_head_mode", "direct_k")),
     }
 
 
@@ -222,6 +229,7 @@ def analyze(
             physics_v1 = physics_v1.to(device, non_blocking=True)
         temperature = batch["temperature"].to(device, non_blocking=True)
         ambient = batch["ambient_K"].to(device, non_blocking=True).float()
+        total_power = batch["total_power_W"].to(device, non_blocking=True).float()
         model_input = build_model_input(
             x,
             physics,
@@ -233,7 +241,7 @@ def analyze(
         if metadata_input is not None:
             metadata_input = metadata_input.to(device, non_blocking=True)
         graph_batch = prepare_graph_batch(batch, bool(model_info.get("graph_enabled")), model_info.get("graph_normalization"), device)
-        prediction = predict_temperature(model, model_input, physics, ambient, metadata_input, graph_batch, stats, model_info)
+        prediction = predict_temperature(model, model_input, physics, ambient, total_power, metadata_input, graph_batch, stats, model_info)
         pred_temperature = prediction["temperature"]
 
         x_np = x.detach().cpu().numpy()
@@ -241,6 +249,7 @@ def analyze(
         temperature_np = temperature.detach().cpu().numpy()
         pred_np = pred_temperature.detach().cpu().numpy()
         mean_rise_pred_np = to_numpy_or_none(prediction.get("mean_rise"))
+        delta_R_pred_np = to_numpy_or_none(prediction.get("delta_R_eff"))
         centered_pred_np = to_numpy_or_none(prediction.get("centered_field"))
         metadata = batch["metadata"]
         batch_size = int(x_np.shape[0])
@@ -286,14 +295,29 @@ def analyze(
             physics_stats = error_stats(phys, y)
             cnn_stats = error_stats(pred, y)
             ambient_i = float(ambient.detach().cpu().numpy()[i])
-            mean_rise_target = float((y - ambient_i).mean())
-            centered_target = y - float(y.mean())
+            total_power_i = float(total_power.detach().cpu().numpy()[i])
+            mean_head_mode = str(model_info.get("mean_head_mode", "direct_k"))
+            if mean_head_mode == "residual_resistance":
+                residual_true = y - phys
+                mean_rise_target = float(residual_true.mean())
+                centered_target = residual_true - mean_rise_target
+                delta_R_target = mean_rise_target / total_power_i if total_power_i > 0.0 else None
+            else:
+                mean_rise_target = float((y - ambient_i).mean())
+                centered_target = y - float(y.mean())
+                delta_R_target = None
             if mean_rise_pred_np is not None and centered_pred_np is not None:
                 mean_rise_error = float(mean_rise_pred_np[i] - mean_rise_target)
                 centered_stats = error_stats(centered_pred_np[i], centered_target)
                 mean_bias_removed_stats = centered_stats
+                delta_R_error = (
+                    float(delta_R_pred_np[i] - delta_R_target)
+                    if delta_R_pred_np is not None and delta_R_target is not None
+                    else None
+                )
             else:
                 mean_rise_error = None
+                delta_R_error = None
                 centered_stats = {}
                 mean_bias_removed_stats = {}
             pred_hotspot = np.unravel_index(int(np.argmax(pred)), pred.shape)
@@ -336,6 +360,8 @@ def analyze(
                 "power_top_10pct_mae_K": masked_mae(abs_error, power_top_10),
                 "mean_rise_error_K": mean_rise_error,
                 "mean_rise_abs_error_K": abs(mean_rise_error) if mean_rise_error is not None else None,
+                "delta_R_eff_error_K_per_W": delta_R_error,
+                "delta_R_eff_abs_error_K_per_W": abs(delta_R_error) if delta_R_error is not None else None,
                 "centered_field_mae_K": centered_stats.get("mae_K"),
                 "centered_field_rmse_K": centered_stats.get("rmse_K"),
                 "mean_bias_removed_mae_K": mean_bias_removed_stats.get("mae_K"),
@@ -352,6 +378,7 @@ def predict_temperature(
     model_input: torch.Tensor,
     physics: torch.Tensor,
     ambient: torch.Tensor,
+    total_power: torch.Tensor,
     metadata_input: torch.Tensor | None,
     graph_batch: dict[str, torch.Tensor] | None,
     stats: NormalizationStats,
@@ -365,15 +392,22 @@ def predict_temperature(
         if bool(model_info.get("graph_enabled")):
             outputs = model(model_input, metadata_input, graph_batch)
         else:
-            outputs = model(model_input, metadata_input) if conditioned else model(model_input)
+            if conditioned and getattr(model, "mean_head_mode", "direct_k") == "residual_resistance":
+                outputs = model(model_input, metadata_input, total_power_W=total_power)
+            else:
+                outputs = model(model_input, metadata_input) if conditioned else model(model_input)
         centered = outputs["centered_field"]
         centered = centered - centered.mean(dim=(-2, -1), keepdim=True)
-        temperature = ambient[:, None, None] + outputs["mean_rise"][:, None, None] + centered
+        if str(model_info.get("mean_head_mode", "direct_k")) == "residual_resistance":
+            temperature = physics + outputs["mean_rise"][:, None, None] + centered
+        else:
+            temperature = ambient[:, None, None] + outputs["mean_rise"][:, None, None] + centered
         return {
             "temperature": temperature,
             "residual": temperature - physics,
             "mean_rise": outputs["mean_rise"],
             "centered_field": centered,
+            "delta_R_eff": outputs.get("delta_R_eff"),
         }
     if hasattr(model, "forward_components"):
         if conditioned:
@@ -502,6 +536,7 @@ def aggregate_records(records: list[dict[str, Any]]) -> dict[str, float]:
         "power_top_5pct_mae_K",
         "power_top_10pct_mae_K",
         "mean_rise_abs_error_K",
+        "delta_R_eff_abs_error_K_per_W",
         "centered_field_mae_K",
         "mean_bias_removed_mae_K",
     ]
@@ -565,6 +600,7 @@ def build_summary(
                 "cnn_mae_K": record["cnn_mae_K"],
                 "cnn_rmse_K": record["cnn_rmse_K"],
                 "mean_rise_abs_error_K": record.get("mean_rise_abs_error_K"),
+                "delta_R_eff_abs_error_K_per_W": record.get("delta_R_eff_abs_error_K_per_W"),
                 "centered_field_mae_K": record.get("centered_field_mae_K"),
             }
             for record in selected
@@ -652,6 +688,7 @@ def write_case_metrics(path: Path, by_case: dict[str, dict[str, float]]) -> None
         "power_top_5pct_mae_K",
         "power_top_10pct_mae_K",
         "mean_rise_abs_error_K",
+        "delta_R_eff_abs_error_K_per_W",
         "centered_field_mae_K",
         "centered_field_rmse_K",
         "centered_field_global_pixel_rmse_K",
@@ -716,6 +753,7 @@ def write_sample_panels(
         if physics_v1 is not None:
             physics_v1 = physics_v1.unsqueeze(0).to(device)
         ambient = sample["ambient_K"].view(1).to(device)
+        total_power = sample["total_power_W"].view(1).to(device)
         y = sample["temperature"].cpu().numpy()
         model_input = build_model_input(
             x,
@@ -733,7 +771,7 @@ def write_sample_panels(
         if bool(model_info.get("graph_enabled")):
             graph_batch = collate_graphs([sample["graph"]])
             graph_batch = prepare_graph_batch({"graph": graph_batch}, True, model_info.get("graph_normalization"), device)
-        pred = predict_temperature(model, model_input, physics, ambient, metadata_input, graph_batch, stats, model_info)["temperature"]
+        pred = predict_temperature(model, model_input, physics, ambient, total_power, metadata_input, graph_batch, stats, model_info)["temperature"]
         draw_sample_panel(
             sample,
             pred.squeeze(0).detach().cpu().numpy(),
