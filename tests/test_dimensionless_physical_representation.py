@@ -8,12 +8,15 @@ import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = REPO_ROOT / "src"
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from chiptherm.ml.dataset import build_dimensionless_v1_input, build_dimensionless_v2_input  # noqa: E402
 from chiptherm.ml.models import build_model, count_parameters  # noqa: E402
 from chiptherm.ml.normalization import NormalizationStats, build_model_input  # noqa: E402
+from scripts.train_residual_cnn import global_branch_channels_for_dataset, refinement_channels_for_dataset  # noqa: E402
 
 
 CHANNEL_NAMES = [
@@ -233,6 +236,29 @@ class DimensionlessV2PhysicalRepresentationTests(unittest.TestCase):
         ):
             self.assertTrue(torch.equal(out[IDX[name]], x[IDX[name]]), name)
 
+    def test_v2_only_intended_geometry_channels_change(self) -> None:
+        x = make_tensor()
+        out = build_dimensionless_v2_input(x, IDX)
+        changed = {
+            name
+            for name in CHANNEL_NAMES
+            if not torch.allclose(out[IDX[name]], x[IDX[name]], atol=1.0e-6, rtol=0.0)
+        }
+
+        self.assertEqual(
+            changed,
+            {
+                "distance_to_left_edge_mm",
+                "distance_to_right_edge_mm",
+                "distance_to_bottom_edge_mm",
+                "distance_to_top_edge_mm",
+                "minimum_distance_to_package_edge_mm",
+                "chiplet_width_mm",
+                "chiplet_height_mm",
+                "chiplet_area_mm2",
+            },
+        )
+
     def test_v2_same_channel_count_and_source_base_preserved(self) -> None:
         x = build_dimensionless_v2_input(make_tensor(), IDX).unsqueeze(0)
         physics = torch.full((1, 4, 4), 350.0)
@@ -271,33 +297,26 @@ class DimensionlessV2PhysicalRepresentationTests(unittest.TestCase):
             "base_channels": 4,
             "refine_channels": 4,
             "refine_blocks": 1,
-            "refinement_channel_indices": [0, 1, 6, 7, 15, 16, 19, 20, 25, 33],
+            "refinement_channel_indices": [0, 1, 2, 3, 4, 5, 6, 7],
             "refinement_channel_names": [
                 "power_density_W_per_mm2",
                 "occupancy_mask",
+                "CPU_mask",
+                "GPU_or_NPU_mask",
+                "memory_mask",
+                "IO_or_ANALOG_or_MEMS_mask",
                 "normalized_x_coordinate",
                 "normalized_y_coordinate",
-                "finite_source_L2mm",
-                "finite_source_L4mm",
-                "enclosed_power_R8mm_W",
-                "enclosed_power_R16mm_W",
-                "minimum_distance_to_package_edge_mm",
-                "source_superposition_base_K",
             ],
             "metadata_dim": 3,
             "metadata_hidden_dim": 8,
             "metadata_embedding_dim": 8,
-            "global_branch_channel_indices": [0, 1, 6, 7, 15, 16, 19, 20, 25, 33],
+            "global_branch_channel_indices": [0, 1, 6, 7, 33],
             "global_branch_channel_names": [
                 "power_density_W_per_mm2",
                 "occupancy_mask",
                 "normalized_x_coordinate",
                 "normalized_y_coordinate",
-                "finite_source_L2mm",
-                "finite_source_L4mm",
-                "enclosed_power_R8mm_W",
-                "enclosed_power_R16mm_W",
-                "minimum_distance_to_package_edge_mm",
                 "source_superposition_base_K",
             ],
             "global_hidden_channels": 4,
@@ -311,6 +330,53 @@ class DimensionlessV2PhysicalRepresentationTests(unittest.TestCase):
         self.assertEqual(count_parameters(dimensional_model), count_parameters(v2_model))
         self.assertEqual(dimensional_model.refinement_channel_indices, v2_model.refinement_channel_indices)
         self.assertEqual(dimensional_model.coarse_model.global_encoder.channel_indices, v2_model.coarse_model.global_encoder.channel_indices)
+
+    def test_dimensional_baseline_routing_matches_successful_reference(self) -> None:
+        stats = NormalizationStats(
+            schema_version=1,
+            power_density_mean=0.0,
+            power_density_std=1.0,
+            physics_mean=0.0,
+            physics_std=1.0,
+            residual_mean=0.0,
+            residual_std=1.0,
+            num_samples=1,
+            num_grid_cells=16,
+            input_channels=len(CHANNEL_NAMES),
+            context_channel_indices=tuple(range(8, len(CHANNEL_NAMES))),
+            context_channel_names=tuple(CHANNEL_NAMES[8:]),
+            context_channel_means=tuple(0.0 for _ in CHANNEL_NAMES[8:]),
+            context_channel_stds=tuple(1.0 for _ in CHANNEL_NAMES[8:]),
+        )
+
+        refinement_indices, refinement_names = refinement_channels_for_dataset(
+            len(CHANNEL_NAMES),
+            stats,
+            enabled=True,
+            routing_mode="dimensional_baseline",
+        )
+        global_indices, global_names = global_branch_channels_for_dataset(
+            len(CHANNEL_NAMES),
+            stats,
+            physics_input_mode="source_superposition_v1",
+            enabled=True,
+            requested=None,
+            routing_mode="dimensional_baseline",
+        )
+
+        self.assertEqual(refinement_indices, tuple(range(8)))
+        self.assertEqual(refinement_names, tuple(CHANNEL_NAMES[:8]))
+        self.assertEqual(global_indices, (0, 1, 6, 7, len(CHANNEL_NAMES)))
+        self.assertEqual(
+            global_names,
+            (
+                "power_density_W_per_mm2",
+                "occupancy_mask",
+                "normalized_x_coordinate",
+                "normalized_y_coordinate",
+                "source_superposition_base_K",
+            ),
+        )
 
 
 if __name__ == "__main__":

@@ -126,6 +126,18 @@ def main() -> int:
         default=None,
         help="Optional explicit global branch channel names or integer model-input indices. Defaults to a compact physical subset.",
     )
+    parser.add_argument(
+        "--channel-routing-mode",
+        default="auto",
+        choices=["auto", "dimensional_baseline"],
+        help=(
+            "Controls default refinement/global channel selection. "
+            "'auto' uses the manifest-named physical feature policy; "
+            "'dimensional_baseline' reproduces the successful dimensional source-superposition "
+            "residual-resistance routing: base raster channels for refinement and "
+            "power/occupancy/coordinates plus source/base map for global fusion."
+        ),
+    )
     parser.add_argument("--pairwise-hidden-dim", default=96, type=int)
     parser.add_argument("--pairwise-layers", default=3, type=int)
     parser.add_argument("--pairwise-basis-rank", default=8, type=int)
@@ -286,6 +298,7 @@ def main() -> int:
         dataset_input_channels,
         stats,
         enabled=args.model_architecture != "miniunet",
+        routing_mode=args.channel_routing_mode,
     )
     global_channel_indices, global_channel_names = global_branch_channels_for_dataset(
         dataset_input_channels,
@@ -293,6 +306,7 @@ def main() -> int:
         physics_input_mode=args.physics_input,
         enabled=is_global_arch or is_feature_fusion_arch,
         requested=args.global_branch_channels,
+        routing_mode=args.channel_routing_mode,
     )
     model_config: dict[str, Any] = {
         "architecture": args.model_architecture,
@@ -301,6 +315,7 @@ def main() -> int:
         "dataset_input_channels": dataset_input_channels,
         "physics_input_mode": args.physics_input,
         "physical_representation": args.physical_representation,
+        "channel_routing_mode": args.channel_routing_mode,
         "dimensionless_v1_transforms": DIMENSIONLESS_V1_TRANSFORMS if args.physical_representation == "dimensionless_v1" else {},
         "dimensionless_v2_transforms": DIMENSIONLESS_V2_TRANSFORMS if args.physical_representation == "dimensionless_v2" else {},
         "dimensionless_v1_characteristic_length": "L_char_mm = sqrt(package_width_mm * package_height_mm)",
@@ -444,6 +459,7 @@ def main() -> int:
         "global_blocks": args.global_blocks,
         "global_pool_size": args.global_pool_size,
         "global_branch_channels": args.global_branch_channels,
+        "channel_routing_mode": args.channel_routing_mode,
         "pairwise_hidden_dim": args.pairwise_hidden_dim,
         "pairwise_layers": args.pairwise_layers,
         "pairwise_basis_rank": args.pairwise_basis_rank,
@@ -489,6 +505,7 @@ def main() -> int:
         {
             "physics_input_mode": args.physics_input,
             "physical_representation": args.physical_representation,
+            "channel_routing_mode": args.channel_routing_mode,
             "dimensionless_v1_transforms": DIMENSIONLESS_V1_TRANSFORMS if args.physical_representation == "dimensionless_v1" else {},
             "dimensionless_v2_transforms": DIMENSIONLESS_V2_TRANSFORMS if args.physical_representation == "dimensionless_v2" else {},
             "dimensionless_v1_characteristic_length": "L_char_mm = sqrt(package_width_mm * package_height_mm)",
@@ -528,6 +545,7 @@ def main() -> int:
     print(f"Model architecture: {args.model_architecture}")
     print(f"Physics input mode: {args.physics_input}")
     print(f"Physical representation: {args.physical_representation}")
+    print(f"Channel routing mode: {args.channel_routing_mode}")
     print(f"Mean head mode: {args.mean_head_mode}")
     if delta_R_stats is not None:
         print(
@@ -673,10 +691,18 @@ def refinement_channels_for_dataset(
     stats: NormalizationStats,
     *,
     enabled: bool,
+    routing_mode: str = "auto",
 ) -> tuple[tuple[int, ...], tuple[str, ...]]:
     if not enabled:
         return (), ()
     names = dataset_channel_names(dataset_input_channels, stats)
+    if routing_mode == "dimensional_baseline":
+        selected = tuple(range(min(8, dataset_input_channels)))
+        if not selected:
+            raise SystemExit("dimensional_baseline routing could not identify base raster refinement channels")
+        return selected, tuple(names[index] for index in selected)
+    if routing_mode != "auto":
+        raise SystemExit(f"unsupported channel routing mode: {routing_mode}")
     selected: list[int] = []
     selected_names: list[str] = []
     for index, name in enumerate(names):
@@ -744,6 +770,7 @@ def global_branch_channels_for_dataset(
     physics_input_mode: str,
     enabled: bool,
     requested: list[str] | None,
+    routing_mode: str = "auto",
 ) -> tuple[tuple[int, ...], tuple[str, ...]]:
     if not enabled:
         return (), ()
@@ -762,7 +789,28 @@ def global_branch_channels_for_dataset(
                 raise SystemExit(f"global branch channel index {index} out of range for {len(names)} model input channels")
             if index not in selected:
                 selected.append(index)
+    elif routing_mode == "dimensional_baseline":
+        target_names = [
+            "power_density_W_per_mm2",
+            "occupancy_mask",
+            "normalized_x_coordinate",
+            "normalized_y_coordinate",
+        ]
+        if physics_input_mode in {"source_superposition_v1", "source_superposition_plus_physics_v1"}:
+            target_names.append("source_superposition_base_K")
+        elif physics_input_mode in {"v1", "gated_v1"}:
+            target_names.append("physics_v1_temperature_K")
+        name_to_index = {name: index for index, name in enumerate(names)}
+        missing = [name for name in target_names if name not in name_to_index]
+        if missing:
+            raise SystemExit(
+                "dimensional_baseline routing could not identify global channels: "
+                + ", ".join(missing)
+            )
+        selected = [name_to_index[name] for name in target_names]
     else:
+        if routing_mode != "auto":
+            raise SystemExit(f"unsupported channel routing mode: {routing_mode}")
         for index, name in enumerate(names):
             if is_global_branch_channel(name):
                 selected.append(index)
