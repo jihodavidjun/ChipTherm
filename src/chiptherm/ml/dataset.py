@@ -16,6 +16,7 @@ TargetName = Literal["residual", "temperature"]
 PhysicalRepresentation = Literal["dimensional", "dimensionless_v1", "dimensionless_v2"]
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
+DATA_ROOT_MARKER = ".chiptherm_data_root.json"
 
 
 DIMENSIONLESS_V1_TRANSFORMS = {
@@ -231,6 +232,7 @@ class ChipThermDataset(Dataset):
             raise ValueError(f"unsupported physical_representation: {self.physical_representation}")
         if not self.index_csv.exists():
             raise FileNotFoundError(self.index_csv)
+        self.declared_data_root = self._discover_declared_data_root()
         self.rows = self._read_rows(self.index_csv)
         self.channel_names = self._load_channel_names()
         self.metadata_feature_names, self.metadata_feature_rows = self._load_metadata_features()
@@ -451,12 +453,28 @@ class ChipThermDataset(Dataset):
         candidates = [
             Path.cwd() / path,
             REPO_ROOT / path,
+            *(([self.declared_data_root / path]) if self.declared_data_root is not None else []),
             self.index_csv.parent / path,
         ]
         for candidate in candidates:
             if candidate.exists():
                 return candidate
         return candidates[0]
+
+    def _discover_declared_data_root(self) -> Path | None:
+        current = self.index_csv.parent
+        for candidate in (current, *current.parents):
+            marker = candidate / DATA_ROOT_MARKER
+            if not marker.exists():
+                continue
+            try:
+                payload = json.loads(marker.read_text(encoding="utf-8"))
+            except Exception as exc:
+                raise ValueError(f"invalid declared data-root marker {marker}: {exc}") from exc
+            if payload.get("path_semantics") != "relative_to_declared_data_root":
+                raise ValueError(f"unsupported data-root path semantics in {marker}")
+            return candidate
+        return None
 
     def _metadata(self, row: dict[str, str]) -> dict[str, Any]:
         payload = {

@@ -1,0 +1,47 @@
+{
+  "schema_version": "benchmark_v2_dependency_lock/1",
+  "benchmark_id": "benchmark_v2_50family",
+  "stage": "pilot_5x10",
+  "status": "phase2_parent_lock",
+  "path_contract": {
+    "semantics": "relative_to_declared_data_root",
+    "absolute_paths_in_portable_artifacts_allowed": false,
+    "relocation_test_required": true
+  },
+  "required_parent_hashes": {
+    "phase1_family_manifest_sha256": "18f8a646ce75b076ec690720034adc6590f6d753f3faa1b55bc608bb99cc609e",
+    "artifact_manifest_schema_sha256": "2f9876ac4a8abc62e201b747d05817c040651f54b1d8b5ee204533ad8d99c8a2",
+    "pilot_selection_sha256": "576722ef160f59eb80d016443026b1d77bc68c3ca6d6bf34d004a5ed59f007d1"
+  },
+  "runtime_required_fields": [
+    "workload_manifest_sha256",
+    "split_manifest_sha256",
+    "code_commit",
+    "dirty_worktree",
+    "python_version",
+    "environment_package_report_sha256",
+    "hotspot.version",
+    "hotspot.sha256",
+    "hotspot_base_config_sha256",
+    "raster_schema_sha256",
+    "metadata_schema_sha256",
+    "graph_node_schema_sha256",
+    "graph_edge_schema_sha256",
+    "declared_data_root_id",
+    "declared_scratch_root_id"
+  ],
+  "schema_contracts": {
+    "encoded_channels": 13,
+    "finite_source_channels": 17,
+    "impedance_channels": 33,
+    "metadata_features": 15,
+    "graph_node_features": 24,
+    "graph_edge_features": 15,
+    "model_input_channels_with_source_base": 34
+  },
+  "source_response_policy": {
+    "fit_normalize_select_train_families_only": true,
+    "oracle_family_targets_never_used_for_learning": true,
+    "checkpoint_hash_and_family_lineage_required": true
+  }
+}

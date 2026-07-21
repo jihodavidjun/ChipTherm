@@ -1,0 +1,51 @@
+{
+  "schema_version": "source_response_checkpoint_lineage/1",
+  "checkpoint_id": "source_response_operator_v1_prototype_seed1",
+  "checkpoint_sha256": "d297cd4a6fb61276e9af8cbd0bee946e8449055146ede61e8400da969b1ba9a8",
+  "architecture": "source_response_operator_v1",
+  "target": "isolated_source_temperature_rise_K_per_W",
+  "training_benchmark_ids": [
+    "benchmark_v1_clean_10family"
+  ],
+  "training_family_uids": [
+    "case01",
+    "case02",
+    "case03",
+    "case04",
+    "case05",
+    "case06",
+    "case07",
+    "case08",
+    "case09",
+    "case10"
+  ],
+  "normalization_family_uids": [
+    "case01",
+    "case02",
+    "case03",
+    "case04",
+    "case05",
+    "case06",
+    "case07",
+    "case08",
+    "case09",
+    "case10"
+  ],
+  "selection_family_uids": [
+    "case01",
+    "case02",
+    "case03",
+    "case04",
+    "case05",
+    "case06",
+    "case07",
+    "case08",
+    "case09",
+    "case10"
+  ],
+  "pilot_usage": "frozen_inference_only",
+  "notes": [
+    "This sidecar records lineage absent from the historical checkpoint payload.",
+    "No Benchmark v2 family is used to fit, normalize, select, or stop this checkpoint."
+  ]
+}

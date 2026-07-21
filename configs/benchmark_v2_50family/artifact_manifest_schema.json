@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://chiptherm.local/schemas/benchmark-v2-artifact-manifest.schema.json",
   "title": "ChipTherm Benchmark v2 Artifact Manifest",
-  "description": "Proposal schema for immutable canonical and generated artifact provenance. This file does not authorize benchmark generation.",
+  "description": "Phase-2 schema for immutable canonical and generated Benchmark v2 artifact provenance.",
   "type": "object",
   "additionalProperties": false,
   "required": [

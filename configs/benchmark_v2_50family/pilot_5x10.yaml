@@ -1,0 +1,33 @@
+schema_version: benchmark_v2_pilot_selection/1
+benchmark_id: benchmark_v2_50family
+stage: pilot_5x10
+base_seed: 20260721
+selected_families:
+  - family_uid: f002
+    role: hpc
+    primary_split: train
+    rationale: Train-family HPC package with two interacting compute clusters and central memory.
+  - family_uid: f023
+    role: mixed_heterogeneous
+    primary_split: val
+    rationale: Validation-family mixed package with separated functional clusters; labels are audit-only for source-response learning.
+  - family_uid: f029
+    role: sparse_or_distributed
+    primary_split: train
+    rationale: Sparse train family with corner/center placement and long physical interaction distances.
+  - family_uid: f032
+    role: dense_high_die
+    primary_split: train
+    rationale: Dense 64-chiplet train family stressing graph size, rasterization, and HotSpot throughput.
+  - family_uid: f044
+    role: compound_geometry
+    primary_split: test
+    rationale: Compound-OOD high-aspect test package; labels and isolated responses are evaluation-only.
+source_response_policy:
+  train_eligible_families: [f002, f029, f032]
+  oracle_only_families: [f023, f044]
+  isolation_frequency: once_per_chiplet_per_fixed_family
+sample_split_assignment:
+  train_workload_ordinals: [1, 2, 3, 4, 5, 6, 7, 8]
+  val_workload_ordinals: [9]
+  test_workload_ordinals: [10]
