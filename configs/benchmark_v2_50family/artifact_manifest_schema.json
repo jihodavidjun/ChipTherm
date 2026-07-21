@@ -1,0 +1,222 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://chiptherm.local/schemas/benchmark-v2-artifact-manifest.schema.json",
+  "title": "ChipTherm Benchmark v2 Artifact Manifest",
+  "description": "Proposal schema for immutable canonical and generated artifact provenance. This file does not authorize benchmark generation.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "artifact_id",
+    "benchmark_id",
+    "artifact_class",
+    "stage",
+    "status",
+    "created_at",
+    "producer",
+    "storage",
+    "parents",
+    "content",
+    "validation",
+    "reproducibility"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "benchmark_v2_artifact_manifest/0.1"
+    },
+    "artifact_id": {
+      "type": "string",
+      "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._:/-]+$"
+    },
+    "benchmark_id": {
+      "const": "benchmark_v2_50family"
+    },
+    "artifact_class": {
+      "enum": [
+        "canonical_source",
+        "generated_required_intermediate",
+        "regenerable_cache",
+        "model_specific_derived",
+        "evaluation_only",
+        "obsolete_deprecated",
+        "unknown_requires_investigation"
+      ]
+    },
+    "stage": {
+      "enum": [
+        "design",
+        "workloads",
+        "hotspot_labels",
+        "source_isolation",
+        "encoded_13ch",
+        "context_17ch",
+        "context_33ch",
+        "metadata",
+        "graphs",
+        "source_response_model",
+        "source_superposition",
+        "splits",
+        "normalization",
+        "model_checkpoint",
+        "evaluation"
+      ]
+    },
+    "status": {
+      "enum": ["staging", "validated", "released", "failed", "superseded"]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "producer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command", "git_commit", "git_dirty", "code_paths"],
+      "properties": {
+        "command": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+        "git_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "git_dirty": {"type": "boolean"},
+        "dirty_diff_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+        "code_paths": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+        "python_version": {"type": "string"},
+        "environment_lock_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
+        "host": {"type": "string"},
+        "worker_count": {"type": "integer", "minimum": 1},
+        "seed": {"type": "integer"}
+      }
+    },
+    "storage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["root_id", "relative_path", "path_semantics", "persistent"],
+      "properties": {
+        "root_id": {"type": "string"},
+        "relative_path": {"type": "string", "not": {"pattern": "^/"}},
+        "path_semantics": {"const": "relative_to_declared_data_root"},
+        "persistent": {"type": "boolean"},
+        "retention_class": {"enum": ["immutable", "publication", "model_lifetime", "cache", "ephemeral"]}
+      }
+    },
+    "parents": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["artifact_id", "manifest_sha256", "relationship"],
+        "properties": {
+          "artifact_id": {"type": "string"},
+          "manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "relationship": {"enum": ["derived_from", "trained_on", "normalized_from", "indexed_view_of", "evaluated_with"]}
+        }
+      }
+    },
+    "content": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["file_count", "total_bytes", "hash_algorithm", "tree_manifest_path", "tree_manifest_sha256"],
+      "properties": {
+        "file_count": {"type": "integer", "minimum": 0},
+        "total_bytes": {"type": "integer", "minimum": 0},
+        "row_count": {"type": "integer", "minimum": 0},
+        "family_count": {"type": "integer", "minimum": 0},
+        "sample_count": {"type": "integer", "minimum": 0},
+        "source_count": {"type": "integer", "minimum": 0},
+        "hash_algorithm": {"const": "sha256"},
+        "tree_manifest_path": {"type": "string"},
+        "tree_manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "tensor_schema": {
+          "type": "object",
+          "properties": {
+            "shape": {"type": "array", "items": {"type": ["integer", "string"]}},
+            "dtype": {"type": "string"},
+            "units": {"type": "string"},
+            "channel_schema_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+          },
+          "additionalProperties": false
+        }
+      }
+    },
+    "split_lineage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol_id", "partition", "split_manifest_sha256"],
+      "properties": {
+        "protocol_id": {"type": "string"},
+        "partition": {"enum": ["train", "val", "test", "all", "not_applicable"]},
+        "fold": {"type": ["integer", "null"], "minimum": 0},
+        "family_uids": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "split_manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "normalization_lineage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fit_partition", "fit_index_sha256", "statistics_sha256"],
+      "properties": {
+        "fit_partition": {"const": "train"},
+        "fit_index_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "statistics_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "checkpoint_lineage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["checkpoint_sha256", "architecture", "config_sha256"],
+      "properties": {
+        "checkpoint_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "architecture": {"type": "string"},
+        "config_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "training_family_set_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "external_dependencies": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "version", "sha256"],
+        "properties": {
+          "name": {"type": "string"},
+          "version": {"type": "string"},
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        }
+      }
+    },
+    "validation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["passed", "report_path", "report_sha256", "checks"],
+      "properties": {
+        "passed": {"type": "boolean"},
+        "report_path": {"type": "string"},
+        "report_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "checks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "passed"],
+            "properties": {
+              "name": {"type": "string"},
+              "passed": {"type": "boolean"},
+              "details": {"type": "string"}
+            }
+          }
+        }
+      }
+    },
+    "reproducibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["regenerable", "reproduction_command", "estimated_cost", "must_not_delete_while_referenced"],
+      "properties": {
+        "regenerable": {"type": "boolean"},
+        "reproduction_command": {"type": ["array", "null"], "items": {"type": "string"}},
+        "estimated_cost": {"type": "string"},
+        "missing_prerequisites": {"type": "array", "items": {"type": "string"}},
+        "must_not_delete_while_referenced": {"type": "boolean"}
+      }
+    },
+    "notes": {"type": "array", "items": {"type": "string"}}
+  }
+}

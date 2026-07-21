@@ -1,0 +1,190 @@
+{
+  "schema_version": "benchmark_v2_dependency_lock/0.1",
+  "status": "proposal_unresolved_do_not_use_for_generation",
+  "benchmark_id": "benchmark_v2_50family",
+  "created_from_audit_date": "2026-07-21",
+  "purpose": "Pin code, external tools, canonical contracts, and parent artifacts before benchmark generation. Null values are generation blockers.",
+  "path_contract": {
+    "semantics": "relative_to_declared_data_root",
+    "repository_root_required": false,
+    "absolute_paths_in_indices_allowed": false,
+    "absolute_paths_in_checkpoints_allowed": false,
+    "relocation_test_required": true
+  },
+  "storage_roots": {
+    "repository": {
+      "value": ".",
+      "role": "lightweight configs docs manifests schemas and checksums"
+    },
+    "persistent_project": {
+      "value": null,
+      "required": true,
+      "role": "canonical benchmark model-ready data checkpoints and release evaluations"
+    },
+    "institutional_scratch": {
+      "value": null,
+      "required": true,
+      "role": "HotSpot workdirs staging retries and regenerable caches"
+    },
+    "tmp_user": {
+      "value": "/tmp/$USER",
+      "allowed_roles": ["worker_local_ephemeral_only"],
+      "canonical_storage_allowed": false
+    }
+  },
+  "code": {
+    "repository": "ChipTherm",
+    "git_commit": "1f701814b619b7c2fdf93613a8dbf4c5a35e9dcc",
+    "dirty_worktree_allowed_for_release": false,
+    "required_script_contracts": [
+      "family_count_agnostic",
+      "workload_count_agnostic",
+      "fixed_family_template",
+      "external_data_root",
+      "relative_paths",
+      "atomic_stage_promotion",
+      "parent_manifest_validation",
+      "split_specific_normalization",
+      "source_checkpoint_family_lineage"
+    ]
+  },
+  "external_tools": {
+    "hotspot": {
+      "executable_path": null,
+      "version": null,
+      "sha256": null,
+      "required": true
+    },
+    "hotspot_base_config": {
+      "path": "configs/hotspot_base.config",
+      "sha256": null,
+      "required": true
+    },
+    "python": {
+      "version": null,
+      "environment_lock_path": null,
+      "environment_lock_sha256": null,
+      "required": true
+    }
+  },
+  "design_contracts": {
+    "proposal_path": "configs/benchmark_v2_50family/design_proposal.yaml",
+    "proposal_sha256": null,
+    "family_count": 50,
+    "workloads_per_family": 200,
+    "sample_count": 10000,
+    "grid_shape": [64, 64],
+    "geometry_unit": "mm",
+    "power_unit": "W",
+    "power_density_unit": "W_per_mm2",
+    "temperature_unit": "K",
+    "target": "steady_state_temperature",
+    "material_and_cooling_policy": "fixed_in_v2_0",
+    "family_structure_fixed_across_workloads": true,
+    "active_workload": "nominal"
+  },
+  "schema_contracts": {
+    "artifact_manifest_schema": {
+      "path": "configs/benchmark_v2_50family/artifact_manifest_schema.json",
+      "sha256": null
+    },
+    "raster_channels": {
+      "count": 33,
+      "ordered_schema_sha256": null
+    },
+    "source_base_model_input_channels": 34,
+    "metadata_features": {
+      "count": 15,
+      "ordered_schema_sha256": null
+    },
+    "graph_node_features": {
+      "count": 24,
+      "ordered_schema_sha256": null
+    },
+    "graph_edge_features": {
+      "count": 15,
+      "ordered_schema_sha256": null
+    }
+  },
+  "split_contracts": {
+    "sample_split": {
+      "train": 8000,
+      "val": 1000,
+      "test": 1000,
+      "manifest_sha256": null
+    },
+    "primary_family_split": {
+      "train_families": 40,
+      "val_families": 5,
+      "test_families": 5,
+      "train_samples": 8000,
+      "val_samples": 1000,
+      "test_samples": 1000,
+      "manifest_sha256": null
+    },
+    "rotational_fold_count": 10,
+    "normalization_fit_partition": "train",
+    "source_response_train_families_only": true
+  },
+  "parent_artifacts": {
+    "legacy_benchmark_v1_20family": {
+      "required_as_parent_of_primary_v2": false,
+      "immutable": true,
+      "release_manifest_path": null,
+      "release_manifest_sha256": null
+    },
+    "family_templates": {
+      "artifact_id": null,
+      "manifest_sha256": null,
+      "required": true
+    },
+    "workload_assignments": {
+      "artifact_id": null,
+      "manifest_sha256": null,
+      "required": true
+    },
+    "hotspot_labels": {
+      "artifact_id": null,
+      "manifest_sha256": null,
+      "required_after_generation": true
+    },
+    "source_response_checkpoint_by_protocol": {
+      "policy": "one checkpoint lineage per declared protocol or fold",
+      "entries": []
+    }
+  },
+  "release_gates": [
+    "all_null_required_values_resolved",
+    "all_50_family_structures_approved",
+    "nearest_family_review_passed",
+    "workload_strata_and_power_limits_approved",
+    "all_parent_manifest_hashes_verified",
+    "zero_unresolved_paths",
+    "zero_cross_split_content_leakage",
+    "source_response_family_lineage_valid",
+    "relocation_test_passed",
+    "full_finite_shape_unit_audit_passed",
+    "legacy_benchmark_hashes_unchanged"
+  ],
+  "must_not_delete_classes": [
+    "canonical_source",
+    "any_parent_referenced_by_a_released_manifest",
+    "train_normalization_for_a_retained_checkpoint",
+    "source_response_checkpoint_for_retained_source_superposition_maps",
+    "split_manifest_for_reported_results"
+  ],
+  "unresolved_blockers": [
+    "persistent_project_storage_root_quota_backup_policy_and_owner",
+    "institutional_scratch_root_retention_and_quota",
+    "HotSpot_executable_version_and_hash",
+    "Python_environment_lock",
+    "final_family_template_hashes",
+    "final_workload_assignment_hashes",
+    "final_split_hashes",
+    "final_ordered_channel_and_graph_schema_hashes",
+    "authoritative_chiplet_type_power_density_ranges",
+    "structural_near_duplicate_threshold",
+    "inactive_chiplet_power_policy",
+    "external_baseline_selection"
+  ]
+}

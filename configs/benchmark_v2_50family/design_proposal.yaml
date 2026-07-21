@@ -1,0 +1,195 @@
+# PROPOSAL ONLY. This file is not an executable benchmark configuration.
+schema_version: benchmark_v2_design_proposal/0.1
+benchmark_id: benchmark_v2_50family
+status: proposal_not_approved_for_generation
+sample_count: 10000
+family_count: 50
+workloads_per_family: 200
+legacy_benchmark:
+  benchmark_id: benchmark_v1_20family
+  policy: immutable_separate_benchmark
+  include_in_primary_v2: false
+  allowed_use: backward_compatibility_and_cross_benchmark_transfer_only
+
+family_semantics:
+  fixed_within_family:
+    - package_width_mm
+    - package_height_mm
+    - grid_rows
+    - grid_cols
+    - chiplet_count
+    - chiplet_names_types_and_rectangles
+    - material_stack
+    - cooling_configuration
+    - HotSpot_configuration
+  varied_within_family:
+    - chiplet_activity
+    - chiplet_power_W
+    - chiplet_power_density_W_per_mm2
+  forbidden_in_v2_0:
+    - material_variation
+    - cooling_variation
+    - grid_resolution_variation
+    - transient_targets
+    - geometry_resampling_per_workload
+
+conventions:
+  target: steady_state_temperature
+  target_unit: K
+  geometry_unit: mm
+  power_unit: W
+  power_density_unit: W_per_mm2
+  grid_rows: 64
+  grid_cols: 64
+  active_workload: nominal
+  ambient_policy: fixed_and_recorded
+  source_superposition_assumption: linear_steady_state
+  path_contract: relative_to_declared_data_root
+  checksum_algorithm: sha256
+
+taxonomy_counts:
+  hpc: 8
+  memory_heavy: 4
+  compute_heavy: 4
+  mixed_heterogeneous: 7
+  analog_mems: 4
+  sparse_low_die: 3
+  dense_high_die: 3
+  compact_clustered: 3
+  distributed: 3
+  edge_constrained: 2
+  package_scale_aspect: 3
+  chiplet_size_aspect: 2
+  whitespace: 2
+  spacing: 2
+  package_material_cooling: 0
+
+# Ranges are review envelopes. Stage 1 must instantiate and validate one fixed
+# structure for every entry, then record exact values and a structural hash.
+families:
+  - {id: f001, category: hpc, split: train, dies: "8-16", package_mm: "32-45", whitespace: "0.35-0.55", composition: CPU_GPU_HBM_DRAM, placement: symmetric_compute_memory_cluster, axis: hpc_small}
+  - {id: f002, category: hpc, split: train, dies: "12-24", package_mm: "38-52", whitespace: "0.38-0.58", composition: CPU_GPU_HBM_DRAM, placement: dual_compute_cluster, axis: hpc_cluster_count}
+  - {id: f003, category: hpc, split: train, dies: "18-32", package_mm: "42-58", whitespace: "0.40-0.62", composition: CPU_GPU_HBM_DRAM, placement: compute_center_memory_ring, axis: memory_adjacency}
+  - {id: f004, category: hpc, split: train, dies: "20-40", package_mm: "48-65", whitespace: "0.42-0.65", composition: CPU_GPU_HBM_DRAM_IO, placement: four_quadrant_clusters, axis: hpc_scale}
+  - {id: f005, category: hpc, split: train, dies: "10-24", package_mm: "35-55", whitespace: "0.35-0.58", composition: CPU_NPU_HBM_DRAM, placement: asymmetric_accelerator_cluster, axis: accelerator_mix}
+  - {id: f006, category: hpc, split: train, dies: "16-36", package_mm: "42-62", whitespace: "0.38-0.64", composition: CPU_GPU_NPU_HBM_DRAM, placement: heterogeneous_compute_islands, axis: compute_heterogeneity}
+  - {id: f007, category: hpc, split: val, dies: "14-30", package_mm: "40-60", whitespace: "0.40-0.62", composition: CPU_GPU_HBM_DRAM, placement: staggered_compute_memory, axis: hpc_topology_validation}
+  - {id: f008, category: hpc, split: test, dies: "22-40", package_mm: "48-68", whitespace: "0.48-0.68", composition: CPU_GPU_NPU_HBM_DRAM, placement: sparse_multi_cluster, axis: compound_hpc_sparse, secondary_tags: [compound_ood]}
+
+  - {id: f009, category: memory_heavy, split: train, dies: "12-24", package_mm: "36-52", whitespace: "0.42-0.62", composition: CPU_HBM_DRAM, placement: memory_ring, axis: memory_fraction}
+  - {id: f010, category: memory_heavy, split: train, dies: "18-36", package_mm: "42-65", whitespace: "0.45-0.70", composition: CPU_GPU_HBM_DRAM, placement: distributed_memory_banks, axis: memory_distribution}
+  - {id: f011, category: memory_heavy, split: train, dies: "10-22", package_mm: "35-58", whitespace: "0.40-0.66", composition: NPU_HBM_DRAM_IO, placement: asymmetric_memory_banks, axis: non_cpu_memory_system}
+  - {id: f012, category: memory_heavy, split: val, dies: "20-36", package_mm: "45-68", whitespace: "0.48-0.70", composition: CPU_GPU_HBM_DRAM, placement: edge_memory_banks, axis: memory_edge_validation}
+
+  - {id: f013, category: compute_heavy, split: train, dies: "6-14", package_mm: "28-42", whitespace: "0.30-0.50", composition: CPU_GPU, placement: compact_compute_cluster, axis: source_density}
+  - {id: f014, category: compute_heavy, split: train, dies: "10-22", package_mm: "34-50", whitespace: "0.32-0.55", composition: GPU_NPU_HBM, placement: accelerator_array, axis: accelerator_density}
+  - {id: f015, category: compute_heavy, split: train, dies: "14-28", package_mm: "38-58", whitespace: "0.35-0.60", composition: CPU_GPU_NPU_DRAM, placement: dual_hot_cluster, axis: interacting_hot_clusters}
+  - {id: f016, category: compute_heavy, split: test, dies: "8-20", package_mm: "32-54", whitespace: "0.42-0.64", composition: CPU_GPU_NPU, placement: edge_separated_hot_sources, axis: compound_compute_edge, secondary_tags: [compound_ood]}
+
+  - {id: f017, category: mixed_heterogeneous, split: train, dies: "10-22", package_mm: "35-52", whitespace: "0.35-0.60", composition: CPU_GPU_MEMORY_IO, placement: functional_quadrants, axis: type_mix}
+  - {id: f018, category: mixed_heterogeneous, split: train, dies: "14-28", package_mm: "40-58", whitespace: "0.38-0.64", composition: CPU_NPU_MEMORY_ANALOG_IO, placement: thermal_zones, axis: low_high_power_adjacency}
+  - {id: f019, category: mixed_heterogeneous, split: train, dies: "18-34", package_mm: "44-65", whitespace: "0.42-0.68", composition: CPU_GPU_NPU_HBM_DRAM_IO, placement: multi_cluster, axis: composition_scale}
+  - {id: f020, category: mixed_heterogeneous, split: train, dies: "12-26", package_mm: "36-60", whitespace: "0.40-0.65", composition: CPU_GPU_MEMORY_ANALOG, placement: asymmetric_functional, axis: asymmetry}
+  - {id: f021, category: mixed_heterogeneous, split: train, dies: "20-40", package_mm: "48-70", whitespace: "0.45-0.70", composition: CPU_GPU_NPU_HBM_DRAM_IO_ANALOG, placement: distributed_functional, axis: broad_heterogeneity}
+  - {id: f022, category: mixed_heterogeneous, split: train, dies: "8-20", package_mm: "32-50", whitespace: "0.35-0.58", composition: CPU_MEMORY_IO_ANALOG, placement: compact_asymmetric, axis: small_heterogeneous}
+  - {id: f023, category: mixed_heterogeneous, split: val, dies: "16-32", package_mm: "42-66", whitespace: "0.46-0.70", composition: CPU_GPU_NPU_MEMORY_IO_ANALOG, placement: separated_functional_clusters, axis: heterogeneous_validation}
+
+  - {id: f024, category: analog_mems, split: train, dies: "7-16", package_mm: "30-48", whitespace: "0.40-0.65", composition: CPU_ANALOG_MEMS_IO, placement: protected_low_power_zone, axis: analog_separation}
+  - {id: f025, category: analog_mems, split: train, dies: "10-20", package_mm: "34-54", whitespace: "0.42-0.68", composition: GPU_MEMORY_ANALOG_MEMS, placement: hot_cold_adjacency, axis: hot_cold_coupling}
+  - {id: f026, category: analog_mems, split: train, dies: "14-24", package_mm: "40-60", whitespace: "0.45-0.72", composition: CPU_NPU_MEMORY_ANALOG_MEMS_IO, placement: distributed_sensitive_modules, axis: sensitive_module_distribution}
+  - {id: f027, category: analog_mems, split: test, dies: "9-22", package_mm: "38-62", whitespace: "0.52-0.74", composition: CPU_GPU_ANALOG_MEMS_IO, placement: edge_sensitive_hot_center, axis: compound_analog_sparse, secondary_tags: [compound_ood]}
+
+  - {id: f028, category: sparse_low_die, split: train, dies: "4-7", package_mm: "35-55", whitespace: "0.62-0.78", composition: CPU_GPU_HBM, placement: widely_separated, axis: sparse_source_count}
+  - {id: f029, category: sparse_low_die, split: train, dies: "6-9", package_mm: "42-68", whitespace: "0.68-0.82", composition: CPU_GPU_MEMORY_IO, placement: corner_and_center, axis: long_range_spacing}
+  - {id: f030, category: sparse_low_die, split: val, dies: "5-8", package_mm: "38-65", whitespace: "0.65-0.80", composition: GPU_NPU_HBM, placement: asymmetric_far_sources, axis: sparse_validation}
+
+  - {id: f031, category: dense_high_die, split: train, dies: "40-52", package_mm: "45-62", whitespace: "0.30-0.48", composition: CPU_GPU_MEMORY_IO, placement: dense_regular_channels, axis: dense_count}
+  - {id: f032, category: dense_high_die, split: train, dies: "50-72", package_mm: "52-72", whitespace: "0.25-0.45", composition: CPU_GPU_NPU_HBM_DRAM, placement: dense_multi_size, axis: extreme_die_count}
+  - {id: f033, category: dense_high_die, split: test, dies: "44-68", package_mm: "48-70", whitespace: "0.28-0.46", composition: CPU_GPU_MEMORY_IO_ANALOG, placement: dense_edge_channels, axis: compound_dense_heterogeneous, secondary_tags: [compound_ood]}
+
+  - {id: f034, category: compact_clustered, split: train, dies: "12-22", package_mm: "28-42", whitespace: "0.25-0.45", composition: CPU_GPU_HBM, placement: single_tight_cluster, axis: compactness}
+  - {id: f035, category: compact_clustered, split: train, dies: "18-30", package_mm: "34-48", whitespace: "0.28-0.48", composition: CPU_GPU_NPU_MEMORY, placement: dual_tight_cluster, axis: cluster_interaction}
+  - {id: f036, category: compact_clustered, split: train, dies: "24-36", package_mm: "38-52", whitespace: "0.30-0.50", composition: CPU_GPU_HBM_DRAM_IO, placement: hierarchical_clusters, axis: cluster_hierarchy}
+
+  - {id: f037, category: distributed, split: train, dies: "10-18", package_mm: "45-62", whitespace: "0.55-0.72", composition: CPU_GPU_HBM, placement: uniform_distributed, axis: distributed_spacing}
+  - {id: f038, category: distributed, split: train, dies: "16-26", package_mm: "52-70", whitespace: "0.58-0.76", composition: CPU_GPU_MEMORY_IO, placement: perimeter_and_center, axis: distributed_topology}
+  - {id: f039, category: distributed, split: train, dies: "20-32", package_mm: "58-75", whitespace: "0.60-0.78", composition: CPU_GPU_NPU_HBM_DRAM, placement: separated_islands, axis: distributed_scale}
+
+  - {id: f040, category: edge_constrained, split: train, dies: "8-18", package_mm: "32-52", whitespace: "0.35-0.62", composition: CPU_GPU_MEMORY, placement: one_hot_edge_band, axis: one_edge}
+  - {id: f041, category: edge_constrained, split: val, dies: "12-24", package_mm: "40-65", whitespace: "0.42-0.68", composition: CPU_GPU_NPU_MEMORY, placement: two_edge_hot_sources, axis: multi_edge_validation}
+
+  - {id: f042, category: package_scale_aspect, split: train, dies: "10-22", package_mm: "25-42", whitespace: "0.35-0.58", composition: CPU_GPU_MEMORY, placement: scale_reference_compact, axis: small_package}
+  - {id: f043, category: package_scale_aspect, split: train, dies: "16-30", package_mm: "55-78", whitespace: "0.50-0.72", composition: CPU_GPU_HBM_DRAM, placement: scale_reference_large, axis: large_package}
+  - {id: f044, category: package_scale_aspect, split: test, dies: "12-28", package_mm: "36x68_to_38x78", whitespace: "0.46-0.70", composition: CPU_GPU_MEMORY_IO, placement: long_axis_clusters, axis: compound_high_aspect_spacing, secondary_tags: [compound_ood]}
+
+  - {id: f045, category: chiplet_size_aspect, split: train, dies: "8-18", package_mm: "35-55", whitespace: "0.35-0.62", composition: CPU_GPU_MEMORY, placement: elongated_sources_mixed_orientation, axis: source_aspect}
+  - {id: f046, category: chiplet_size_aspect, split: train, dies: "14-28", package_mm: "42-65", whitespace: "0.40-0.68", composition: CPU_GPU_NPU_MEMORY, placement: multi_scale_source_sizes, axis: source_size_variance}
+
+  - {id: f047, category: whitespace, split: train, dies: "10-24", package_mm: "38-58", whitespace: "0.30-0.42", composition: CPU_GPU_MEMORY_IO, placement: matched_low_whitespace, axis: whitespace_low}
+  - {id: f048, category: whitespace, split: train, dies: "10-24", package_mm: "48-70", whitespace: "0.68-0.80", composition: CPU_GPU_MEMORY_IO, placement: matched_high_whitespace, axis: whitespace_high}
+
+  - {id: f049, category: spacing, split: train, dies: "10-24", package_mm: "38-62", whitespace: "0.38-0.65", composition: CPU_GPU_MEMORY, placement: matched_near_spacing, axis: spacing_near}
+  - {id: f050, category: spacing, split: train, dies: "10-24", package_mm: "38-62", whitespace: "0.38-0.65", composition: CPU_GPU_MEMORY, placement: matched_far_spacing, axis: spacing_far}
+
+workload_allocation:
+  low_balanced: 20
+  low_sparse_or_type_specific: 15
+  medium_balanced: 35
+  medium_type_specific: 25
+  medium_skewed: 20
+  high_balanced_dense: 20
+  high_single_dominant: 20
+  high_interacting_multi_source: 25
+  sparse_active_subset_stress: 10
+  dense_active_subset_stress: 10
+  total: 200
+  sampling:
+    method: deterministic_stratified_or_latin_hypercube
+    joint_variables: [total_power_W, dominant_share, active_count, active_types, interaction_distance]
+    enforce_type_power_density_bounds: true
+    duplicate_identity: sha256_of_power_assignment_and_fixed_family_uid
+    near_duplicate_audit: required
+    inactive_power_policy: low_positive_idle_floor_pending_review
+
+split_protocols:
+  sample_split:
+    train_workloads_per_family: 160
+    val_workloads_per_family: 20
+    test_workloads_per_family: 20
+    totals: {train: 8000, val: 1000, test: 1000}
+  primary_family_split:
+    train_families: 40
+    val_families: [f007, f012, f023, f030, f041]
+    test_families: [f008, f016, f027, f033, f044]
+    totals: {train: 8000, val: 1000, test: 1000}
+  rotational_family_folds:
+    group_count: 10
+    families_per_group: 5
+    policy: test_group_k_val_group_k_plus_1_train_remaining_groups
+  package_physics_ood:
+    enabled: false
+    reason: current_inputs_do_not_represent_varying_material_or_cooling
+
+source_response_policy:
+  train_targets_from_train_families_only: true
+  test_family_targets_allowed_for_oracle_only: true
+  canonical_isolation_frequency: once_per_source_per_fixed_family
+  per_workload_isolation_forbidden: true
+  checkpoint_must_record_family_set_hash: true
+
+stage_gates:
+  stage_1: specification_and_nearest_family_review
+  stage_2: five_families_times_ten_workloads
+  stage_3: ten_families_times_fifty_workloads
+  stage_4: fifty_families_times_two_hundred_workloads
+  full_generation_approved: false
+
+unresolved_decisions:
+  - persistent_project_storage_root_quota_backup_and_owner
+  - institutional_scratch_root_and_retention_window
+  - authoritative_per_type_power_density_ranges
+  - structural_near_duplicate_distance_and_review_threshold
+  - low_positive_idle_floor_or_explicit_zero_power_support
+  - exact_50_fixed_layouts_and_candidate_seeds
+  - number_of_rotational_folds_to_publish
+  - independent_external_baseline_for_publication
