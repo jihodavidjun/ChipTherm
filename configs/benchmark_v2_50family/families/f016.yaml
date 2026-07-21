@@ -1,0 +1,645 @@
+schema_version: benchmark_v2_family/1
+benchmark_id: benchmark_v2_50family
+status: stage1_fixed_structure
+family_uid: f016
+primary_category: compute_heavy
+primary_split: test
+rotational_fold_group: 6
+secondary_tags:
+- compound_ood
+- edge_compute
+placement_style: edge_separated_hot_sources
+purpose: Compound-OOD edge-separated high-power compute sources.
+generation:
+  base_seed: 20260721
+  candidate_seed: 20276865
+  accepted_candidate_attempt: 0
+  method: deterministic_structured_cell_construction
+  geometry_depends_on_workload: false
+fixed_structure:
+  grid:
+    rows: 64
+    cols: 64
+    map_mode: avg
+  layout:
+    schema_version: 1
+    units:
+      length: mm
+    package:
+      name: f016
+      substrate: silicon_interposer
+      size:
+        width: 50.0
+        height: 40.0
+    chiplets:
+    - name: CPU00
+      type: CPU
+      position:
+        x: 1.494140317
+        y: 1.213671543
+      size:
+        width: 7.011719365
+        height: 7.572656914
+    - name: CPU01
+      type: CPU
+      position:
+        x: 41.213671543
+        y: 1.494140317
+      size:
+        width: 7.572656914
+        height: 7.011719365
+    - name: CPU02
+      type: CPU
+      position:
+        x: 1.494140317
+        y: 31.213671543
+      size:
+        width: 7.011719365
+        height: 7.572656914
+    - name: CPU03
+      type: CPU
+      position:
+        x: 41.213671543
+        y: 31.494140317
+      size:
+        width: 7.572656914
+        height: 7.011719365
+    - name: GPU00
+      type: GPU
+      position:
+        x: 11.295365904
+        y: 0.628531767
+      size:
+        width: 7.409268192
+        height: 8.742936466
+    - name: GPU01
+      type: GPU
+      position:
+        x: 30.628531767
+        y: 1.295365904
+      size:
+        width: 8.742936466
+        height: 7.409268192
+    - name: GPU02
+      type: GPU
+      position:
+        x: 11.295365904
+        y: 30.628531767
+      size:
+        width: 7.409268192
+        height: 8.742936466
+    - name: GPU03
+      type: GPU
+      position:
+        x: 30.628531767
+        y: 31.295365904
+      size:
+        width: 8.742936466
+        height: 7.409268192
+    - name: GPU04
+      type: GPU
+      position:
+        x: 1.295365904
+        y: 10.628531767
+      size:
+        width: 7.409268192
+        height: 8.742936466
+    - name: GPU05
+      type: GPU
+      position:
+        x: 40.628531767
+        y: 11.295365904
+      size:
+        width: 8.742936466
+        height: 7.409268192
+    - name: NPU00
+      type: NPU
+      position:
+        x: 1.430215296
+        y: 21.430215296
+      size:
+        width: 7.139569408
+        height: 7.139569408
+    - name: NPU01
+      type: NPU
+      position:
+        x: 41.430215296
+        y: 21.430215296
+      size:
+        width: 7.139569408
+        height: 7.139569408
+    - name: NPU02
+      type: NPU
+      position:
+        x: 21.430215296
+        y: 1.430215296
+      size:
+        width: 7.139569408
+        height: 7.139569408
+    - name: NPU03
+      type: NPU
+      position:
+        x: 21.430215296
+        y: 31.430215296
+      size:
+        width: 7.139569408
+        height: 7.139569408
+    - name: NPU04
+      type: NPU
+      position:
+        x: 11.430215296
+        y: 11.430215296
+      size:
+        width: 7.139569408
+        height: 7.139569408
+    - name: NPU05
+      type: NPU
+      position:
+        x: 31.430215296
+        y: 11.430215296
+      size:
+        width: 7.139569408
+        height: 7.139569408
+    - name: IO00
+      type: IO
+      position:
+        x: 12.774441519
+        y: 22.017751635
+      size:
+        width: 4.451116962
+        height: 5.96449673
+    - name: IO01
+      type: IO
+      position:
+        x: 32.017751635
+        y: 22.774441519
+      size:
+        width: 5.96449673
+        height: 4.451116962
+  composition:
+    CPU: 4
+    GPU: 6
+    NPU: 6
+    IO: 2
+  thermal_stack:
+    schema_version: 1
+    ambient_K: 318.15
+    initial_temperature_K: 318.15
+    chip:
+      thickness_m: 0.00015
+      thermal_conductivity_W_per_mK: 130.0
+      volumetric_heat_capacity_J_per_m3K: 1630300
+    interface:
+      thickness_m: 2.0e-05
+      thermal_conductivity_W_per_mK: 4.0
+      volumetric_heat_capacity_J_per_m3K: 4000000
+    spreader:
+      side_m: 0.09
+      thickness_m: 0.001
+      thermal_conductivity_W_per_mK: 400.0
+      volumetric_heat_capacity_J_per_m3K: 3550000
+    sink:
+      side_m: 0.1
+      thickness_m: 0.0069
+      thermal_conductivity_W_per_mK: 400.0
+      volumetric_heat_capacity_J_per_m3K: 3550000
+      convection_resistance_K_per_W: 0.12
+      convection_capacitance_J_per_K: 140.4
+  hotspot:
+    schema_version: 1
+    model_type: grid
+    grid:
+      rows: 64
+      cols: 64
+      map_mode: avg
+    sampling_interval_s: 0.01
+    base_processor_frequency_Hz: 3000000000
+    leakage_used: false
+    detailed_package: false
+    secondary_path: false
+  material_and_cooling_variant: benchmark_v2_0_fixed_default
+constraints:
+  minimum_legal_gap_mm: 0.5
+  target_whitespace_fraction: 0.52
+  allowed_chiplet_types:
+  - CPU
+  - GPU
+  - NPU
+  - HBM
+  - DRAM
+  - IO
+  - ANALOG
+  - MEMS
+  geometry_unit: mm
+descriptors:
+  package_width_mm: 50.0
+  package_height_mm: 40.0
+  package_area_mm2: 2000.0
+  package_aspect_ratio: 1.25
+  chiplet_count: 18
+  type_counts: &id001
+    CPU: 4
+    GPU: 6
+    NPU: 6
+    HBM: 0
+    DRAM: 0
+    IO: 2
+    ANALOG: 0
+    MEMS: 0
+  occupied_area_mm2: 960.0000000061339
+  occupied_fraction: 0.4800000000030669
+  whitespace_fraction: 0.5199999999969331
+  minimum_chiplet_gap_mm: 1.842203309999995
+  mean_pairwise_chiplet_gap_mm: 16.72013892601987
+  minimum_package_edge_clearance_mm: 0.628531767
+  mean_package_edge_clearance_mm: 3.5135096795000007
+  chiplet_area_min_mm2: 26.548672564696535
+  chiplet_area_mean_mm2: 53.333333333674105
+  chiplet_area_std_mm2: 11.191415411591004
+  chiplet_area_max_mm2: 64.77876106221069
+  chiplet_aspect_ratio_min: 1.0
+  chiplet_aspect_ratio_mean: 1.115555555546989
+  chiplet_aspect_ratio_std: 0.10822929480702577
+  chiplet_aspect_ratio_max: 1.3400000002066894
+  minimum_pairwise_center_distance_mm: 9.999999999499998
+  mean_pairwise_center_distance_mm: 25.409760842097846
+  pairwise_center_distance_histogram: &id004
+  - 0.0
+  - 0.2614379085
+  - 0.2483660131
+  - 0.2679738562
+  - 0.1176470588
+  - 0.091503268
+  - 0.0130718954
+  - 0.0
+  pairwise_edge_gap_histogram: &id005
+  - 0.2614379085
+  - 0.2483660131
+  - 0.2549019608
+  - 0.137254902
+  - 0.0980392157
+  - 0.0
+  - 0.0
+  - 0.0
+  package_edge_distance_histogram: &id006
+  - 0.7777777778
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.2222222222
+  - 0.0
+  - 0.0
+  - 0.0
+  chiplet_area_quantiles_normalized: &id002
+  - 0.0132743363
+  - 0.0254867257
+  - 0.0265486726
+  - 0.0323893805
+  - 0.0323893805
+  chiplet_aspect_ratio_quantiles: &id003
+  - 1.0
+  - 1.0
+  - 1.08
+  - 1.1799999999
+  - 1.3400000002
+  spatial_occupancy_descriptor_8x8: &id007
+  - 0.5762318994
+  - 0.4418382525
+  - 0.8679475471
+  - 0.4077876107
+  - 0.4814616076
+  - 0.7409268192
+  - 0.5064037346
+  - 0.5650131484
+  - 0.5762318994
+  - 0.4418382525
+  - 0.8679475471
+  - 0.4077876107
+  - 0.4814616076
+  - 0.7409268192
+  - 0.5064037345
+  - 0.5650131482
+  - 0.6930888178
+  - 0.4655761935
+  - 0.693370387
+  - 0.0
+  - 0.0
+  - 0.693370387
+  - 0.492249559
+  - 0.6664154523
+  - 0.6930888178
+  - 0.4655761935
+  - 0.693370387
+  - 0.0
+  - 0.0
+  - 0.693370387
+  - 0.492249559
+  - 0.6664154523
+  - 0.5505789988
+  - 0.2649962225
+  - 0.424778761
+  - 0.0
+  - 0.0
+  - 0.390434059
+  - 0.2993409245
+  - 0.5505789988
+  - 0.5505789988
+  - 0.2649962225
+  - 0.424778761
+  - 0.0
+  - 0.0
+  - 0.390434059
+  - 0.2993409245
+  - 0.5505789988
+  - 0.5762318994
+  - 0.4418382525
+  - 0.8679475471
+  - 0.4077876107
+  - 0.4814616076
+  - 0.7409268192
+  - 0.5064037346
+  - 0.5650131484
+  - 0.5762318994
+  - 0.4418382525
+  - 0.8679475471
+  - 0.4077876107
+  - 0.4814616076
+  - 0.7409268192
+  - 0.5064037345
+  - 0.5650131482
+  type_aware_spatial_descriptor_4x4: &id008
+    CPU:
+    - 0.25
+    - 0.0
+    - 0.0
+    - 0.25
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.25
+    - 0.0
+    - 0.0
+    - 0.25
+    GPU:
+    - 0.0
+    - 0.1666666667
+    - 0.1666666667
+    - 0.0
+    - 0.1666666667
+    - 0.0
+    - 0.0
+    - 0.1666666667
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.1666666667
+    - 0.1666666667
+    - 0.0
+    NPU:
+    - 0.0
+    - 0.0
+    - 0.1666666667
+    - 0.0
+    - 0.0
+    - 0.1666666667
+    - 0.1666666667
+    - 0.0
+    - 0.1666666667
+    - 0.0
+    - 0.0
+    - 0.1666666667
+    - 0.0
+    - 0.0
+    - 0.1666666667
+    - 0.0
+    HBM:
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    DRAM:
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    IO:
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.5
+    - 0.5
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    ANALOG:
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    MEMS:
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+structural_fingerprint: c4f3fd4574f62a529c34ce4aea2b2e14204f4f9bc25411943f27ac5fef000716
+structural_fingerprint_components:
+  physical_package_mm:
+  - 50.0
+  - 40.0
+  package_aspect_ratio: 1.25
+  chiplet_count: 18
+  type_histogram: *id001
+  whitespace_fraction: 0.5199999999969331
+  chiplet_area_quantiles_normalized: *id002
+  chiplet_aspect_ratio_quantiles: *id003
+  pairwise_center_distance_histogram: *id004
+  pairwise_edge_gap_histogram: *id005
+  package_edge_distance_histogram: *id006
+  spatial_occupancy_descriptor_8x8: *id007
+  type_aware_spatial_descriptor_4x4: *id008
+  normalized_chiplets:
+  - name: CPU00
+    type: CPU
+    x_normalized: 0.0298828063
+    y_normalized: 0.0303417886
+    width_normalized: 0.1402343873
+    height_normalized: 0.1893164228
+  - name: CPU01
+    type: CPU
+    x_normalized: 0.8242734309
+    y_normalized: 0.0373535079
+    width_normalized: 0.1514531383
+    height_normalized: 0.1752929841
+  - name: CPU02
+    type: CPU
+    x_normalized: 0.0298828063
+    y_normalized: 0.7803417886
+    width_normalized: 0.1402343873
+    height_normalized: 0.1893164228
+  - name: CPU03
+    type: CPU
+    x_normalized: 0.8242734309
+    y_normalized: 0.7873535079
+    width_normalized: 0.1514531383
+    height_normalized: 0.1752929841
+  - name: GPU00
+    type: GPU
+    x_normalized: 0.2259073181
+    y_normalized: 0.0157132942
+    width_normalized: 0.1481853638
+    height_normalized: 0.2185734116
+  - name: GPU01
+    type: GPU
+    x_normalized: 0.6125706353
+    y_normalized: 0.0323841476
+    width_normalized: 0.1748587293
+    height_normalized: 0.1852317048
+  - name: GPU02
+    type: GPU
+    x_normalized: 0.2259073181
+    y_normalized: 0.7657132942
+    width_normalized: 0.1481853638
+    height_normalized: 0.2185734116
+  - name: GPU03
+    type: GPU
+    x_normalized: 0.6125706353
+    y_normalized: 0.7823841476
+    width_normalized: 0.1748587293
+    height_normalized: 0.1852317048
+  - name: GPU04
+    type: GPU
+    x_normalized: 0.0259073181
+    y_normalized: 0.2657132942
+    width_normalized: 0.1481853638
+    height_normalized: 0.2185734116
+  - name: GPU05
+    type: GPU
+    x_normalized: 0.8125706353
+    y_normalized: 0.2823841476
+    width_normalized: 0.1748587293
+    height_normalized: 0.1852317048
+  - name: IO00
+    type: IO
+    x_normalized: 0.2554888304
+    y_normalized: 0.5504437909
+    width_normalized: 0.0890223392
+    height_normalized: 0.1491124182
+  - name: IO01
+    type: IO
+    x_normalized: 0.6403550327
+    y_normalized: 0.569361038
+    width_normalized: 0.1192899346
+    height_normalized: 0.1112779241
+  - name: NPU00
+    type: NPU
+    x_normalized: 0.0286043059
+    y_normalized: 0.5357553824
+    width_normalized: 0.1427913882
+    height_normalized: 0.1784892352
+  - name: NPU01
+    type: NPU
+    x_normalized: 0.8286043059
+    y_normalized: 0.5357553824
+    width_normalized: 0.1427913882
+    height_normalized: 0.1784892352
+  - name: NPU02
+    type: NPU
+    x_normalized: 0.4286043059
+    y_normalized: 0.0357553824
+    width_normalized: 0.1427913882
+    height_normalized: 0.1784892352
+  - name: NPU03
+    type: NPU
+    x_normalized: 0.4286043059
+    y_normalized: 0.7857553824
+    width_normalized: 0.1427913882
+    height_normalized: 0.1784892352
+  - name: NPU04
+    type: NPU
+    x_normalized: 0.2286043059
+    y_normalized: 0.2857553824
+    width_normalized: 0.1427913882
+    height_normalized: 0.1784892352
+  - name: NPU05
+    type: NPU
+    x_normalized: 0.6286043059
+    y_normalized: 0.2857553824
+    width_normalized: 0.1427913882
+    height_normalized: 0.1784892352
+future_workload_contract:
+  workloads_per_family: 200
+  fixed_fields:
+  - package dimensions
+  - grid convention
+  - chiplet IDs/types/rectangles
+  - thermal stack
+  - cooling configuration
+  - ambient convention
+  - HotSpot settings
+  variable_fields:
+  - chiplet activity
+  - chiplet power_W
+  - chiplet power_density_W_per_mm2

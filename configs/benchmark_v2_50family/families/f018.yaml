@@ -1,0 +1,730 @@
+schema_version: benchmark_v2_family/1
+benchmark_id: benchmark_v2_50family
+status: stage1_fixed_structure
+family_uid: f018
+primary_category: mixed_heterogeneous
+primary_split: train
+rotational_fold_group: 8
+secondary_tags: []
+placement_style: thermal_zones
+purpose: High- and low-power functional thermal zones.
+generation:
+  base_seed: 20260721
+  candidate_seed: 20278883
+  accepted_candidate_attempt: 0
+  method: deterministic_structured_cell_construction
+  geometry_depends_on_workload: false
+fixed_structure:
+  grid:
+    rows: 64
+    cols: 64
+    map_mode: avg
+  layout:
+    schema_version: 1
+    units:
+      length: mm
+    package:
+      name: f018
+      substrate: silicon_interposer
+      size:
+        width: 52.0
+        height: 46.0
+    chiplets:
+    - name: CPU00
+      type: CPU
+      position:
+        x: 1.182304285
+        y: 0.260888628
+      size:
+        width: 8.03539143
+        height: 8.678222744
+    - name: CPU01
+      type: CPU
+      position:
+        x: 11.238753843
+        y: 0.561809114
+      size:
+        width: 8.722492315
+        height: 8.076381773
+    - name: CPU02
+      type: CPU
+      position:
+        x: 21.982304285
+        y: 0.260888628
+      size:
+        width: 8.03539143
+        height: 8.678222744
+    - name: NPU00
+      type: NPU
+      position:
+        x: 32.28817769
+        y: 0.48817769
+      size:
+        width: 8.223644619
+        height: 8.223644619
+    - name: NPU01
+      type: NPU
+      position:
+        x: 42.68817769
+        y: 0.48817769
+      size:
+        width: 8.223644619
+        height: 8.223644619
+    - name: NPU02
+      type: NPU
+      position:
+        x: 1.08817769
+        y: 9.68817769
+      size:
+        width: 8.223644619
+        height: 8.223644619
+    - name: NPU03
+      type: NPU
+      position:
+        x: 11.48817769
+        y: 9.68817769
+      size:
+        width: 8.223644619
+        height: 8.223644619
+    - name: HBM00
+      type: HBM
+      position:
+        x: 22.72987312
+        y: 10.245514261
+      size:
+        width: 6.54025376
+        height: 7.108971479
+    - name: HBM01
+      type: HBM
+      position:
+        x: 32.845514261
+        y: 10.52987312
+      size:
+        width: 7.108971479
+        height: 6.54025376
+    - name: HBM02
+      type: HBM
+      position:
+        x: 43.52987312
+        y: 10.245514261
+      size:
+        width: 6.54025376
+        height: 7.108971479
+    - name: DRAM00
+      type: DRAM
+      position:
+        x: 2.077621445
+        y: 19.502936018
+      size:
+        width: 6.24475711
+        height: 6.994127963
+    - name: DRAM01
+      type: DRAM
+      position:
+        x: 12.102936018
+        y: 19.877621445
+      size:
+        width: 6.994127963
+        height: 6.24475711
+    - name: DRAM02
+      type: DRAM
+      position:
+        x: 33.277621445
+        y: 19.502936018
+      size:
+        width: 6.24475711
+        height: 6.994127963
+    - name: IO00
+      type: IO
+      position:
+        x: 43.364925793
+        y: 20.436511786
+      size:
+        width: 6.870148413
+        height: 5.126976428
+    - name: IO01
+      type: IO
+      position:
+        x: 2.636511786
+        y: 28.764925793
+      size:
+        width: 5.126976428
+        height: 6.870148413
+    - name: IO02
+      type: IO
+      position:
+        x: 12.164925793
+        y: 29.636511786
+      size:
+        width: 6.870148413
+        height: 5.126976428
+    - name: ANALOG00
+      type: ANALOG
+      position:
+        x: 23.216283137
+        y: 29.416283137
+      size:
+        width: 5.567433726
+        height: 5.567433726
+    - name: ANALOG01
+      type: ANALOG
+      position:
+        x: 33.616283137
+        y: 29.416283137
+      size:
+        width: 5.567433726
+        height: 5.567433726
+    - name: ANALOG02
+      type: ANALOG
+      position:
+        x: 44.016283137
+        y: 29.416283137
+      size:
+        width: 5.567433726
+        height: 5.567433726
+    - name: ANALOG03
+      type: ANALOG
+      position:
+        x: 2.416283137
+        y: 38.616283137
+      size:
+        width: 5.567433726
+        height: 5.567433726
+    - name: MEMS00
+      type: MEMS
+      position:
+        x: 12.961306453
+        y: 39.13072355
+      size:
+        width: 5.277387094
+        height: 4.538552901
+    - name: MEMS01
+      type: MEMS
+      position:
+        x: 23.73072355
+        y: 38.761306453
+      size:
+        width: 4.538552901
+        height: 5.277387094
+    - name: MEMS02
+      type: MEMS
+      position:
+        x: 33.761306453
+        y: 39.13072355
+      size:
+        width: 5.277387094
+        height: 4.538552901
+    - name: MEMS03
+      type: MEMS
+      position:
+        x: 44.53072355
+        y: 38.761306453
+      size:
+        width: 4.538552901
+        height: 5.277387094
+  composition:
+    CPU: 3
+    NPU: 4
+    HBM: 3
+    DRAM: 3
+    IO: 3
+    ANALOG: 4
+    MEMS: 4
+  thermal_stack:
+    schema_version: 1
+    ambient_K: 318.15
+    initial_temperature_K: 318.15
+    chip:
+      thickness_m: 0.00015
+      thermal_conductivity_W_per_mK: 130.0
+      volumetric_heat_capacity_J_per_m3K: 1630300
+    interface:
+      thickness_m: 2.0e-05
+      thermal_conductivity_W_per_mK: 4.0
+      volumetric_heat_capacity_J_per_m3K: 4000000
+    spreader:
+      side_m: 0.09
+      thickness_m: 0.001
+      thermal_conductivity_W_per_mK: 400.0
+      volumetric_heat_capacity_J_per_m3K: 3550000
+    sink:
+      side_m: 0.1
+      thickness_m: 0.0069
+      thermal_conductivity_W_per_mK: 400.0
+      volumetric_heat_capacity_J_per_m3K: 3550000
+      convection_resistance_K_per_W: 0.12
+      convection_capacitance_J_per_K: 140.4
+  hotspot:
+    schema_version: 1
+    model_type: grid
+    grid:
+      rows: 64
+      cols: 64
+      map_mode: avg
+    sampling_interval_s: 0.01
+    base_processor_frequency_Hz: 3000000000
+    leakage_used: false
+    detailed_package: false
+    secondary_path: false
+  material_and_cooling_variant: benchmark_v2_0_fixed_default
+constraints:
+  minimum_legal_gap_mm: 0.5
+  target_whitespace_fraction: 0.55
+  allowed_chiplet_types:
+  - CPU
+  - GPU
+  - NPU
+  - HBM
+  - DRAM
+  - IO
+  - ANALOG
+  - MEMS
+  geometry_unit: mm
+descriptors:
+  package_width_mm: 52.0
+  package_height_mm: 46.0
+  package_area_mm2: 2392.0
+  package_aspect_ratio: 1.1304347826086956
+  chiplet_count: 24
+  type_counts: &id001
+    CPU: 3
+    GPU: 0
+    NPU: 4
+    HBM: 3
+    DRAM: 3
+    IO: 3
+    ANALOG: 4
+    MEMS: 4
+  occupied_area_mm2: 1076.3999999725777
+  occupied_fraction: 0.44999999998853585
+  whitespace_fraction: 0.5500000000114642
+  minimum_chiplet_gap_mm: 0.7490663180000006
+  mean_pairwise_chiplet_gap_mm: 18.660994182341703
+  minimum_package_edge_clearance_mm: 0.260888628
+  mean_package_edge_clearance_mm: 4.695286602375
+  chiplet_area_min_mm2: 23.95170050517366
+  chiplet_area_mean_mm2: 44.849999998857406
+  chiplet_area_std_mm2: 16.800076957246446
+  chiplet_area_max_mm2: 70.44617794799858
+  chiplet_aspect_ratio_min: 1.0
+  chiplet_aspect_ratio_mean: 1.105501348150418
+  chiplet_aspect_ratio_std: 0.10621415624845623
+  chiplet_aspect_ratio_max: 1.3399999998985757
+  minimum_pairwise_center_distance_mm: 9.199999999
+  mean_pairwise_center_distance_mm: 26.629115618435083
+  pairwise_center_distance_histogram: &id004
+  - 0.0
+  - 0.231884058
+  - 0.2391304348
+  - 0.2826086957
+  - 0.1884057971
+  - 0.0507246377
+  - 0.0072463768
+  - 0.0
+  pairwise_edge_gap_histogram: &id005
+  - 0.231884058
+  - 0.25
+  - 0.25
+  - 0.1811594203
+  - 0.0797101449
+  - 0.0072463768
+  - 0.0
+  - 0.0
+  package_edge_distance_histogram: &id006
+  - 0.6666666667
+  - 0.0
+  - 0.0
+  - 0.25
+  - 0.0833333333
+  - 0.0
+  - 0.0
+  - 0.0
+  chiplet_area_quantiles_normalized: &id002
+  - 0.0100132527
+  - 0.012958327
+  - 0.0182594608
+  - 0.0282727136
+  - 0.0294507433
+  chiplet_aspect_ratio_quantiles: &id003
+  - 1.0
+  - 1.0
+  - 1.0869565219
+  - 1.1627906976
+  - 1.3399999999
+  spatial_occupancy_descriptor_8x8: &id007
+  - 0.7809879337
+  - 0.6436231629
+  - 0.9022940671
+  - 0.6540899626
+  - 0.619883628
+  - 0.9150995322
+  - 0.6087023336
+  - 0.7619009328
+  - 0.7160932248
+  - 0.5775926473
+  - 0.8173935995
+  - 0.4984925208
+  - 0.4693668675
+  - 0.6748488845
+  - 0.4335340585
+  - 0.5822612721
+  - 0.8325880477
+  - 0.6651760952
+  - 1.0
+  - 0.5356844906
+  - 0.5030964431
+  - 0.9172245203
+  - 0.4453467889
+  - 0.7030964431
+  - 0.5096188762
+  - 0.3220182531
+  - 0.6244598483
+  - 0.0128928524
+  - 0.0091419833
+  - 0.5354253896
+  - 0.2008261929
+  - 0.3375470236
+  - 0.4137883814
+  - 0.2454567958
+  - 0.5093603163
+  - 0.0
+  - 0.0
+  - 0.5354253894
+  - 0.1953184962
+  - 0.3247707537
+  - 0.5928399092
+  - 0.3025437386
+  - 0.7853247431
+  - 0.3786388858
+  - 0.3786388858
+  - 0.7322887546
+  - 0.2268029686
+  - 0.5554638202
+  - 0.2958390079
+  - 0.110273368
+  - 0.1994305616
+  - 0.1264157323
+  - 0.1264157324
+  - 0.2265616307
+  - 0.061346627
+  - 0.1950213119
+  - 0.4298109937
+  - 0.1597010295
+  - 0.4792653239
+  - 0.2300359342
+  - 0.2300359343
+  - 0.4792653239
+  - 0.1017951937
+  - 0.3618165795
+  type_aware_spatial_descriptor_4x4: &id008
+    CPU:
+    - 0.3333333333
+    - 0.3333333333
+    - 0.3333333333
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    GPU:
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    NPU:
+    - 0.0
+    - 0.0
+    - 0.25
+    - 0.25
+    - 0.25
+    - 0.25
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    HBM:
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.6666666667
+    - 0.3333333333
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    DRAM:
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.3333333333
+    - 0.0
+    - 0.3333333333
+    - 0.0
+    - 0.0
+    - 0.3333333333
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    IO:
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.3333333333
+    - 0.3333333333
+    - 0.0
+    - 0.3333333333
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    ANALOG:
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.5
+    - 0.25
+    - 0.25
+    - 0.0
+    - 0.0
+    - 0.0
+    MEMS:
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.25
+    - 0.5
+    - 0.25
+structural_fingerprint: c3c28492d0052b1392fc9e25439a438fb1f68e9ec2ae9b0d560a6a5e95655038
+structural_fingerprint_components:
+  physical_package_mm:
+  - 52.0
+  - 46.0
+  package_aspect_ratio: 1.1304347826086956
+  chiplet_count: 24
+  type_histogram: *id001
+  whitespace_fraction: 0.5500000000114642
+  chiplet_area_quantiles_normalized: *id002
+  chiplet_aspect_ratio_quantiles: *id003
+  pairwise_center_distance_histogram: *id004
+  pairwise_edge_gap_histogram: *id005
+  package_edge_distance_histogram: *id006
+  spatial_occupancy_descriptor_8x8: *id007
+  type_aware_spatial_descriptor_4x4: *id008
+  normalized_chiplets:
+  - name: ANALOG00
+    type: ANALOG
+    x_normalized: 0.4464669834
+    y_normalized: 0.639484416
+    width_normalized: 0.1070660332
+    height_normalized: 0.121031168
+  - name: ANALOG01
+    type: ANALOG
+    x_normalized: 0.6464669834
+    y_normalized: 0.639484416
+    width_normalized: 0.1070660332
+    height_normalized: 0.121031168
+  - name: ANALOG02
+    type: ANALOG
+    x_normalized: 0.8464669834
+    y_normalized: 0.639484416
+    width_normalized: 0.1070660332
+    height_normalized: 0.121031168
+  - name: ANALOG03
+    type: ANALOG
+    x_normalized: 0.0464669834
+    y_normalized: 0.839484416
+    width_normalized: 0.1070660332
+    height_normalized: 0.121031168
+  - name: CPU00
+    type: CPU
+    x_normalized: 0.0227366209
+    y_normalized: 0.0056714919
+    width_normalized: 0.1545267583
+    height_normalized: 0.1886570162
+  - name: CPU01
+    type: CPU
+    x_normalized: 0.2161298816
+    y_normalized: 0.0122132416
+    width_normalized: 0.1677402368
+    height_normalized: 0.1755735168
+  - name: CPU02
+    type: CPU
+    x_normalized: 0.4227366209
+    y_normalized: 0.0056714919
+    width_normalized: 0.1545267583
+    height_normalized: 0.1886570162
+  - name: DRAM00
+    type: DRAM
+    x_normalized: 0.0399542586
+    y_normalized: 0.42397687
+    width_normalized: 0.1200914829
+    height_normalized: 0.1520462601
+  - name: DRAM01
+    type: DRAM
+    x_normalized: 0.2327487696
+    y_normalized: 0.4321222053
+    width_normalized: 0.1345024608
+    height_normalized: 0.1357555893
+  - name: DRAM02
+    type: DRAM
+    x_normalized: 0.6399542586
+    y_normalized: 0.42397687
+    width_normalized: 0.1200914829
+    height_normalized: 0.1520462601
+  - name: HBM00
+    type: HBM
+    x_normalized: 0.4371129446
+    y_normalized: 0.2227285709
+    width_normalized: 0.1257741108
+    height_normalized: 0.1545428582
+  - name: HBM01
+    type: HBM
+    x_normalized: 0.631644505
+    y_normalized: 0.2289102852
+    width_normalized: 0.13671099
+    height_normalized: 0.1421794296
+  - name: HBM02
+    type: HBM
+    x_normalized: 0.8371129446
+    y_normalized: 0.2227285709
+    width_normalized: 0.1257741108
+    height_normalized: 0.1545428582
+  - name: IO00
+    type: IO
+    x_normalized: 0.8339408806
+    y_normalized: 0.4442719953
+    width_normalized: 0.1321182387
+    height_normalized: 0.1114560093
+  - name: IO01
+    type: IO
+    x_normalized: 0.0507021497
+    y_normalized: 0.6253244738
+    width_normalized: 0.0985957005
+    height_normalized: 0.1493510525
+  - name: IO02
+    type: IO
+    x_normalized: 0.2339408806
+    y_normalized: 0.6442719953
+    width_normalized: 0.1321182387
+    height_normalized: 0.1114560093
+  - name: MEMS00
+    type: MEMS
+    x_normalized: 0.2492558933
+    y_normalized: 0.8506679033
+    width_normalized: 0.1014882133
+    height_normalized: 0.0986641935
+  - name: MEMS01
+    type: MEMS
+    x_normalized: 0.4563600683
+    y_normalized: 0.8426370968
+    width_normalized: 0.0872798635
+    height_normalized: 0.1147258064
+  - name: MEMS02
+    type: MEMS
+    x_normalized: 0.6492558933
+    y_normalized: 0.8506679033
+    width_normalized: 0.1014882133
+    height_normalized: 0.0986641935
+  - name: MEMS03
+    type: MEMS
+    x_normalized: 0.8563600683
+    y_normalized: 0.8426370968
+    width_normalized: 0.0872798635
+    height_normalized: 0.1147258064
+  - name: NPU00
+    type: NPU
+    x_normalized: 0.620926494
+    y_normalized: 0.0106125585
+    width_normalized: 0.1581470119
+    height_normalized: 0.178774883
+  - name: NPU01
+    type: NPU
+    x_normalized: 0.820926494
+    y_normalized: 0.0106125585
+    width_normalized: 0.1581470119
+    height_normalized: 0.178774883
+  - name: NPU02
+    type: NPU
+    x_normalized: 0.020926494
+    y_normalized: 0.2106125585
+    width_normalized: 0.1581470119
+    height_normalized: 0.178774883
+  - name: NPU03
+    type: NPU
+    x_normalized: 0.220926494
+    y_normalized: 0.2106125585
+    width_normalized: 0.1581470119
+    height_normalized: 0.178774883
+future_workload_contract:
+  workloads_per_family: 200
+  fixed_fields:
+  - package dimensions
+  - grid convention
+  - chiplet IDs/types/rectangles
+  - thermal stack
+  - cooling configuration
+  - ambient convention
+  - HotSpot settings
+  variable_fields:
+  - chiplet activity
+  - chiplet power_W
+  - chiplet power_density_W_per_mm2

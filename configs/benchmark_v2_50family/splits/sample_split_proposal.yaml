@@ -1,0 +1,8 @@
+schema_version: benchmark_v2_preliminary_workload_split/1
+benchmark_id: benchmark_v2_50family
+status: proposal_only_workloads_not_generated
+per_family:
+  train_workload_count: 160
+  val_workload_count: 20
+  test_workload_count: 20
+assignment_policy: deterministic stratification within each future workload category

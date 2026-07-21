@@ -1,0 +1,66 @@
+schema_version: benchmark_v2_rotational_family_groups/1
+benchmark_id: benchmark_v2_50family
+status: preliminary_stage1
+groups:
+  group_01:
+  - f001
+  - f011
+  - f021
+  - f031
+  - f041
+  group_02:
+  - f002
+  - f012
+  - f022
+  - f032
+  - f042
+  group_03:
+  - f003
+  - f013
+  - f023
+  - f033
+  - f043
+  group_04:
+  - f004
+  - f014
+  - f024
+  - f034
+  - f044
+  group_05:
+  - f005
+  - f015
+  - f025
+  - f035
+  - f045
+  group_06:
+  - f006
+  - f016
+  - f026
+  - f036
+  - f046
+  group_07:
+  - f007
+  - f017
+  - f027
+  - f037
+  - f047
+  group_08:
+  - f008
+  - f018
+  - f028
+  - f038
+  - f048
+  group_09:
+  - f009
+  - f019
+  - f029
+  - f039
+  - f049
+  group_10:
+  - f010
+  - f020
+  - f030
+  - f040
+  - f050
+fold_policy: fold k test=group k, val=group ((k mod 10)+1), train=remaining eight
+  groups
