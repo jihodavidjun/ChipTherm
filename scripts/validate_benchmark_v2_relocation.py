@@ -16,7 +16,7 @@ from chiptherm.benchmark_v2_pipeline import STAGE_SPECS, relocate_pilot
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Relocate and validate the Benchmark v2 pilot tree.")
+    parser = argparse.ArgumentParser(description="Relocate and validate a Benchmark v2 pilot or full-stage tree.")
     parser.add_argument("--source-root", default=os.environ.get("CHIPTHERM_V2_DATA_ROOT"), type=Path)
     parser.add_argument("--destination-root", required=True, type=Path)
     parser.add_argument("--residual-checkpoint", default=None, type=Path)
@@ -35,6 +35,10 @@ def main() -> int:
     print(f"Relocation passed: {report['passed']}")
     print(f"Files checked: {report['destination_file_count']}")
     print(f"Samples loaded: {report['loaded_samples']}")
+    accounting = report.get("physical_copy_accounting", {})
+    print(f"Bulk files hard-linked: {accounting.get('hardlinked_bulk_files', 0)}")
+    print(f"Bulk files copied: {accounting.get('copied_bulk_files', 0)}")
+    print(f"Metadata files copied: {accounting.get('copied_metadata_files', 0)}")
     return 0
 
 

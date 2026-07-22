@@ -38,6 +38,16 @@ def main() -> int:
     parser.add_argument("--source-lineage", default=REPO_ROOT / "configs/benchmark_v2_50family/source_response_lineage_prototype_seed1.json", type=Path)
     parser.add_argument("--residual-checkpoint", default=None, type=Path)
     parser.add_argument("--source-device", default="cpu", choices=["cpu", "cuda", "mps", "auto"])
+    parser.add_argument("--min-free-gb", default=100.0, type=float)
+    parser.add_argument("--min-free-fraction", default=0.20, type=float)
+    parser.add_argument("--max-retained-gb", default=2000.0, type=float)
+    parser.add_argument("--max-staging-gb", default=500.0, type=float)
+    parser.add_argument("--override-storage-gate", action="store_true")
+    parser.add_argument("--execution-families", nargs="*", default=None, help="Schedule only these families while retaining the full immutable stage identity.")
+    parser.add_argument("--start-family", default=None, help="Inclusive execution-family lower bound, e.g. f011.")
+    parser.add_argument("--end-family", default=None, help="Inclusive execution-family upper bound, e.g. f020.")
+    parser.add_argument("--max-new-package-runs", default=None, type=int)
+    parser.add_argument("--stop-after-current-family", action="store_true")
     args = parser.parse_args()
 
     if args.data_root is None:
@@ -45,6 +55,16 @@ def main() -> int:
     selection_path = (args.pilot_selection or STAGE_SPECS[args.stage].selection_path).resolve()
     selection = load_selection(selection_path)
     selected = tuple(args.selected_families or [row["family_uid"] for row in selection["selected_families"]])
+    execution_families = list(args.execution_families or [])
+    if args.start_family or args.end_family:
+        lower = args.start_family or selected[0]
+        upper = args.end_family or selected[-1]
+        ranged = [uid for uid in selected if lower <= uid <= upper]
+        if not ranged:
+            raise SystemExit(f"family range [{lower}, {upper}] selects no stage families")
+        if execution_families and set(execution_families) != set(ranged):
+            raise SystemExit("--execution-families conflicts with --start-family/--end-family")
+        execution_families = ranged
     data_root = args.data_root.expanduser().resolve()
     scratch_root = (args.scratch_root or data_root / "staging").expanduser().resolve()
     run_id = args.run_id or f"pilot-{args.seed}-{uuid.uuid4().hex[:10]}"
@@ -69,6 +89,14 @@ def main() -> int:
         residual_checkpoint=args.residual_checkpoint.expanduser().resolve() if args.residual_checkpoint else None,
         source_device=args.source_device,
         stage=args.stage,
+        min_free_gb=float(args.min_free_gb),
+        min_free_fraction=float(args.min_free_fraction),
+        max_retained_gb=float(args.max_retained_gb),
+        max_staging_gb=float(args.max_staging_gb),
+        override_storage_gate=bool(args.override_storage_gate),
+        execution_family_uids=tuple(execution_families) if execution_families else None,
+        max_new_package_runs=args.max_new_package_runs,
+        stop_after_current_family=bool(args.stop_after_current_family),
     )
     print(f"Benchmark: benchmark_v2_50family")
     print(f"Stage: {args.stage}")
@@ -76,6 +104,8 @@ def main() -> int:
     print(f"Scratch root: {scratch_root}")
     print(f"Run ID: {run_id}")
     print(f"Selected families: {', '.join(selected)}")
+    if execution_families:
+        print(f"Execution families: {', '.join(execution_families)}")
     report = build_pilot(options)
     print(f"Pilot status: {report['status']}")
     print(f"Workloads: {report['workload_count']}")

@@ -1,0 +1,52 @@
+schema_version: benchmark_v2_workload_cell_spec/2
+benchmark_id: benchmark_v2_50family
+stage: full_50x200
+matrix: 10_power_regimes_x_20_activity_topology_regimes
+cell_count: 200
+ordering:
+  - ordinals: [1, 50]
+    rule: accepted_phase3_5x10_prefix
+  - ordinals: [51, 100]
+    rule: accepted_five_power_regimes_x_ten_added_topologies
+  - ordinals: [101, 200]
+    rule: five_added_power_regimes_x_all_twenty_topologies
+accepted_phase3_prefix: true
+cell_identity_sha256: 499d0b8232d53a52faf577389f323f319cb123929454c258ae1e7f1fde93de26
+power_regimes:
+  - {key: phase2_reference, load_fraction: null, broad_stratum: reference}
+  - {key: very_low, load_fraction: 0.06, broad_stratum: very_low}
+  - {key: moderate, load_fraction: 0.36, broad_stratum: medium}
+  - {key: high, load_fraction: 0.72, broad_stratum: high}
+  - {key: stress, load_fraction: 0.96, broad_stratum: stress}
+  - {key: low, load_fraction: 0.16, broad_stratum: low}
+  - {key: medium_low, load_fraction: 0.28, broad_stratum: medium_low}
+  - {key: medium, load_fraction: 0.52, broad_stratum: medium}
+  - {key: medium_high, load_fraction: 0.64, broad_stratum: medium_high}
+  - {key: very_high, load_fraction: 0.84, broad_stratum: high}
+topology_regimes:
+  - balanced
+  - memory_dominant
+  - compute_dominant
+  - type_specific
+  - heterogeneous_cross_type
+  - dense_balanced
+  - single_source_dominant
+  - clustered_interaction
+  - spatially_distributed_sparse
+  - dense_cross_type
+  - io_analog_mems_dominant
+  - two_source_near
+  - two_source_far
+  - three_source_cluster
+  - edge_corner_dominant
+  - center_dominant
+  - sparse_asymmetric
+  - medium_density_asymmetric
+  - dense_asymmetric
+  - symmetric_pairs
+required_coverage:
+  power: [very_low, low, medium_low, medium, medium_high, high, stress]
+  activity: [sparse, medium_density, dense]
+  interaction: [single_source, two_source, three_or_more_source, clustered, distributed]
+  placement: [edge_corner, center, symmetric, asymmetric]
+  type: [compute, memory, io_analog_mems, heterogeneous_cross_type]

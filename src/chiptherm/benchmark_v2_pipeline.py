@@ -23,8 +23,10 @@ import yaml
 
 from .benchmark_v2 import BENCHMARK_ID, validate_family_spec
 from .benchmark_v2_workloads import (
+    FULL_STAGE,
     PHASE2_STAGE,
     PHASE3_STAGE,
+    full_workload_cells,
     load_family,
     scale_workload_cells,
     validate_workload,
@@ -125,6 +127,14 @@ STAGE_SPECS: dict[str, PilotStageSpec] = {
         REPO_ROOT / "configs/benchmark_v2_50family/pilot_10x50.yaml",
         True,
     ),
+    FULL_STAGE: PilotStageSpec(
+        FULL_STAGE,
+        50,
+        200,
+        10000,
+        REPO_ROOT / "configs/benchmark_v2_50family/full_50x200.yaml",
+        True,
+    ),
 }
 
 
@@ -181,6 +191,14 @@ class PilotBuildOptions:
     residual_checkpoint: Path | None = None
     source_device: str = "cpu"
     stage: str = PILOT_STAGE
+    min_free_gb: float = 100.0
+    min_free_fraction: float = 0.20
+    max_retained_gb: float = 2000.0
+    max_staging_gb: float = 500.0
+    override_storage_gate: bool = False
+    execution_family_uids: tuple[str, ...] | None = None
+    max_new_package_runs: int | None = None
+    stop_after_current_family: bool = False
 
 
 def utc_now() -> str:
@@ -359,6 +377,64 @@ def ensure_phase2_snapshot(data_root: Path) -> dict[str, Any]:
     return current
 
 
+def accepted_pilot_immutability_snapshot(data_root: Path) -> dict[str, Any]:
+    """Hash accepted Phase 2 and Phase 3 artifacts before the full build."""
+    phase2 = phase2_immutability_snapshot(data_root)
+    roots = [
+        f"canonical/stages/{PHASE3_STAGE}",
+        f"derived/stages/{PHASE3_STAGE}",
+        f"derived/indices/{PHASE3_STAGE}",
+    ]
+    files: list[dict[str, Any]] = []
+    for relative in roots:
+        root = data_root / relative
+        if not root.exists():
+            continue
+        for path in sorted(item for item in root.rglob("*") if item.is_file()):
+            files.append(
+                {
+                    "path": data_root_relative(path, data_root),
+                    "sha256": sha256_file(path),
+                    "size": path.stat().st_size,
+                }
+            )
+    manifest_root = data_root / "canonical/manifests"
+    for pattern in (f"{PHASE3_STAGE}_*.json", f"artifacts/{PHASE3_STAGE}_*.json"):
+        for path in sorted(manifest_root.glob(pattern)):
+            files.append(
+                {
+                    "path": data_root_relative(path, data_root),
+                    "sha256": sha256_file(path),
+                    "size": path.stat().st_size,
+                }
+            )
+    phase3_digest = sha256_json([(row["path"], row["sha256"]) for row in files])
+    return {
+        "schema_version": "benchmark_v2_accepted_pilot_immutability/1",
+        "phase2": phase2,
+        "phase3": {
+            "available": bool(files),
+            "file_count": len(files),
+            "content_sha256": phase3_digest,
+            "files": files,
+        },
+        "available": bool(phase2.get("available")) and bool(files),
+        "content_sha256": sha256_json([phase2.get("content_sha256"), phase3_digest]),
+    }
+
+
+def ensure_accepted_pilot_snapshot(data_root: Path) -> dict[str, Any]:
+    path = data_root / f"canonical/manifests/{FULL_STAGE}_accepted_pilot_snapshot.json"
+    current = accepted_pilot_immutability_snapshot(data_root)
+    if path.exists():
+        expected = load_json(path)
+        if expected.get("available") and current.get("content_sha256") != expected.get("content_sha256"):
+            raise ValueError("accepted Phase 2/3 artifacts changed after the Phase 4 immutability snapshot")
+        return expected
+    write_json(path, current)
+    return current
+
+
 def verify_phase1_families(
     family_dir: Path,
     family_manifest_path: Path,
@@ -390,6 +466,21 @@ def load_selection(path: Path, selected_override: Sequence[str] | None = None) -
     stage = str(selection.get("stage", PILOT_STAGE))
     spec = stage_spec(stage)
     rows = list(selection.get("selected_families", []))
+    if not rows and selection.get("selected_family_uids"):
+        rows = []
+        for uid in selection["selected_family_uids"]:
+            family = load_family(REPO_ROOT / "configs/benchmark_v2_50family/families" / f"{uid}.yaml")
+            primary_split = str(family["primary_split"])
+            rows.append(
+                {
+                    "family_uid": str(uid),
+                    "primary_split": primary_split,
+                    "source_isolation_eligibility": "learned_train" if primary_split == "train" else "oracle_only",
+                    "taxonomy_category": str(family.get("taxonomy", {}).get("primary_category", "phase1_fixed_family")),
+                    "role": f"full_{primary_split}",
+                }
+            )
+        selection["selected_families"] = rows
     configured = [str(row["family_uid"]) for row in rows]
     selected = list(selected_override or configured)
     if len(selected) != spec.family_count or len(set(selected)) != spec.family_count:
@@ -400,6 +491,20 @@ def load_selection(path: Path, selected_override: Sequence[str] | None = None) -
         if missing:
             raise ValueError(f"selected overrides are absent from pilot selection config: {missing}")
         selection["selected_families"] = [role_by_uid[uid] for uid in selected]
+    if stage == FULL_STAGE:
+        declared_split = selection.get("primary_family_split", {})
+        derived_split = {
+            split: sorted(str(row["family_uid"]) for row in selection["selected_families"] if row["primary_split"] == split)
+            for split in ("train", "val", "test")
+        }
+        normalized_declared = {split: sorted(str(uid) for uid in declared_split.get(split, [])) for split in derived_split}
+        if normalized_declared != derived_split or {key: len(value) for key, value in derived_split.items()} != {"train": 40, "val": 5, "test": 5}:
+            raise ValueError(f"full_50x200 primary split differs from immutable Phase 1 family splits: {derived_split}")
+        policy = selection.get("source_response_policy", {})
+        if sorted(str(uid) for uid in policy.get("train_eligible_families", [])) != derived_split["train"]:
+            raise ValueError("full_50x200 source train eligibility must equal the 40 primary train families")
+        if sorted(str(uid) for uid in policy.get("oracle_only_families", [])) != sorted(derived_split["val"] + derived_split["test"]):
+            raise ValueError("full_50x200 oracle-only families must equal primary validation and test families")
     declared_hash = selection.get("selection_content_sha256")
     if declared_hash:
         hash_payload = dict(selection)
@@ -414,18 +519,31 @@ def load_selection(path: Path, selected_override: Sequence[str] | None = None) -
         expected_cell_hash = str(workload_design.get("workload_cell_spec_sha256", ""))
         if not cell_spec_path.is_file() or sha256_file(cell_spec_path) != expected_cell_hash:
             raise ValueError(f"{stage} workload-cell specification hash mismatch: {cell_spec_path}")
-        frozen_cells = load_yaml(cell_spec_path).get("cells", [])
-        generated_cells = scale_workload_cells()
-        frozen_identity = [
-            (int(row["workload_ordinal"]), str(row["power_regime"]), str(row["topology_regime"]))
-            for row in frozen_cells
-        ]
+        cell_spec = load_yaml(cell_spec_path)
+        frozen_cells = cell_spec.get("cells", [])
+        generated_cells = full_workload_cells() if stage == FULL_STAGE else scale_workload_cells()
         generated_identity = [
             (int(row["workload_ordinal"]), str(row["power_regime"]), str(row["topology_regime"]))
             for row in generated_cells
         ]
-        if frozen_identity != generated_identity:
-            raise ValueError(f"{stage} workload generator differs from the frozen 50-cell specification")
+        if frozen_cells:
+            frozen_identity = [
+                (int(row["workload_ordinal"]), str(row["power_regime"]), str(row["topology_regime"]))
+                for row in frozen_cells
+            ]
+            if frozen_identity != generated_identity:
+                raise ValueError(f"{stage} workload generator differs from its frozen cell specification")
+        elif str(cell_spec.get("cell_identity_sha256", "")) != sha256_json(generated_identity):
+            raise ValueError(f"{stage} compact workload-cell identity hash differs from the generator")
+    assignment = selection.get("sample_split_assignment", {})
+    for split in ("train", "val", "test"):
+        key = f"{split}_workload_ordinals"
+        range_key = f"{split}_workload_ordinal_range"
+        if key not in assignment and range_key in assignment:
+            start, end = (int(value) for value in assignment[range_key])
+            assignment[key] = list(range(start, end + 1))
+    if assignment:
+        selection["sample_split_assignment"] = assignment
     return selection
 
 
@@ -470,6 +588,11 @@ def validate_source_checkpoint_lineage(
     overlap = sorted(fit_families & forbidden)
     if overlap:
         raise ValueError(f"source-response checkpoint leaks pilot val/test families: {overlap}")
+    train_eligible = set(str(value) for value in policy["train_eligible_families"])
+    v2_fit_families = {value for value in fit_families if value.startswith("f") and value[1:].isdigit()}
+    outside_train = sorted(v2_fit_families - train_eligible)
+    if outside_train:
+        raise ValueError(f"source-response checkpoint uses Benchmark v2 families outside the declared train set: {outside_train}")
     if lineage.get("target") != "isolated_source_temperature_rise_K_per_W":
         raise ValueError("source-response lineage target is incompatible")
     return lineage
@@ -565,6 +688,73 @@ def workload_rows(
                 raise ValueError("\n".join(problems))
             rows.append(workload)
     return rows
+
+
+def write_full_workload_design_reports(
+    data_root: Path,
+    workloads: Sequence[dict[str, Any]],
+    families: Mapping[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Write checkpoint-independent coverage diagnostics before HotSpot starts."""
+    coverage_path = data_root / f"canonical/manifests/{FULL_STAGE}_workload_coverage.csv"
+    rows = [
+        {
+            "family_uid": row["family_uid"],
+            "workload_uid": row["workload_uid"],
+            "sample_uid": row["sample_uid"],
+            "workload_cell": row["workload_cell"],
+            "broad_stratum": row.get("broad_stratum", ""),
+            "sub_stratum": row.get("sub_stratum", ""),
+            "power_regime": row.get("power_regime", ""),
+            "topology_regime": row.get("topology_regime", ""),
+            "active_chiplet_count": row["active_chiplet_count"],
+            "active_chiplet_fraction": row["active_chiplet_fraction"],
+            "dominant_chiplet_share": row["dominant_chiplet_share"],
+            "total_package_power_W": row["total_package_power_W"],
+            "content_hash": row["content_hash"],
+            "family_structural_fingerprint": families[str(row["family_uid"])]["structural_fingerprint"],
+            "validation_status": row.get("validation_status", ""),
+        }
+        for row in workloads
+    ]
+    write_csv(coverage_path, rows)
+    expected_cells = {str(row["workload_cell"]) for row in full_workload_cells()}
+    cells_by_family = {
+        family_uid: {str(row["workload_cell"]) for row in workloads if row["family_uid"] == family_uid}
+        for family_uid in sorted(families)
+    }
+    densities = [
+        float(value)
+        for row in workloads
+        for value in row["chiplet_power_density_W_per_mm2"].values()
+    ]
+    report = {
+        "schema_version": "benchmark_v2_full_workload_design_report/1",
+        "stage": FULL_STAGE,
+        "family_count": len(families),
+        "workload_count": len(workloads),
+        "workloads_per_family": {
+            uid: sum(row["family_uid"] == uid for row in workloads) for uid in sorted(families)
+        },
+        "expected_cell_count": len(expected_cells),
+        "full_cell_coverage": all(cells == expected_cells for cells in cells_by_family.values()),
+        "unique_content_hashes": len({str(row["content_hash"]) for row in workloads}),
+        "geometry_fingerprints": {
+            uid: str(families[uid]["structural_fingerprint"]) for uid in sorted(families)
+        },
+        "distributions": {
+            "total_power_W": _distribution_summary([float(row["total_package_power_W"]) for row in workloads]),
+            "active_chiplet_fraction": _distribution_summary([float(row["active_chiplet_fraction"]) for row in workloads]),
+            "dominant_chiplet_share": _distribution_summary([float(row["dominant_chiplet_share"]) for row in workloads]),
+            "chiplet_power_density_W_per_mm2": _distribution_summary(densities),
+        },
+        "coverage_csv": data_root_relative(coverage_path, data_root),
+        "passed": len(workloads) == 10000 and all(cells == expected_cells for cells in cells_by_family.values()),
+    }
+    write_json(data_root / f"canonical/manifests/{FULL_STAGE}_workload_design_report.json", report)
+    if not report["passed"]:
+        raise ValueError("full workload design report failed before HotSpot execution")
+    return report
 
 
 def write_canonical_sample_source(
@@ -730,6 +920,9 @@ def validated_existing_sample(sample_root: Path, family: dict[str, Any], workloa
         target = np.load(target_path, mmap_mode="r")
         source_family = load_yaml(sample_root / "source/family.yaml")
         source_workload = load_yaml(sample_root / "source/workload.yaml")
+        source_package = load_yaml(sample_root / "source/package.yaml")
+        source_hotspot = load_yaml(sample_root / "source/hotspot.yaml")
+        source_hashes = manifest.get("source_hashes", {})
     except Exception:
         return False
     return bool(
@@ -737,9 +930,72 @@ def validated_existing_sample(sample_root: Path, family: dict[str, Any], workloa
         and manifest.get("sample_uid") == workload.get("sample_uid")
         and source_family.get("structural_fingerprint") == family.get("structural_fingerprint")
         and source_workload.get("content_hash") == workload.get("content_hash")
+        and sha256_json(source_package) == sha256_json(family["fixed_structure"]["thermal_stack"])
+        and sha256_json(source_hotspot) == sha256_json(family["fixed_structure"]["hotspot"])
+        and all(
+            not source_hashes.get(name) or sha256_file(sample_root / "source" / name) == source_hashes[name]
+            for name in ("layout.json", "power.yaml", "package.yaml", "hotspot.yaml", "family.yaml", "workload.yaml")
+        )
         and tuple(target.shape) == GRID_SHAPE
         and np.isfinite(np.asarray(target)).all()
     )
+
+
+def reusable_pilot_sample(
+    paths: PilotPaths,
+    family: dict[str, Any],
+    workload: dict[str, Any],
+    phase3_catalog: Mapping[str, Mapping[str, str]] | None = None,
+) -> tuple[Path, str] | None:
+    """Find an immutable accepted pilot sample with the exact full-stage content."""
+    if paths.stage not in {PHASE3_STAGE, FULL_STAGE}:
+        return None
+    uid = str(workload["sample_uid"])
+    candidates: list[tuple[Path, str, str]] = []
+    if paths.stage == FULL_STAGE:
+        catalog = phase3_catalog if phase3_catalog is not None else pilot_hotspot_catalog(paths.data_root)
+        row = catalog.get(uid)
+        if row is not None:
+            candidates.append(
+                (
+                    resolve_data_path(str(row["sample_root"]), paths.data_root),
+                    str(row.get("ownership_stage") or PHASE3_STAGE),
+                    str(row.get("workload_content_sha256", "")),
+                )
+            )
+    phase2_root = paths.data_root / "canonical/hotspot_labels" / str(workload["family_uid"]) / uid
+    candidates.append((phase2_root, PHASE2_STAGE, str(workload["content_hash"])))
+    valid = [
+        (root, owner)
+        for root, owner, workload_hash in candidates
+        if workload_hash == str(workload["content_hash"])
+        and validated_existing_sample(root, family, workload)
+    ]
+    if not valid:
+        return None
+    unique = {(str(root.resolve()), owner) for root, owner in valid}
+    if len(unique) > 1:
+        # Multiple references are acceptable only when they resolve to the
+        # same physical immutable sample.
+        physical = {item[0] for item in unique}
+        if len(physical) != 1:
+            raise ValueError(f"ambiguous pilot reuse candidates for {uid}: {sorted(unique)}")
+    root, owner = valid[0]
+    return root, owner
+
+
+def pilot_hotspot_catalog(data_root: Path) -> dict[str, dict[str, str]]:
+    path = data_root / f"canonical/stages/{PHASE3_STAGE}/hotspot_labels/sample_index.csv"
+    if not path.is_file():
+        return {}
+    rows = read_csv(path)
+    catalog: dict[str, dict[str, str]] = {}
+    for row in rows:
+        uid = str(row.get("sample_uid", ""))
+        if not uid or uid in catalog:
+            raise ValueError(f"Phase 3 HotSpot reuse catalog has missing/duplicate UID: {uid!r}")
+        catalog[uid] = dict(row)
+    return catalog
 
 
 def generate_hotspot_samples(
@@ -752,13 +1008,28 @@ def generate_hotspot_samples(
     workers: int,
     resume: bool,
     dry_run: bool,
+    execution_family_uids: Sequence[str] | None = None,
+    max_new_package_runs: int | None = None,
+    stop_after_current_family: bool = False,
 ) -> dict[str, Any]:
     stage_root = paths.run_root / "hotspot_labels"
     stage_root.mkdir(parents=True, exist_ok=True)
     accepted_root = paths.canonical("hotspot_labels")
     scheduled: list[tuple[dict[str, Any], Path]] = []
+    planned_new = 0
     skipped: list[str] = []
-    reused_phase2: list[str] = []
+    reused_samples: dict[str, tuple[Path, str]] = {}
+    deferred: dict[str, str] = {}
+    execution_families = set(str(value) for value in execution_family_uids or families)
+    missing_execution_families = sorted(execution_families - set(families))
+    if missing_execution_families:
+        raise ValueError(f"execution families are outside the selected stage: {missing_execution_families}")
+    if stop_after_current_family:
+        first = next((str(row["family_uid"]) for row in workloads if str(row["family_uid"]) in execution_families), None)
+        execution_families = {first} if first else set()
+    if max_new_package_runs is not None and max_new_package_runs < 0:
+        raise ValueError("max_new_package_runs must be nonnegative")
+    phase3_catalog = pilot_hotspot_catalog(paths.data_root) if paths.stage == FULL_STAGE else {}
     for workload in workloads:
         family_uid = str(workload["family_uid"])
         sample_uid = str(workload["sample_uid"])
@@ -766,13 +1037,23 @@ def generate_hotspot_samples(
         if resume and validated_existing_sample(accepted, families[family_uid], workload):
             skipped.append(sample_uid)
             continue
-        phase2_sample = paths.data_root / "canonical" / "hotspot_labels" / family_uid / sample_uid
-        if (
-            paths.stage == PHASE3_STAGE
-            and bool(workload.get("phase2_reference"))
-            and validated_existing_sample(phase2_sample, families[family_uid], workload)
-        ):
-            reused_phase2.append(sample_uid)
+        reusable = reusable_pilot_sample(paths, families[family_uid], workload, phase3_catalog)
+        if reusable is not None:
+            reused_samples[sample_uid] = reusable
+            continue
+        if family_uid not in execution_families:
+            deferred[sample_uid] = "family_not_selected_for_this_execution"
+            continue
+        if max_new_package_runs is not None and planned_new >= max_new_package_runs:
+            deferred[sample_uid] = "max_new_package_runs_reached"
+            continue
+        if dry_run and paths.stage == FULL_STAGE:
+            planned_new += 1
+            if int(str(workload["workload_uid"])[1:4]) == 1:
+                representative = paths.run_root / "dry_run_representative_sources" / family_uid / sample_uid
+                if representative.exists():
+                    shutil.rmtree(representative)
+                write_canonical_sample_source(representative, families[family_uid], workload)
             continue
         stage = stage_root / family_uid / sample_uid
         if stage.exists():
@@ -780,6 +1061,7 @@ def generate_hotspot_samples(
             retry_destination.parent.mkdir(parents=True, exist_ok=True)
             stage.replace(retry_destination)
         write_canonical_sample_source(stage, families[family_uid], workload)
+        planned_new += 1
         if dry_run:
             write_json(
                 stage / "manifest.json",
@@ -841,56 +1123,73 @@ def generate_hotspot_samples(
                     }
                     failures.append(failure)
                     write_json(stage / "failure.json", failure)
-                processed = len(completed) + len(failures)
+                launched_processed = len(completed) + len(failures)
+                processed = len(skipped) + len(reused_samples) + launched_processed
                 peak_staging_bytes = max(peak_staging_bytes, _tree_size(paths.run_root))
-                if processed == len(scheduled) or processed % max(1, min(10, len(scheduled))) == 0:
+                if launched_processed == len(scheduled) or launched_processed % max(1, min(10, len(scheduled))) == 0:
                     elapsed = time.perf_counter() - progress_started
-                    rate = processed / elapsed if elapsed > 0 else 0.0
-                    eta = (len(scheduled) - processed) / rate if rate > 0 else None
+                    rate = launched_processed / elapsed if elapsed > 0 else 0.0
+                    eta = (len(scheduled) - launched_processed) / rate if rate > 0 else None
                     promoted_bytes = sum(
                         _tree_size(accepted_root / str(item["family_uid"]) / str(item["sample_uid"]))
                         for item, _ in scheduled
                         if str(item["sample_uid"]) in completed
                     )
                     print(
-                        f"HotSpot progress {processed}/{len(scheduled)} "
+                        f"HotSpot progress {processed}/{len(workloads)} "
                         f"family={workload['family_uid']} successes={len(completed)} failures={len(failures)} "
                         f"retries={retry_count} elapsed_s={elapsed:.1f} "
-                        f"eta_s={eta:.1f} promoted_bytes={promoted_bytes}"
+                        f"eta_s={eta:.1f} promoted_bytes={promoted_bytes} "
+                        f"staging_bytes={peak_staging_bytes} reused={len(reused_samples)}"
                         if eta is not None
-                        else f"HotSpot progress {processed}/{len(scheduled)} family={workload['family_uid']}"
+                        else f"HotSpot progress {processed}/{len(workloads)} family={workload['family_uid']}"
                     )
+    reused_by_stage: dict[str, int] = {}
+    for _, owner in reused_samples.values():
+        reused_by_stage[owner] = reused_by_stage.get(owner, 0) + 1
+    complete = not failures and not deferred and len(skipped) + len(reused_samples) + len(completed) == len(workloads)
     report = {
         "schema_version": "benchmark_v2_hotspot_generation_report/1",
         "requested": len(workloads),
         "scheduled": len(scheduled),
         "completed": len(completed),
         "skipped_valid": len(skipped),
-        "reused_phase2": len(reused_phase2),
+        "reused_phase2": reused_by_stage.get(PHASE2_STAGE, 0),
+        "reused_pilot": len(reused_samples),
+        "reused_by_ownership_stage": reused_by_stage,
+        "deferred": len(deferred),
+        "deferred_uids": deferred,
+        "complete": complete,
         "failed": len(failures),
         "retry_count": retry_count,
         "completed_uids": sorted(completed),
         "skipped_uids": sorted(skipped),
-        "reused_phase2_uids": sorted(reused_phase2),
+        "reused_phase2_uids": sorted(uid for uid, (_, owner) in reused_samples.items() if owner == PHASE2_STAGE),
+        "reused_pilot_uids": sorted(reused_samples),
         "failures": failures,
         "hotspot_executable_sha256": executable_sha,
         "dry_run": dry_run,
-        "dry_run_source_count": len(workloads) - len(reused_phase2) if dry_run else 0,
+        "dry_run_source_count": planned_new if dry_run else 0,
+        "dry_run_representative_source_count": (
+            len(list((paths.run_root / "dry_run_representative_sources").glob("f*/f*/source/scenario.yaml")))
+            if dry_run and paths.stage == FULL_STAGE
+            else planned_new if dry_run else 0
+        ),
         "peak_staging_bytes_observed": peak_staging_bytes,
     }
     write_json(paths.run_root / "hotspot_generation_report.json", report)
     write_csv(paths.run_root / "hotspot_failures.csv", failures)
     if failures:
         raise RuntimeError(f"HotSpot failed for {len(failures)} pilot samples; staging outputs were retained")
-    if not dry_run:
+    if not dry_run and complete:
         collection_rows: list[dict[str, Any]] = []
-        reused_set = set(reused_phase2)
         for workload in workloads:
             family_uid = str(workload["family_uid"])
             sample_uid = str(workload["sample_uid"])
             sample_root = accepted_root / family_uid / sample_uid
-            if sample_uid in reused_set:
-                sample_root = paths.data_root / "canonical/hotspot_labels" / family_uid / sample_uid
+            ownership_stage = paths.stage
+            if sample_uid in reused_samples:
+                sample_root, ownership_stage = reused_samples[sample_uid]
             if not validated_existing_sample(sample_root, families[family_uid], workload):
                 raise ValueError(f"logical HotSpot collection contains an invalid sample after generation: {sample_uid}")
             collection_rows.append(
@@ -901,8 +1200,8 @@ def generate_hotspot_samples(
                     "workload_content_sha256": workload["content_hash"],
                     "sample_root": data_root_relative(sample_root, paths.data_root),
                     "target_path": data_root_relative(sample_root / "parsed/temp_layer0.npy", paths.data_root),
-                    "ownership_stage": PHASE2_STAGE if sample_uid in reused_set else paths.stage,
-                    "reused_by_content_hash": str(sample_uid in reused_set).lower(),
+                    "ownership_stage": ownership_stage,
+                    "reused_by_content_hash": str(sample_uid in reused_samples).lower(),
                 }
             )
         write_csv(accepted_root / "sample_index.csv", collection_rows)
@@ -912,7 +1211,8 @@ def generate_hotspot_samples(
                 "schema_version": "benchmark_v2_hotspot_collection/1",
                 "stage": paths.stage,
                 "sample_count": len(collection_rows),
-                "reused_phase2_count": len(reused_phase2),
+                "reused_pilot_count": len(reused_samples),
+                "reused_by_ownership_stage": reused_by_stage,
                 "path_semantics": PATH_SEMANTICS,
             },
         )
@@ -941,20 +1241,21 @@ def raw_index_rows(
         for ordinal in sample_assignment[key]
     }
     rows: list[dict[str, str]] = []
+    phase3_catalog = pilot_hotspot_catalog(paths.data_root) if paths.stage == FULL_STAGE else {}
     for workload in workloads:
         uid = str(workload["sample_uid"])
         family_uid = str(workload["family_uid"])
         ordinal = int(str(workload["workload_uid"])[1:4])
         sample_root = paths.canonical("hotspot_labels") / family_uid / uid
-        if not (sample_root / "parsed/temp_layer0.npy").exists() and paths.stage == PHASE3_STAGE:
-            phase2_sample = paths.data_root / "canonical" / "hotspot_labels" / family_uid / uid
-            if bool(workload.get("phase2_reference")) and validated_existing_sample(
-                phase2_sample, families[family_uid], workload
-            ):
-                sample_root = phase2_sample
+        if not (sample_root / "parsed/temp_layer0.npy").exists():
+            reusable = reusable_pilot_sample(paths, families[family_uid], workload, phase3_catalog)
+            if reusable is not None:
+                sample_root = reusable[0]
         target = sample_root / "parsed/temp_layer0.npy"
         if not target.exists():
             raise FileNotFoundError(f"missing validated label for {uid}: {target}")
+        family_split = str(families[family_uid]["primary_split"])
+        sample_split = sample_split_by_ordinal[ordinal]
         rows.append(
             {
                 "benchmark_id": BENCHMARK_ID,
@@ -970,9 +1271,12 @@ def raw_index_rows(
                 "topology_regime": str(workload.get("topology_regime", workload["stratum"])),
                 "active_chiplet_fraction": str(workload.get("active_chiplet_fraction", "")),
                 "dominant_chiplet_share": str(workload.get("dominant_chiplet_share", "")),
-                "split": sample_split_by_ordinal[ordinal],
-                "sample_split": sample_split_by_ordinal[ordinal],
-                "family_split": str(families[family_uid]["primary_split"]),
+                # Full-stage normalization is fit only on primary train
+                # families. The secondary workload split remains a separate
+                # train-family-only protocol below.
+                "split": family_split if paths.stage == FULL_STAGE else sample_split,
+                "sample_split": sample_split,
+                "family_split": family_split,
                 "layout_path": data_root_relative(sample_root / "source/layout.json", paths.data_root),
                 "power_path": data_root_relative(sample_root / "source/power.yaml", paths.data_root),
                 "package_path": data_root_relative(sample_root / "source/package.yaml", paths.data_root),
@@ -1107,6 +1411,11 @@ def build_derived_pipeline(
                 "checkpoint_sha256": sha256_file(portable_checkpoint),
                 "lineage_sha256": sha256_json(source_lineage),
                 "path_semantics": PATH_SEMANTICS,
+                "artifact_status": (
+                    "provisional_source_checkpoint_dependent"
+                    if paths.stage == FULL_STAGE
+                    else "source_checkpoint_dependent"
+                ),
             },
         )
         promote_directory(source_model_stage, source_model_dest, resume=False)
@@ -1130,7 +1439,17 @@ def build_derived_pipeline(
             paths.run_root,
         )
         canonicalize_stage_indices(source_stage, source_dest, paths.data_root)
-        add_source_lineage_columns(source_stage, source_lineage, portable_checkpoint, paths.data_root)
+        add_source_lineage_columns(
+            source_stage,
+            source_lineage,
+            portable_checkpoint,
+            paths.data_root,
+            artifact_status=(
+                "provisional_source_checkpoint_dependent"
+                if paths.stage == FULL_STAGE
+                else "source_checkpoint_dependent"
+            ),
+        )
         promote_directory(source_stage, source_dest, resume=False)
 
     # Source-response records require the encoded X path as well as the raw
@@ -1159,11 +1478,20 @@ def build_isolation_inputs(
     data_root: Path,
 ) -> dict[str, Path]:
     policy = selection["source_response_policy"]
-    family_partition = {
-        **{uid: "train" for uid in policy["train_eligible_families"]},
-        **{uid: "val" for uid in policy["oracle_only_families"][:-1]},
-        **{uid: "test" for uid in policy["oracle_only_families"][-1:]},
+    selected_rows = {
+        str(row["family_uid"]): str(row["primary_split"])
+        for row in selection["selected_families"]
     }
+    family_partition = dict(selected_rows)
+    train_eligible = set(str(uid) for uid in policy["train_eligible_families"])
+    oracle_only = set(str(uid) for uid in policy["oracle_only_families"])
+    declared = set(family_partition)
+    if train_eligible | oracle_only != declared or train_eligible & oracle_only:
+        raise ValueError("source-response policy must partition every selected family exactly once")
+    if any(family_partition[uid] != "train" for uid in train_eligible):
+        raise ValueError("only primary train families may be source-model train eligible")
+    if any(family_partition[uid] not in {"val", "test"} for uid in oracle_only):
+        raise ValueError("validation/test source-isolation families must be oracle-only")
     selected: dict[str, list[dict[str, str]]] = {"train": [], "val": [], "test": []}
     by_family: dict[str, list[dict[str, str]]] = {}
     for row in raw_rows:
@@ -1215,24 +1543,36 @@ def run_source_isolation(
     stage = paths.run_root / "source_isolation"
     reused_rows: dict[str, list[dict[str, str]]] = {"train": [], "val": [], "test": []}
     reused_families: set[str] = set()
-    if paths.stage == PHASE3_STAGE and selection is not None:
-        overlap = {
-            str(row["family_uid"])
+    reuse_root: Path | None = None
+    overlap: set[str] = set()
+    reused_from_stage = ""
+    if selection is not None and paths.stage == PHASE3_STAGE:
+        overlap = {str(row["family_uid"]) for row in selection["selected_families"] if bool(row.get("phase2_overlap"))}
+        reuse_root = paths.data_root / "canonical/source_isolation"
+        reused_from_stage = PHASE2_STAGE
+    elif selection is not None and paths.stage == FULL_STAGE:
+        catalog = pilot_hotspot_catalog(paths.data_root)
+        overlap = {str(row["family_uid"]) for row in catalog.values()}
+        reuse_root = paths.data_root / f"canonical/stages/{PHASE3_STAGE}/source_isolation"
+        reused_from_stage = PHASE3_STAGE
+    if reuse_root is not None and durable_stage_complete(reuse_root):
+        split_by_family = {
+            str(row["family_uid"]): str(row["primary_split"])
             for row in selection["selected_families"]
-            if bool(row.get("phase2_overlap"))
         }
-        phase2_root = paths.data_root / "canonical/source_isolation"
-        if durable_stage_complete(phase2_root):
-            for split in ("train", "val", "test"):
-                for row in read_csv(phase2_root / f"{split}_index.csv"):
-                    family_uid = str(row.get("case_id", row.get("family_uid", "")))
-                    if family_uid not in overlap:
-                        continue
-                    target = str(row.get("target_rise_path", ""))
-                    if not target or not resolve_data_path(target, paths.data_root).is_file():
-                        raise FileNotFoundError(f"cannot reuse Phase 2 source-isolation target for {family_uid}: {target!r}")
-                    reused_rows[split].append(dict(row))
-                    reused_families.add(family_uid)
+        for split in ("train", "val", "test"):
+            for row in read_csv(reuse_root / f"{split}_index.csv"):
+                family_uid = str(row.get("case_id", row.get("family_uid", "")))
+                if family_uid not in overlap:
+                    continue
+                target = str(row.get("target_rise_path", ""))
+                if not target or not resolve_data_path(target, paths.data_root).is_file():
+                    raise FileNotFoundError(f"cannot reuse accepted source-isolation target for {family_uid}: {target!r}")
+                desired_split = split_by_family[family_uid]
+                item = dict(row)
+                item["split"] = desired_split
+                reused_rows[desired_split].append(item)
+                reused_families.add(family_uid)
     generated_families = [uid for uid in selected_families if uid not in reused_families]
     command = [
         sys.executable,
@@ -1250,42 +1590,74 @@ def run_source_isolation(
     if resume:
         command.append("--resume")
     run_checked(command, paths.run_root)
-    if reused_families:
-        combined: list[dict[str, str]] = []
-        for split in ("train", "val", "test"):
-            generated = read_csv(stage / f"{split}_index.csv")
-            rows = generated + reused_rows[split]
-            rows.sort(key=lambda row: (row.get("case_id", ""), row.get("original_sample_uid", ""), int(row.get("source_index") or 0)))
-            write_csv(stage / f"{split}_index.csv", rows)
-            combined.extend(rows)
-        write_csv(stage / "combined_source_index.csv", combined)
-        with (stage / "combined_source_index.jsonl").open("w", encoding="utf-8") as handle:
-            for row in combined:
-                handle.write(json.dumps(row, sort_keys=True) + "\n")
-        manifest_path = stage / "source_response_manifest.json"
-        manifest = load_json(manifest_path)
-        manifest["actual_source_rows"] = {
-            split: len(read_csv(stage / f"{split}_index.csv")) for split in ("train", "val", "test")
-        }
-        manifest["actual_total_source_rows"] = len(combined)
-        manifest["phase2_reuse"] = {
-            "family_uids": sorted(reused_families),
-            "source_rows": sum(len(rows) for rows in reused_rows.values()),
-            "ownership": "root-relative references to accepted immutable Phase 2 targets; arrays are not duplicated",
-        }
-        write_json(manifest_path, manifest)
-        (stage / "README.md").write_text(
-            "# ChipTherm Benchmark v2 Phase 3 source isolation\n\n"
-            f"Source rows: {len(combined)}. Reused Phase 2 families: {', '.join(sorted(reused_families))}.\n",
-            encoding="utf-8",
-        )
-    write_json(
-        stage / "phase2_reuse_report.json",
+    combined: list[dict[str, str]] = []
+    for split in ("train", "val", "test"):
+        generated = read_csv(stage / f"{split}_index.csv")
+        rows = generated + reused_rows[split]
+        rows.sort(key=lambda row: (row.get("case_id", ""), row.get("original_sample_uid", ""), int(row.get("source_index") or 0)))
+        for row in rows:
+            family_uid = str(row.get("case_id", row.get("family_uid", "")))
+            row["family_uid"] = family_uid
+            row["primary_family_split"] = split
+            row["source_isolation_eligibility"] = "learned_train" if split == "train" else "oracle_only"
+            layout_value = str(row.get("layout_path") or row.get("source_layout_path") or "")
+            hotspot_value = str(row.get("hotspot_path") or row.get("source_hotspot_path") or "")
+            target_value = str(row.get("target_rise_path", ""))
+            if layout_value:
+                row["parent_layout_sha256"] = sha256_file(resolve_data_path(layout_value, paths.data_root))
+            if hotspot_value:
+                row["hotspot_config_sha256"] = sha256_file(resolve_data_path(hotspot_value, paths.data_root))
+            if target_value:
+                row["isolation_artifact_sha256"] = sha256_file(resolve_data_path(target_value, paths.data_root))
+        write_csv(stage / f"{split}_index.csv", rows)
+        combined.extend(rows)
+    write_csv(stage / "combined_source_index.csv", combined)
+    with (stage / "combined_source_index.jsonl").open("w", encoding="utf-8") as handle:
+        for row in combined:
+            handle.write(json.dumps(row, sort_keys=True) + "\n")
+    manifest_path = stage / "source_response_manifest.json"
+    manifest = load_json(manifest_path) if manifest_path.is_file() else {}
+    manifest.update(
         {
-            "schema_version": "benchmark_v2_phase2_source_isolation_reuse/1",
+            "schema_version": "benchmark_v2_source_isolation_manifest/2",
+            "stage": paths.stage,
+            "actual_source_rows": {
+                split: len(read_csv(stage / f"{split}_index.csv")) for split in ("train", "val", "test")
+            },
+            "actual_total_source_rows": len(combined),
+            "accepted_pilot_reuse": {
+                "source_stage": reused_from_stage,
+                "family_uids": sorted(reused_families),
+                "source_rows": sum(len(rows) for rows in reused_rows.values()),
+                "ownership": "root-relative references to accepted immutable pilot targets; arrays are not duplicated",
+            },
+            "leakage_policy": {
+                "train_eligible_families": sorted(
+                    str(uid) for uid in selection["source_response_policy"]["train_eligible_families"]
+                ),
+                "oracle_only_families": sorted(
+                    str(uid) for uid in selection["source_response_policy"]["oracle_only_families"]
+                ),
+            },
+        }
+    )
+    write_json(manifest_path, manifest)
+    (stage / "README.md").write_text(
+        f"# ChipTherm Benchmark v2 {paths.stage} source isolation\n\n"
+        f"Source rows: {len(combined)}. Reused accepted-pilot families: "
+        f"{', '.join(sorted(reused_families)) or 'none'}. Validation/test rows are oracle-only.\n",
+        encoding="utf-8",
+    )
+    write_json(
+        stage / "pilot_reuse_report.json",
+        {
+            "schema_version": "benchmark_v2_source_isolation_reuse/2",
+            "stage": paths.stage,
+            "source_stage": reused_from_stage,
             "reused_family_uids": sorted(reused_families),
             "reused_source_rows": sum(len(rows) for rows in reused_rows.values()),
             "generated_family_uids": generated_families,
+            "reuse_source_root": data_root_relative(reuse_root, paths.data_root) if reuse_root is not None and reuse_root.exists() else "",
         },
     )
     canonicalize_stage_indices(stage, destination, paths.data_root)
@@ -1323,6 +1695,11 @@ def create_final_indices(
         result["graph_artifact_id"] = f"{paths.stage}_graphs"
         result["metadata_artifact_id"] = f"{paths.stage}_metadata"
         result["source_superposition_artifact_id"] = f"{paths.stage}_source_superposition"
+        result["source_superposition_status"] = (
+            "provisional_source_checkpoint_dependent"
+            if paths.stage == FULL_STAGE
+            else "source_checkpoint_dependent"
+        )
         for key, value in manifest_ids.items():
             result[key] = value
         enriched.append(result)
@@ -1332,6 +1709,8 @@ def create_final_indices(
             subset: list[dict[str, str]] = []
             for row in enriched:
                 if row.get(split_key) != split:
+                    continue
+                if protocol == "sample_split" and paths.stage == FULL_STAGE and row.get("family_split") != "train":
                     continue
                 item = dict(row)
                 item["split"] = split
@@ -1368,6 +1747,69 @@ def create_final_indices(
                 "workload_cell_count": len({row.get("workload_cell", "") for row in enriched if row["family_uid"] == family_uid}),
             }
             for family_uid in sorted(selected_by_uid)
+        ],
+    )
+    reuse_rows: list[dict[str, str]] = []
+    for row in enriched:
+        logical_source = str(row.get("source_dir", ""))
+        if f"/stages/{PHASE3_STAGE}/" in f"/{logical_source}":
+            ownership = PHASE3_STAGE
+        elif "/canonical/hotspot_labels/" in f"/{logical_source}":
+            ownership = PHASE2_STAGE
+        else:
+            ownership = paths.stage
+        reuse_rows.append(
+            {
+                "sample_uid": row["sample_uid"],
+                "family_uid": row["family_uid"],
+                "workload_content_sha256": row.get("workload_content_sha256", ""),
+                "ownership_stage": ownership,
+                "reused": str(ownership != paths.stage).lower(),
+                "reuse_validation": "content_family_config_hashes_validated",
+            }
+        )
+    write_csv(stage / "reuse_manifest.csv", reuse_rows)
+    hotspot_report_path = paths.run_root / "hotspot_generation_report.json"
+    hotspot_report = load_json(hotspot_report_path) if hotspot_report_path.is_file() else {}
+    failures = list(hotspot_report.get("failures", []))
+    write_csv(
+        stage / "failure_accounting.csv",
+        failures
+        or [
+            {
+                "stage": "hotspot_generation",
+                "requested": hotspot_report.get("requested", len(enriched)),
+                "completed": hotspot_report.get("completed", ""),
+                "skipped_valid": hotspot_report.get("skipped_valid", ""),
+                "reused_pilot": hotspot_report.get("reused_pilot", ""),
+                "failed": hotspot_report.get("failed", 0),
+                "retry_count": hotspot_report.get("retry_count", 0),
+                "status": "fully_accounted" if hotspot_report.get("complete") else "report_unavailable_or_incomplete",
+            }
+        ],
+    )
+    artifact_roots = {
+        "hotspot_labels": paths.canonical("hotspot_labels"),
+        "encoded_13ch": paths.derived("encoded_13ch"),
+        "context_17ch": paths.derived("context_17ch"),
+        "context_33ch": paths.derived("context_33ch"),
+        "metadata": paths.derived("metadata"),
+        "graphs": paths.derived("graphs"),
+        "source_superposition": paths.derived("source_superposition"),
+    }
+    write_csv(
+        stage / "artifact_inventory.csv",
+        [
+            {
+                "artifact_class": name,
+                "root": data_root_relative(root, paths.data_root),
+                "file_count": _tree_file_count(root),
+                "retained_bytes": _tree_size(root),
+                "checkpoint_dependency": (
+                    "provisional_source_checkpoint_dependent" if name == "source_superposition" else "checkpoint_independent"
+                ),
+            }
+            for name, root in artifact_roots.items()
         ],
     )
     for name in ("feature_manifest.json", "graph_manifest.json"):
@@ -1485,6 +1927,8 @@ def add_source_lineage_columns(
     lineage: dict[str, Any],
     checkpoint: Path,
     data_root: Path,
+    *,
+    artifact_status: str = "source_checkpoint_dependent",
 ) -> None:
     lineage_hash = sha256_json(lineage)
     for csv_path in stage_root.glob("*.csv"):
@@ -1495,6 +1939,7 @@ def add_source_lineage_columns(
             row["source_checkpoint"] = data_root_relative(checkpoint, data_root)
             row["source_checkpoint_lineage_sha256"] = lineage_hash
             row["source_checkpoint_training_family_set_sha256"] = sha256_json(sorted(lineage["training_family_uids"]))
+            row["source_superposition_status"] = artifact_status
         write_csv(csv_path, rows)
     combined_path = stage_root / "combined_encoded_index.csv"
     if combined_path.exists():
@@ -1507,6 +1952,7 @@ def add_source_lineage_columns(
         payload["source_checkpoint_lineage_sha256"] = lineage_hash
         payload["source_checkpoint_training_family_uids"] = sorted(str(value) for value in lineage["training_family_uids"])
         payload["source_checkpoint_training_family_set_sha256"] = sha256_json(sorted(lineage["training_family_uids"]))
+        payload["artifact_status"] = artifact_status
         write_json(sidecar, payload)
     manifest_path = stage_root / "manifest.json"
     if manifest_path.exists():
@@ -1514,6 +1960,7 @@ def add_source_lineage_columns(
         payload["source_checkpoint"] = data_root_relative(checkpoint, data_root)
         payload["source_checkpoint_sha256"] = sha256_file(checkpoint)
         payload["source_checkpoint_lineage_sha256"] = lineage_hash
+        payload["artifact_status"] = artifact_status
         write_json(manifest_path, payload)
     write_json(stage_root / "source_checkpoint_lineage.json", lineage)
 
@@ -1910,17 +2357,172 @@ def _is_within(path: Path, root: Path) -> bool:
         return False
 
 
+FULL_FALLBACK_BYTES_PER_SAMPLE = {
+    "canonical_workloads": 20_000,
+    "canonical_hotspot_labels": 1_500_000,
+    "encoded_13ch": 230_000,
+    "context_17ch": 310_000,
+    "context_33ch": 590_000,
+    "metadata": 4_000,
+    "graphs": 80_000,
+    "source_superposition": 40_000,
+    "indices": 12_000,
+}
+
+
+def estimate_full_build_resources(
+    data_root: Path,
+    *,
+    expected_samples: int = 10000,
+    reusable_package_samples: int = 500,
+    expected_source_rows: int = 1137,
+    reusable_source_rows: int = 242,
+    min_free_gb: float = 100.0,
+    min_free_fraction: float = 0.20,
+    max_retained_gb: float = 2000.0,
+    max_staging_gb: float = 500.0,
+) -> dict[str, Any]:
+    """Project Phase 4 storage from the accepted scale pilot when available."""
+    data_root = Path(data_root).resolve()
+    phase3_report_path = data_root / f"canonical/manifests/{PHASE3_STAGE}_strict_validation.json"
+    phase3 = load_json(phase3_report_path) if phase3_report_path.is_file() else {}
+    measured = phase3.get("storage", {}).get("bytes_by_artifact_class", {})
+    measured_samples = int(phase3.get("actual_sample_count", 500) or 500)
+    measured_sources = int(phase3.get("source_isolation_target_count", 242) or 242)
+
+    aliases = {
+        "canonical_workloads": "canonical_workloads",
+        "canonical_hotspot_labels": "canonical_hotspot_labels",
+        "encoded_13ch": "encoded_13ch",
+        "context_17ch": "context_17ch",
+        "context_33ch": "context_33ch",
+        "metadata": "metadata",
+        "graphs": "graphs",
+        "source_superposition": "source_superposition",
+        "indices": "indices",
+    }
+    per_sample: dict[str, float] = {}
+    for key, measured_key in aliases.items():
+        value = float(measured.get(measured_key, 0.0))
+        per_sample[key] = value / measured_samples if value > 0.0 else float(FULL_FALLBACK_BYTES_PER_SAMPLE[key])
+    source_isolation_measured = float(measured.get("canonical_source_isolation", 0.0))
+    source_bytes_per_row = (
+        source_isolation_measured / measured_sources
+        if source_isolation_measured > 0.0 and measured_sources > 0
+        else 1_000_000.0
+    )
+    full_label_root = data_root / f"canonical/stages/{FULL_STAGE}/hotspot_labels"
+    completed_full_packages = sum(
+        1
+        for target in full_label_root.glob("f*/f*/parsed/temp_layer0.npy")
+        if (target.parents[1] / "manifest.json").is_file()
+    )
+    new_packages = max(0, expected_samples - reusable_package_samples - completed_full_packages)
+    new_sources = max(0, expected_source_rows - reusable_source_rows)
+    projected_new = {
+        "canonical_workloads": int(per_sample["canonical_workloads"] * expected_samples),
+        "canonical_hotspot_labels": int(per_sample["canonical_hotspot_labels"] * new_packages),
+        "encoded_13ch": int(per_sample["encoded_13ch"] * expected_samples),
+        "context_17ch": int(per_sample["context_17ch"] * expected_samples),
+        "context_33ch": int(per_sample["context_33ch"] * expected_samples),
+        "metadata": int(per_sample["metadata"] * expected_samples),
+        "graphs": int(per_sample["graphs"] * expected_samples),
+        "source_isolation": int(source_bytes_per_row * new_sources),
+        "source_superposition_provisional": int(per_sample["source_superposition"] * expected_samples),
+        "indices_manifests_reports": int(per_sample["indices"] * expected_samples),
+    }
+    existing_full_workloads = _tree_size(data_root / f"canonical/stages/{FULL_STAGE}/workloads")
+    projected_new["canonical_workloads"] = max(
+        0, projected_new["canonical_workloads"] - existing_full_workloads
+    )
+    current_retained = sum(
+        _tree_size(data_root / name)
+        for name in ("canonical", "derived", "checkpoints", "evaluations", "reports")
+    )
+    projected_new_total = sum(projected_new.values())
+    filesystem = shutil.disk_usage(data_root)
+    required_free = max(float(min_free_gb) * 1024**3, float(min_free_fraction) * filesystem.total)
+    projected_free_after = filesystem.free - projected_new_total
+    projected_retained = current_retained + projected_new_total
+    largest_derived_stage = max(
+        projected_new["encoded_13ch"],
+        projected_new["context_17ch"],
+        projected_new["context_33ch"],
+        projected_new["graphs"],
+        projected_new["source_superposition_provisional"],
+    )
+    phase3_peak = int(phase3.get("storage", {}).get("staging_peak_bytes_observed", 0) or 0)
+    projected_peak_staging = max(largest_derived_stage, phase3_peak)
+    projected_inode_count = int(
+        expected_samples * 34
+        + expected_source_rows * 18
+        + 10_000
+    )
+    checks = {
+        "free_space_margin": projected_free_after >= required_free,
+        "retained_limit": projected_retained <= float(max_retained_gb) * 1024**3,
+        "staging_limit": projected_peak_staging <= float(max_staging_gb) * 1024**3,
+        "accepted_phase3_measurement_available": bool(phase3) and phase3.get("passed") is True,
+    }
+    hard_passed = all(checks.values())
+    phase3_runtime = float(phase3.get("runtime", {}).get("wall_clock_s", 0.0) or 0.0)
+    projected_runtime = phase3_runtime * (new_packages / 450.0) if phase3_runtime > 0.0 else None
+    return {
+        "schema_version": "benchmark_v2_full_resource_projection/1",
+        "stage": FULL_STAGE,
+        "measurement_source": data_root_relative(phase3_report_path, data_root) if phase3_report_path.is_file() else "conservative_fallback_constants",
+        "expected_samples": expected_samples,
+        "reusable_package_samples": reusable_package_samples,
+        "completed_full_package_samples": completed_full_packages,
+        "new_package_runs": new_packages,
+        "expected_source_rows": expected_source_rows,
+        "reusable_source_rows": reusable_source_rows,
+        "new_source_runs": new_sources,
+        "filesystem_total_bytes": filesystem.total,
+        "filesystem_free_bytes": filesystem.free,
+        "current_retained_bytes": current_retained,
+        "projected_new_bytes": projected_new,
+        "projected_new_total_bytes": projected_new_total,
+        "projected_retained_bytes": projected_retained,
+        "projected_free_after_bytes": projected_free_after,
+        "required_free_after_bytes": int(required_free),
+        "projected_peak_staging_bytes": projected_peak_staging,
+        "projected_inode_count": projected_inode_count,
+        "projected_runtime_s": projected_runtime,
+        "limits": {
+            "min_free_gb": min_free_gb,
+            "min_free_fraction": min_free_fraction,
+            "max_retained_gb": max_retained_gb,
+            "max_staging_gb": max_staging_gb,
+        },
+        "checks": checks,
+        "passed": hard_passed,
+        "recommendation": "GO" if hard_passed else "NO-GO",
+        "retention_policy": {
+            "must_retain": ["canonical", "derived/encoded_13ch", "derived/metadata", "derived/graphs", "derived/indices", "canonical/manifests"],
+            "may_regenerate": ["context_17ch", "context_33ch", "source_superposition"],
+            "staging_only": ["staging/runs", "staging/hotspot_workdirs", "staging/retries"],
+            "safe_to_delete_only_after_strict_and_visual_acceptance": [f"staging/runs/full-50x200-20260721"],
+        },
+    }
+
+
 def build_pilot(options: PilotBuildOptions) -> dict[str, Any]:
     started = time.perf_counter()
     spec = stage_spec(options.stage)
     if options.workers <= 0:
         raise ValueError("workers must be positive")
     design = load_yaml(options.config_path)
-    if design.get("benchmark_id") != BENCHMARK_ID or design.get("stage_gates", {}).get("full_generation_approved") is not False:
+    if design.get("benchmark_id") != BENCHMARK_ID:
         raise ValueError("--config is not the approved Benchmark v2 staged design proposal")
     selection = load_selection(options.selection_path, options.selected_families)
     if selection.get("stage") != options.stage:
         raise ValueError(f"selection stage {selection.get('stage')!r} does not match requested stage {options.stage!r}")
+    if options.stage == FULL_STAGE:
+        if selection.get("launch_approved_after_phase3") is not True:
+            raise ValueError("full_50x200 selection is not approved after the accepted Phase 3 gate")
+    elif design.get("stage_gates", {}).get("full_generation_approved") is not False:
+        raise ValueError("pilot stages require the approved staged design proposal")
     family_manifest_path = options.family_dir.parent / "family_manifest.yaml"
     verify_parent_lock(options.parent_lock_path, family_manifest_path=family_manifest_path)
     families_list, phase1_hash = verify_phase1_families(options.family_dir, family_manifest_path, options.selected_families)
@@ -1928,6 +2530,7 @@ def build_pilot(options: PilotBuildOptions) -> dict[str, Any]:
     paths = PilotPaths(options.data_root.resolve(), options.scratch_root.resolve(), options.run_id, options.stage)
     ensure_root_layout(paths.data_root, paths.scratch_root)
     phase2_snapshot = ensure_phase2_snapshot(paths.data_root) if options.stage == PHASE3_STAGE else None
+    accepted_pilot_snapshot = ensure_accepted_pilot_snapshot(paths.data_root) if options.stage == FULL_STAGE else None
     paths.run_root.mkdir(parents=True, exist_ok=True)
     copy_selected_families(families_list, options.family_dir, paths.canonical("families"), phase1_manifest_sha256=phase1_hash)
     workload_manifest = prepare_workloads(
@@ -1939,6 +2542,43 @@ def build_pilot(options: PilotBuildOptions) -> dict[str, Any]:
         stage_name=options.stage,
     )
     workloads = workload_rows(paths.canonical("workloads"), families, stage_name=options.stage)
+    workload_design_report = (
+        write_full_workload_design_reports(paths.data_root, workloads, families)
+        if options.stage == FULL_STAGE
+        else None
+    )
+    expected_source_rows = sum(len(family["fixed_structure"]["layout"]["chiplets"]) for family in families_list)
+    reusable_source_rows = 0
+    if options.stage == FULL_STAGE:
+        phase3_isolation = paths.data_root / f"canonical/stages/{PHASE3_STAGE}/source_isolation"
+        if durable_stage_complete(phase3_isolation):
+            reusable_source_rows = sum(
+                len(read_csv(phase3_isolation / f"{split}_index.csv"))
+                for split in ("train", "val", "test")
+            )
+    resource_projection = (
+        estimate_full_build_resources(
+            paths.data_root,
+            expected_samples=spec.sample_count,
+            reusable_package_samples=500,
+            expected_source_rows=expected_source_rows,
+            reusable_source_rows=reusable_source_rows,
+            min_free_gb=options.min_free_gb,
+            min_free_fraction=options.min_free_fraction,
+            max_retained_gb=options.max_retained_gb,
+            max_staging_gb=options.max_staging_gb,
+        )
+        if options.stage == FULL_STAGE
+        else None
+    )
+    if resource_projection is not None:
+        write_json(paths.canonical("manifests") / f"{FULL_STAGE}_resource_projection.json", resource_projection)
+        if not options.dry_run and not resource_projection["passed"] and not options.override_storage_gate:
+            raise RuntimeError(
+                "full_50x200 storage gate is NO-GO; inspect "
+                f"{paths.canonical('manifests') / f'{FULL_STAGE}_resource_projection.json'} or use the explicit "
+                "--override-storage-gate only after manual capacity review"
+            )
     runtime_lock = runtime_dependency_lock(
         options,
         phase1_hash=phase1_hash,
@@ -1960,6 +2600,9 @@ def build_pilot(options: PilotBuildOptions) -> dict[str, Any]:
         workers=options.workers,
         resume=options.resume,
         dry_run=options.dry_run,
+        execution_family_uids=options.execution_family_uids,
+        max_new_package_runs=options.max_new_package_runs,
+        stop_after_current_family=options.stop_after_current_family,
     )
     hotspot_stage_runtime = time.perf_counter() - hotspot_started
     if options.dry_run:
@@ -1979,7 +2622,32 @@ def build_pilot(options: PilotBuildOptions) -> dict[str, Any]:
             "derived_stages_run": False,
             "runtime_s": time.perf_counter() - started,
             "phase2_immutability_snapshot": phase2_snapshot,
-            "recommendation": "GO WITH MANUAL REVIEW: run real HotSpot and derived stages before scale authorization.",
+            "accepted_pilot_immutability_snapshot": accepted_pilot_snapshot,
+            "resource_projection": resource_projection,
+            "workload_design_report": workload_design_report,
+            "recommendation": (
+                resource_projection["recommendation"]
+                if resource_projection is not None
+                else "GO WITH MANUAL REVIEW: run real HotSpot and derived stages before scale authorization."
+            ),
+        }
+        write_json(paths.canonical("manifests") / f"{options.stage}_build_report.json", report)
+        write_json(paths.canonical("manifests") / f"{options.stage}_validation_report.json", report)
+        return report
+    if not hotspot_report.get("complete", False):
+        report = {
+            "schema_version": "benchmark_v2_full_partial_build/1",
+            "benchmark_id": BENCHMARK_ID,
+            "stage": options.stage,
+            "status": "partial_hotspot_complete_resume_required",
+            "run_id": options.run_id,
+            "workload_count": len(workloads),
+            "hotspot": hotspot_report,
+            "resource_projection": resource_projection,
+            "accepted_pilot_immutability_snapshot": accepted_pilot_snapshot,
+            "derived_stages_run": False,
+            "runtime_s": time.perf_counter() - started,
+            "recommendation": "RESUME: completed samples are durable; deferred samples remain explicit.",
         }
         write_json(paths.canonical("manifests") / f"{options.stage}_build_report.json", report)
         write_json(paths.canonical("manifests") / f"{options.stage}_validation_report.json", report)
@@ -2032,6 +2700,32 @@ def build_pilot(options: PilotBuildOptions) -> dict[str, Any]:
         index_root=index_root,
     )
     finalization_stage_runtime = time.perf_counter() - finalization_started
+    isolation_reuse = load_json(isolation_root / "pilot_reuse_report.json")
+    accepted_reuse = {
+        "hotspot_samples": int(hotspot_report.get("reused_pilot", 0)),
+        "hotspot_by_ownership_stage": hotspot_report.get("reused_by_ownership_stage", {}),
+        "source_isolation_artifacts": int(isolation_reuse.get("reused_source_rows", 0)),
+        "source_isolation_families": isolation_reuse.get("reused_family_uids", []),
+        "source_isolation_source_stage": isolation_reuse.get("source_stage", ""),
+        "source_isolation_note": "Accepted pilot arrays are referenced root-relatively and retain single ownership.",
+        "source_response_checkpoint": bool(derived.get("source_checkpoint_preexisting", False)),
+        "source_response_checkpoint_sha256": sha256_file(derived["portable_source_checkpoint"]),
+        "artifact_class_counts": {
+            "workload_definitions_content_identical": 500 if options.stage == FULL_STAGE else int(hotspot_report.get("reused_phase2", 0)),
+            "package_hotspot_labels": int(hotspot_report.get("reused_pilot", 0)),
+            "encoded_13ch": 0,
+            "context_17ch": 0,
+            "context_33ch": 0,
+            "metadata_rows": 0,
+            "graph_artifacts": 0,
+            "source_isolation_targets": int(isolation_reuse.get("reused_source_rows", 0)),
+            "provisional_source_superposition_maps": 0,
+        },
+        "derived_reuse_note": (
+            "Full-stage derived tensors are regenerated into one coherent stage-owned schema; "
+            "accepted pilot package labels and source-isolation arrays retain single ownership."
+        ),
+    }
     report = {
         "schema_version": "benchmark_v2_pilot_validation_report/1",
         "benchmark_id": BENCHMARK_ID,
@@ -2054,15 +2748,13 @@ def build_pilot(options: PilotBuildOptions) -> dict[str, Any]:
             "source_isolation": isolation_stage_runtime,
             "indices_and_manifests": finalization_stage_runtime,
         },
-        "phase2_reuse": {
-            "hotspot_samples": int(hotspot_report.get("reused_phase2", 0)),
-            "source_isolation_artifacts": int(load_json(isolation_root / "phase2_reuse_report.json").get("reused_source_rows", 0)),
-            "source_isolation_families": load_json(isolation_root / "phase2_reuse_report.json").get("reused_family_uids", []),
-            "source_isolation_note": "Accepted Phase 2 target arrays are referenced root-relatively and retain single ownership.",
-            "source_response_checkpoint": bool(derived.get("source_checkpoint_preexisting", False)),
-            "source_response_checkpoint_sha256": sha256_file(derived["portable_source_checkpoint"]),
-        },
+        "accepted_pilot_reuse": accepted_reuse,
+        # Kept for the accepted Phase 3 report reader.
+        "phase2_reuse": accepted_reuse if options.stage == PHASE3_STAGE else {},
         "phase2_immutability_snapshot": phase2_snapshot,
+        "accepted_pilot_immutability_snapshot": accepted_pilot_snapshot,
+        "resource_projection": resource_projection,
+        "workload_design_report": workload_design_report,
         "expected_sample_count": spec.sample_count,
         "recommendation": "GO WITH MANUAL REVIEW: strict validation, relocation, and visual review must pass.",
     }
@@ -2095,6 +2787,7 @@ def write_pilot_artifact_manifests(
         tensor_schema: dict[str, Any] | None = None,
         row_count: int | None = None,
         source_count: int | None = None,
+        artifact_status: str = "validated",
     ) -> None:
         parent_rows = [
             {
@@ -2122,25 +2815,62 @@ def write_pilot_artifact_manifests(
             seed=options.seed,
             workers=options.workers,
         )
+        if artifact_status != "validated":
+            payload = load_json(path)
+            payload.setdefault("notes", []).append(artifact_status)
+            write_json(path, payload)
         written[key] = data_root_relative(path, paths.data_root)
 
     prefix = options.stage
     spec = stage_spec(options.stage)
     emit("families", paths.canonical("families"), "canonical_source", "design", row_count=spec.family_count)
     emit("workloads", paths.canonical("workloads"), "canonical_source", "workloads", parents=(f"{prefix}_families",), row_count=spec.sample_count)
-    hotspot_parents = (f"{prefix}_workloads", f"{PHASE2_STAGE}_hotspot_labels") if options.stage == PHASE3_STAGE else (f"{prefix}_workloads",)
+    if options.stage == PHASE3_STAGE:
+        hotspot_parents = (f"{prefix}_workloads", f"{PHASE2_STAGE}_hotspot_labels")
+    elif options.stage == FULL_STAGE:
+        hotspot_parents = (f"{prefix}_workloads", f"{PHASE3_STAGE}_hotspot_labels")
+    else:
+        hotspot_parents = (f"{prefix}_workloads",)
     emit("hotspot_labels", paths.canonical("hotspot_labels"), "canonical_source", "hotspot_labels", parents=hotspot_parents, row_count=spec.sample_count, tensor_schema={"shape": [64, 64], "dtype": "float32", "units": "K", "channel_schema_sha256": schemas["raster"]})
     emit("encoded_13ch", Path(derived["encoded_13ch"]), "model_specific_derived", "encoded_13ch", parents=(f"{prefix}_hotspot_labels",), row_count=spec.sample_count, tensor_schema={"shape": [13, 64, 64], "dtype": "float32", "units": "mixed", "channel_schema_sha256": schemas["raster"]})
     emit("context_17ch", Path(derived["context_17ch"]), "model_specific_derived", "context_17ch", parents=(f"{prefix}_encoded_13ch",), row_count=spec.sample_count, tensor_schema={"shape": [17, 64, 64], "dtype": "float32", "units": "mixed", "channel_schema_sha256": sha256_file(Path(derived["context_17ch"]) / "feature_manifest.json")})
     emit("context_33ch", Path(derived["context_33ch"]), "model_specific_derived", "context_33ch", parents=(f"{prefix}_context_17ch",), row_count=spec.sample_count, tensor_schema={"shape": [33, 64, 64], "dtype": "float32", "units": "mixed", "channel_schema_sha256": sha256_file(Path(derived["context_33ch"]) / "feature_manifest.json")})
     emit("metadata", Path(derived["metadata"]), "model_specific_derived", "metadata", parents=(f"{prefix}_context_33ch",), row_count=spec.sample_count, tensor_schema={"shape": [15], "dtype": "float32", "units": "mixed", "channel_schema_sha256": schemas["metadata"]})
     emit("graphs", Path(derived["graphs"]), "model_specific_derived", "graphs", parents=(f"{prefix}_context_33ch", f"{prefix}_metadata"), row_count=spec.sample_count, tensor_schema={"shape": ["N", 24], "dtype": "float32", "units": "mixed", "channel_schema_sha256": schemas["graph_node"]})
-    source_model_parents = (f"{PHASE2_STAGE}_source_response_model",) if options.stage == PHASE3_STAGE and bool(derived.get("source_checkpoint_preexisting")) else ()
-    emit("source_response_model", Path(derived["source_response_model"]), "model_specific_derived", "source_response_model", parents=source_model_parents, row_count=None)
+    if options.stage == PHASE3_STAGE and bool(derived.get("source_checkpoint_preexisting")):
+        source_model_parents = (f"{PHASE2_STAGE}_source_response_model",)
+    elif options.stage == FULL_STAGE and bool(derived.get("source_checkpoint_preexisting")):
+        source_model_parents = (f"{PHASE3_STAGE}_source_response_model",)
+    else:
+        source_model_parents = ()
+    source_status = "provisional_source_checkpoint_dependent" if options.stage == FULL_STAGE else "validated"
+    emit(
+        "source_response_model",
+        Path(derived["source_response_model"]),
+        "model_specific_derived",
+        "source_response_model",
+        parents=source_model_parents,
+        row_count=None,
+        artifact_status=source_status,
+    )
     source_count = sum(len(read_csv(isolation_root / f"{split}_index.csv")) for split in ("train", "val", "test"))
-    isolation_parents = (f"{prefix}_hotspot_labels", f"{PHASE2_STAGE}_source_isolation") if options.stage == PHASE3_STAGE else (f"{prefix}_hotspot_labels",)
+    if options.stage == PHASE3_STAGE:
+        isolation_parents = (f"{prefix}_hotspot_labels", f"{PHASE2_STAGE}_source_isolation")
+    elif options.stage == FULL_STAGE:
+        isolation_parents = (f"{prefix}_hotspot_labels", f"{PHASE3_STAGE}_source_isolation")
+    else:
+        isolation_parents = (f"{prefix}_hotspot_labels",)
     emit("source_isolation", isolation_root, "canonical_source", "source_isolation", parents=isolation_parents, row_count=spec.family_count, source_count=source_count)
-    emit("source_superposition", Path(derived["source_superposition"]), "model_specific_derived", "source_superposition", parents=(f"{prefix}_graphs", f"{prefix}_source_response_model"), row_count=spec.sample_count, tensor_schema={"shape": [64, 64], "dtype": "float32", "units": "K", "channel_schema_sha256": sha256_json(["source_superposition_base_K"])})
+    emit(
+        "source_superposition",
+        Path(derived["source_superposition"]),
+        "model_specific_derived",
+        "source_superposition",
+        parents=(f"{prefix}_graphs", f"{prefix}_source_response_model"),
+        row_count=spec.sample_count,
+        tensor_schema={"shape": [64, 64], "dtype": "float32", "units": "K", "channel_schema_sha256": sha256_json(["source_superposition_base_K"])},
+        artifact_status=source_status,
+    )
     emit("indices", index_root, "generated_required_intermediate", "splits", parents=(f"{prefix}_source_superposition",), row_count=spec.sample_count, tensor_schema=None)
     return written
 
@@ -2313,17 +3043,20 @@ def validate_scale_pilot_root(
     allow_dry_run: bool = False,
     residual_checkpoint: str | Path | None = None,
     require_relocation: bool = False,
+    stage: str = PHASE3_STAGE,
 ) -> dict[str, Any]:
-    """Strictly validate the isolated 10x50 scale pilot and project full-build cost."""
+    """Strictly validate a namespaced Benchmark v2 scale/full stage."""
+    if stage not in {PHASE3_STAGE, FULL_STAGE}:
+        raise ValueError(f"staged validation supports {PHASE3_STAGE} and {FULL_STAGE}, got {stage!r}")
     data_root = Path(data_root).expanduser().resolve()
     marker = load_json(data_root / ROOT_MARKER_NAME)
     if marker.get("benchmark_id") != BENCHMARK_ID or marker.get("path_semantics") != PATH_SEMANTICS:
         raise ValueError("invalid Benchmark v2 data-root marker")
-    spec = stage_spec(PHASE3_STAGE)
-    paths = PilotPaths(data_root, data_root / "staging", "strict-validation", PHASE3_STAGE)
+    spec = stage_spec(stage)
+    paths = PilotPaths(data_root, data_root / "staging", "strict-validation", stage)
     selection = load_selection(spec.selection_path)
     selected = [str(item["family_uid"]) for item in selection["selected_families"]]
-    build_report = load_json(data_root / f"canonical/manifests/{PHASE3_STAGE}_build_report.json")
+    build_report = load_json(data_root / f"canonical/manifests/{stage}_build_report.json")
     dry_run = build_report.get("status") == "dry_run_validated"
     if dry_run and not allow_dry_run:
         raise ValueError("scale pilot is a dry run; real HotSpot and derived stages are required")
@@ -2334,7 +3067,10 @@ def validate_scale_pilot_root(
     workload_files = sorted(workload_root.glob("f*/w*.yaml"))
     workloads = [load_yaml(path) for path in workload_files]
     by_family = {uid: [row for row in workloads if row.get("family_uid") == uid] for uid in selected}
-    expected_cells = {str(row["workload_cell"]) for row in scale_workload_cells()}
+    expected_cells = {
+        str(row["workload_cell"])
+        for row in (full_workload_cells() if stage == FULL_STAGE else scale_workload_cells())
+    }
     actual_cells = {uid: {str(row.get("workload_cell", "")) for row in rows} for uid, rows in by_family.items()}
     families = {uid: load_yaml(paths.canonical("families") / f"{uid}.yaml") for uid in selected}
     workload_problems = [
@@ -2352,7 +3088,7 @@ def validate_scale_pilot_root(
         and len({json.dumps(families[uid]["fixed_structure"]["layout"], sort_keys=True)}) == 1
         for uid in selected
     )
-    portable = audit_portable_documents(data_root, stage=PHASE3_STAGE)
+    portable = audit_portable_documents(data_root, stage=stage)
     checks.extend(
         [
             _check("selected_family_count", len(selected) == spec.family_count and len(set(selected)) == spec.family_count, str(selected)),
@@ -2365,27 +3101,68 @@ def validate_scale_pilot_root(
             _check("portable_paths", portable["violation_count"] == 0, f"violations={portable['violation_count']}"),
         ]
     )
+    if stage == FULL_STAGE:
+        primary_counts = {
+            split: sum(str(row["primary_split"]) == split for row in selection["selected_families"])
+            for split in ("train", "val", "test")
+        }
+        sample_uids = [str(row.get("sample_uid", "")) for row in workloads]
+        workload_uids = [(str(row.get("family_uid", "")), str(row.get("workload_uid", ""))) for row in workloads]
+        policy = selection["source_response_policy"]
+        train_eligible = set(str(uid) for uid in policy["train_eligible_families"])
+        oracle_only = set(str(uid) for uid in policy["oracle_only_families"])
+        primary_by_family = {str(row["family_uid"]): str(row["primary_split"]) for row in selection["selected_families"]}
+        resource_projection = build_report.get("resource_projection", {})
+        checks.extend(
+            [
+                _check("primary_family_split_40_5_5", primary_counts == {"train": 40, "val": 5, "test": 5}, str(primary_counts)),
+                _check("unique_sample_uids", len(sample_uids) == len(set(sample_uids)) == spec.sample_count),
+                _check("unique_family_workload_uids", len(workload_uids) == len(set(workload_uids)) == spec.sample_count),
+                _check(
+                    "source_isolation_eligibility",
+                    len(train_eligible) == 40
+                    and len(oracle_only) == 10
+                    and not train_eligible & oracle_only
+                    and all(primary_by_family[uid] == "train" for uid in train_eligible)
+                    and all(primary_by_family[uid] in {"val", "test"} for uid in oracle_only),
+                ),
+                _check(
+                    "full_stage_namespaces",
+                    paths.canonical("workloads") == data_root / f"canonical/stages/{FULL_STAGE}/workloads"
+                    and paths.derived("graphs") == data_root / f"derived/stages/{FULL_STAGE}/graphs",
+                ),
+                _check(
+                    "storage_resource_gate",
+                    resource_projection.get("recommendation") == "GO" and resource_projection.get("passed") is True,
+                    str(resource_projection.get("checks", {})),
+                ),
+            ]
+        )
 
     if dry_run:
-        planned = int(build_report.get("hotspot", {}).get("dry_run_source_count", 0)) + int(build_report.get("hotspot", {}).get("reused_phase2", 0))
+        planned = int(build_report.get("hotspot", {}).get("dry_run_source_count", 0)) + int(build_report.get("hotspot", {}).get("reused_pilot", 0))
         checks.append(_check("dry_run_source_accounting", planned == spec.sample_count, f"planned_or_reused={planned}"))
         passed = all(bool(row["passed"]) for row in checks)
         report = {
-            "schema_version": "benchmark_v2_scale_pilot_strict_validation/1",
+            "schema_version": (
+                "benchmark_v2_full_strict_validation/1"
+                if stage == FULL_STAGE
+                else "benchmark_v2_scale_pilot_strict_validation/1"
+            ),
             "benchmark_id": BENCHMARK_ID,
-            "stage": PHASE3_STAGE,
+            "stage": stage,
             "status": "dry_run_passed" if passed else "dry_run_failed",
             "passed": passed,
             "checks": checks,
             "portable_path_audit": portable,
             "recommendation": "GO WITH MANUAL REVIEW" if passed else "NO-GO",
         }
-        write_json(data_root / f"canonical/manifests/{PHASE3_STAGE}_strict_validation.json", report)
+        write_json(data_root / f"canonical/manifests/{stage}_strict_validation.json", report)
         if not passed:
             raise ValueError(f"scale dry-run validation failed: {[row for row in checks if not row['passed']]}")
         return report
 
-    index_root = paths.derived("indices") / PHASE3_STAGE
+    index_root = paths.derived("indices") / stage
     final_rows = read_csv(index_root / "all_index.csv")
     path_failures = audit_index_paths(final_rows, data_root)
     final_uids = [row.get("sample_uid", "") for row in final_rows]
@@ -2418,7 +3195,7 @@ def validate_scale_pilot_root(
         checks.append(_check(f"{name}_count_shape_finite", len(rows) == spec.sample_count and not failures, f"rows={len(rows)} failures={failures[:5]}"))
 
     schema_hashes = current_schema_hashes()
-    runtime_lock = load_json(data_root / f"canonical/manifests/{PHASE3_STAGE}_runtime_dependency_lock.json")
+    runtime_lock = load_json(data_root / f"canonical/manifests/{stage}_runtime_dependency_lock.json")
     schema_ok = all(
         runtime_lock.get(key) == schema_hashes[source]
         for key, source in (
@@ -2497,9 +3274,17 @@ def validate_scale_pilot_root(
         protocol: {split: len(read_csv(index_root / protocol / f"{split}_index.csv")) for split in ("train", "val", "test")}
         for protocol in ("sample_split", "family_split")
     }
-    checks.append(_check("model_ready_indices", split_counts["sample_split"] == {"train": 400, "val": 50, "test": 50} and sum(split_counts["family_split"].values()) == spec.sample_count, str(split_counts)))
+    expected_sample_counts = {"train": 6400, "val": 800, "test": 800} if stage == FULL_STAGE else {"train": 400, "val": 50, "test": 50}
+    expected_family_counts = {"train": 8000, "val": 1000, "test": 1000} if stage == FULL_STAGE else None
+    split_ok = split_counts["sample_split"] == expected_sample_counts
+    split_ok = split_ok and (
+        split_counts["family_split"] == expected_family_counts
+        if expected_family_counts is not None
+        else sum(split_counts["family_split"].values()) == spec.sample_count
+    )
+    checks.append(_check("model_ready_indices", split_ok, str(split_counts)))
 
-    artifact_files = sorted((data_root / "canonical/manifests/artifacts").glob(f"{PHASE3_STAGE}_*.json"))
+    artifact_files = sorted((data_root / "canonical/manifests/artifacts").glob(f"{stage}_*.json"))
     artifact_errors: list[str] = []
     for path in artifact_files:
         try:
@@ -2548,27 +3333,82 @@ def validate_scale_pilot_root(
     accounted = sum(int(hotspot_report.get(key, 0)) for key in ("completed", "skipped_valid", "reused_phase2", "failed"))
     checks.append(_check("retry_failure_accounting", accounted == spec.sample_count and int(hotspot_report.get("failed", 0)) == 0, f"accounted={accounted} report={hotspot_report}"))
 
-    snapshot_path = data_root / f"canonical/manifests/{PHASE3_STAGE}_phase2_snapshot.json"
-    expected_snapshot = load_json(snapshot_path) if snapshot_path.exists() else {"available": False}
-    current_snapshot = phase2_immutability_snapshot(data_root)
+    if stage == FULL_STAGE:
+        snapshot_path = data_root / f"canonical/manifests/{FULL_STAGE}_accepted_pilot_snapshot.json"
+        expected_snapshot = load_json(snapshot_path) if snapshot_path.exists() else {"available": False}
+        current_snapshot = accepted_pilot_immutability_snapshot(data_root)
+        immutable_name = "accepted_phase2_phase3_artifacts_unchanged"
+    else:
+        snapshot_path = data_root / f"canonical/manifests/{PHASE3_STAGE}_phase2_snapshot.json"
+        expected_snapshot = load_json(snapshot_path) if snapshot_path.exists() else {"available": False}
+        current_snapshot = phase2_immutability_snapshot(data_root)
+        immutable_name = "phase2_artifacts_unchanged"
     immutable = bool(expected_snapshot.get("available")) and expected_snapshot.get("content_sha256") == current_snapshot.get("content_sha256")
-    checks.append(_check("phase2_artifacts_unchanged", immutable, f"expected={expected_snapshot.get('content_sha256')} actual={current_snapshot.get('content_sha256')}"))
+    checks.append(_check(immutable_name, immutable, f"expected={expected_snapshot.get('content_sha256')} actual={current_snapshot.get('content_sha256')}"))
 
-    relocation_path = data_root / f"canonical/manifests/{PHASE3_STAGE}_relocation_validation.json"
+    relocation_path = data_root / f"canonical/manifests/{stage}_relocation_validation.json"
     relocation = load_json(relocation_path) if relocation_path.exists() else {"passed": False, "status": "not_run"}
-    visual_review_path = data_root / f"canonical/manifests/{PHASE3_STAGE}_visual_review.json"
+    visual_review_path = data_root / f"canonical/manifests/{stage}_visual_review.json"
     visual_review = load_json(visual_review_path) if visual_review_path.exists() else {"approved": False, "status": "not_reviewed"}
     if require_relocation:
         checks.append(_check("relocation", relocation.get("passed") is True, str(relocation)))
 
-    temperatures = [np.asarray(np.load(path, mmap_mode="r"), dtype=np.float64) for path in label_paths]
     total_powers = [float(row["total_package_power_W"]) for row in workloads]
     active_fractions = [float(row.get("active_chiplet_fraction", 0.0)) for row in workloads]
     dominant_shares = [float(row.get("dominant_chiplet_share", 0.0)) for row in workloads]
-    temperature_means = [float(array.mean()) for array in temperatures]
-    temperature_peaks = [float(array.max()) for array in temperatures]
-    temperature_ranges = [float(array.max() - array.min()) for array in temperatures]
+    power_densities = [
+        float(value)
+        for row in workloads
+        for value in row.get("chiplet_power_density_W_per_mm2", {}).values()
+    ]
+    temperature_means: list[float] = []
+    temperature_peaks: list[float] = []
+    temperature_ranges: list[float] = []
+    label_hashes: list[str] = []
+    residual_abs_means: list[float] = []
+    for row, label_path in zip(final_rows, label_paths, strict=True):
+        array = np.asarray(np.load(label_path, mmap_mode="r"), dtype=np.float64)
+        temperature_means.append(float(array.mean()))
+        temperature_peaks.append(float(array.max()))
+        temperature_ranges.append(float(array.max() - array.min()))
+        label_hashes.append(sha256_file(label_path))
+        base_value = str(row.get("source_superposition_base_path", ""))
+        if base_value:
+            base = np.asarray(np.load(resolve_data_path(base_value, data_root), mmap_mode="r"), dtype=np.float64)
+            residual_abs_means.append(float(np.mean(np.abs(array - base))))
     runtimes = [float(row["hotspot_runtime_s"]) for row in final_rows if str(row.get("hotspot_runtime_s", "")).strip()]
+    if stage == FULL_STAGE:
+        required_reports = [
+            index_root / name
+            for name in (
+                "workload_coverage.csv", "family_coverage.csv", "reuse_manifest.csv",
+                "failure_accounting.csv", "artifact_inventory.csv",
+            )
+        ]
+        failure_rows = read_csv(index_root / "failure_accounting.csv") if (index_root / "failure_accounting.csv").is_file() else []
+        source_statuses = {row.get("source_superposition_status", "") for row in source_rows}
+        checks.extend(
+            [
+                _check("full_index_reports", all(path.is_file() for path in required_reports), str([path.name for path in required_reports if not path.is_file()])),
+                _check(
+                    "failure_accounting_consistency",
+                    bool(failure_rows)
+                    and int(hotspot_report.get("failed", 0)) == 0
+                    and int(hotspot_report.get("completed", 0))
+                    + int(hotspot_report.get("skipped_valid", 0))
+                    + int(hotspot_report.get("reused_pilot", 0))
+                    == spec.sample_count,
+                    str(hotspot_report),
+                ),
+                _check(
+                    "provisional_source_checkpoint_marking",
+                    source_statuses == {"provisional_source_checkpoint_dependent"},
+                    str(source_statuses),
+                ),
+                _check("temperature_distribution_sanity", all(250.0 <= peak <= 1500.0 for peak in temperature_peaks) and all(value > 0.0 for value in temperature_ranges)),
+                _check("unique_hotspot_label_arrays", len(label_hashes) == len(set(label_hashes)), f"duplicates={len(label_hashes) - len(set(label_hashes))}"),
+            ]
+        )
 
     artifact_roots = {
         "canonical_families": paths.canonical("families"),
@@ -2607,9 +3447,13 @@ def validate_scale_pilot_root(
         else ("GO WITH MANUAL REVIEW" if passed else "NO-GO")
     )
     report = {
-        "schema_version": "benchmark_v2_scale_pilot_strict_validation/1",
+        "schema_version": (
+            "benchmark_v2_full_strict_validation/1"
+            if stage == FULL_STAGE
+            else "benchmark_v2_scale_pilot_strict_validation/1"
+        ),
         "benchmark_id": BENCHMARK_ID,
-        "stage": PHASE3_STAGE,
+        "stage": stage,
         "passed": passed,
         "status": "validated" if passed else "failed",
         "recommendation": recommendation,
@@ -2622,15 +3466,16 @@ def validate_scale_pilot_root(
         "hotspot": {
             **hotspot_report,
             "runtime_s": _distribution_summary(runtimes),
+            "runtime_by_family_s": _runtime_by_group(final_rows, "family_uid"),
             "slowest_families": _slowest_groups(final_rows, "family_uid"),
             "slowest_workload_cells": _slowest_groups(final_rows, "workload_cell"),
         },
         "source_isolation_target_count": len(isolation_train) + len(isolation_val) + len(isolation_test),
         "source_isolation_run_count": (
             len(isolation_train) + len(isolation_val) + len(isolation_test)
-            - int(build_report.get("phase2_reuse", {}).get("source_isolation_artifacts", 0))
+            - int(build_report.get("accepted_pilot_reuse", build_report.get("phase2_reuse", {})).get("source_isolation_artifacts", 0))
         ),
-        "phase2_reuse": build_report.get("phase2_reuse", {}),
+        "accepted_pilot_reuse": build_report.get("accepted_pilot_reuse", build_report.get("phase2_reuse", {})),
         "runtime": {
             "wall_clock_s": wall_clock,
             "by_stage_s": build_report.get("runtime_by_stage_s", {}),
@@ -2640,6 +3485,10 @@ def validate_scale_pilot_root(
         "storage": {
             "retained_bytes": total_bytes,
             "bytes_by_artifact_class": bytes_by_class,
+            "bytes_by_checkpoint_dependency": {
+                "provisional_source_checkpoint_dependent": bytes_by_class.get("source_response_model_reference", 0) + bytes_by_class.get("source_superposition", 0),
+                "checkpoint_independent_or_deterministic_context": total_bytes - bytes_by_class.get("source_response_model_reference", 0) - bytes_by_class.get("source_superposition", 0),
+            },
             "files_by_artifact_class": files_by_class,
             "inode_file_count": total_files,
             "bytes_per_sample": total_bytes / spec.sample_count,
@@ -2652,41 +3501,67 @@ def validate_scale_pilot_root(
             "total_power_W": _distribution_summary(total_powers),
             "active_fraction": _distribution_summary(active_fractions),
             "dominant_source_share": _distribution_summary(dominant_shares),
+            "chiplet_power_density_W_per_mm2": _distribution_summary(power_densities),
             "temperature_mean_K": _distribution_summary(temperature_means),
             "temperature_peak_K": _distribution_summary(temperature_peaks),
             "temperature_spatial_range_K": _distribution_summary(temperature_ranges),
+            "target_minus_provisional_source_base_abs_mean_K": _distribution_summary(residual_abs_means),
         },
         "suspicious_hotspot_outputs": [
             final_rows[index].get("sample_uid", "")
             for index, (peak, spatial_range) in enumerate(zip(temperature_peaks, temperature_ranges, strict=True))
             if peak < 250.0 or peak > 1500.0 or spatial_range <= 0.0
         ],
+        "duplicate_label_hash_count": len(label_hashes) - len(set(label_hashes)),
         "portable_path_audit": portable,
         "relocation": relocation,
         "visual_review": visual_review,
         "loader_forward": loader_report,
         "loader_all_rows": loader_all_report,
-        "phase2_immutability": {"expected": expected_snapshot, "actual": current_snapshot, "passed": immutable},
+        "accepted_pilot_immutability": {"expected": expected_snapshot, "actual": current_snapshot, "passed": immutable},
         "build_report": build_report,
+        "retention_policy": build_report.get("resource_projection", {}).get("retention_policy", {}),
     }
-    write_json(data_root / f"canonical/manifests/{PHASE3_STAGE}_strict_validation.json", report)
-    write_json(data_root / f"canonical/manifests/{PHASE3_STAGE}_validation_report.json", report)
+    write_json(data_root / f"canonical/manifests/{stage}_strict_validation.json", report)
+    write_json(data_root / f"canonical/manifests/{stage}_validation_report.json", report)
     if not passed:
         raise ValueError(f"strict scale-pilot validation failed: {[row for row in checks if not row['passed']]}")
     return report
 
 
+def validate_full_root(
+    data_root: str | Path,
+    *,
+    allow_dry_run: bool = False,
+    residual_checkpoint: str | Path | None = None,
+    require_relocation: bool = False,
+) -> dict[str, Any]:
+    return validate_scale_pilot_root(
+        data_root,
+        allow_dry_run=allow_dry_run,
+        residual_checkpoint=residual_checkpoint,
+        require_relocation=require_relocation,
+        stage=FULL_STAGE,
+    )
+
+
 def _distribution_summary(values: Sequence[float]) -> dict[str, float | int | None]:
     if not values:
-        return {"count": 0, "min": None, "q25": None, "median": None, "q75": None, "p95": None, "max": None, "mean": None}
+        return {
+            "count": 0, "min": None, "p01": None, "p05": None, "q25": None,
+            "median": None, "q75": None, "p95": None, "p99": None, "max": None, "mean": None,
+        }
     array = np.asarray(values, dtype=np.float64)
     return {
         "count": int(array.size),
         "min": float(array.min()),
+        "p01": float(np.quantile(array, 0.01)),
+        "p05": float(np.quantile(array, 0.05)),
         "q25": float(np.quantile(array, 0.25)),
         "median": float(np.median(array)),
         "q75": float(np.quantile(array, 0.75)),
         "p95": float(np.quantile(array, 0.95)),
+        "p99": float(np.quantile(array, 0.99)),
         "max": float(array.max()),
         "mean": float(array.mean()),
     }
@@ -2724,26 +3599,38 @@ def _slowest_groups(rows: Sequence[dict[str, str]], key: str) -> list[dict[str, 
     return [{key: name, "count": len(values), "mean_runtime_s": float(np.mean(values)), "p95_runtime_s": float(np.quantile(values, 0.95))} for name, values in ranked[:10]]
 
 
+def _runtime_by_group(rows: Sequence[dict[str, str]], key: str) -> dict[str, dict[str, float | int | None]]:
+    grouped: dict[str, list[float]] = {}
+    for row in rows:
+        value = str(row.get("hotspot_runtime_s", "")).strip()
+        if value:
+            grouped.setdefault(str(row.get(key, "unknown")), []).append(float(value))
+    return {name: _distribution_summary(values) for name, values in sorted(grouped.items())}
+
+
 def _path_belongs_to_stage(path: Path, data_root: Path, stage: str) -> bool:
     """Return whether a portable metadata document is owned by one pilot stage."""
     relative = path.relative_to(data_root)
     parts = relative.parts
-    if stage == PHASE3_STAGE:
+    if stage in {PHASE3_STAGE, FULL_STAGE}:
         if parts[:3] in {
-            ("canonical", "stages", PHASE3_STAGE),
-            ("derived", "stages", PHASE3_STAGE),
-            ("derived", "indices", PHASE3_STAGE),
+            ("canonical", "stages", stage),
+            ("derived", "stages", stage),
+            ("derived", "indices", stage),
         }:
             return True
         if parts[:2] == ("canonical", "manifests"):
             if len(parts) >= 4 and parts[2] == "artifacts":
-                return parts[3].startswith(f"{PHASE3_STAGE}_")
-            return len(parts) >= 3 and parts[2].startswith(PHASE3_STAGE)
-        if parts[:2] in {("evaluations", PHASE3_STAGE), ("reports", PHASE3_STAGE)}:
+                return parts[3].startswith(f"{stage}_")
+            return len(parts) >= 3 and parts[2].startswith(stage)
+        if parts[:2] in {("evaluations", stage), ("reports", stage)}:
             return True
         return False
     if stage == PHASE2_STAGE:
-        return not _path_belongs_to_stage(path, data_root, PHASE3_STAGE)
+        return not any(
+            _path_belongs_to_stage(path, data_root, namespaced_stage)
+            for namespaced_stage in (PHASE3_STAGE, FULL_STAGE)
+        )
     raise ValueError(f"unsupported Benchmark v2 stage {stage!r}; choices={sorted(STAGE_SPECS)}")
 
 
@@ -3440,14 +4327,20 @@ def relocate_pilot(
     destination_root = Path(destination_root).resolve()
     if destination_root.exists():
         raise FileExistsError(f"relocation destination already exists: {destination_root}")
+    relocation_counts = {"hardlinked_bulk_files": 0, "copied_bulk_files": 0, "copied_metadata_files": 0}
     def copy_for_relocation(source: str, destination: str) -> str:
         source_path = Path(source)
         if link_bulk_arrays and source_path.suffix in {".npy", ".npz", ".pt"}:
             try:
                 os.link(source, destination)
+                relocation_counts["hardlinked_bulk_files"] += 1
                 return destination
             except OSError:
                 pass
+        if source_path.suffix in {".npy", ".npz", ".pt"}:
+            relocation_counts["copied_bulk_files"] += 1
+        else:
+            relocation_counts["copied_metadata_files"] += 1
         return shutil.copy2(source, destination)
 
     shutil.copytree(
@@ -3461,24 +4354,27 @@ def relocate_pilot(
     source_hashes = {item["path"]: item["sha256"] for item in source_tree["files"] if not item["path"].startswith("staging/")}
     destination_hashes = {item["path"]: item["sha256"] for item in destination_tree["files"]}
     hash_match = source_hashes == destination_hashes
-    strict = (
-        validate_scale_pilot_root(destination_root, residual_checkpoint=residual_checkpoint)
-        if stage == PHASE3_STAGE
-        else validate_pilot_root(destination_root, residual_checkpoint=residual_checkpoint)
-    )
+    if stage == FULL_STAGE:
+        strict = validate_full_root(destination_root, residual_checkpoint=residual_checkpoint)
+    elif stage == PHASE3_STAGE:
+        strict = validate_scale_pilot_root(destination_root, residual_checkpoint=residual_checkpoint)
+    else:
+        strict = validate_pilot_root(destination_root, residual_checkpoint=residual_checkpoint)
     portable = audit_portable_documents(destination_root, stage=stage)
+    relocation_loader = strict.get("loader_smoke") or strict.get("loader_forward") or {}
     report = {
         "schema_version": "benchmark_v2_relocation_validation/1",
         "benchmark_id": BENCHMARK_ID,
         "stage": stage,
         "bulk_array_copy_mode": "hardlink_with_copy_fallback" if link_bulk_arrays else "copy",
+        "physical_copy_accounting": relocation_counts,
         "passed": bool(hash_match and strict["passed"] and portable["violation_count"] == 0),
         "hash_match": hash_match,
         "source_file_count": len(source_hashes),
         "destination_file_count": len(destination_hashes),
-        "loaded_samples": strict.get("loader_smoke", {}).get("samples", 0),
+        "loaded_samples": relocation_loader.get("samples", 0),
         "portable_path_violations": portable["violation_count"],
-        "loader_smoke": strict.get("loader_smoke"),
+        "loader_smoke": relocation_loader,
     }
     report_name = "relocation_validation_report.json" if stage == PHASE2_STAGE else f"{stage}_relocation_validation.json"
     write_json(destination_root / "canonical/manifests" / report_name, report)

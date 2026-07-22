@@ -1,0 +1,55 @@
+schema_version: benchmark_v2_full_selection/1
+benchmark_id: benchmark_v2_50family
+stage: full_50x200
+base_seed: 20260721
+expected_family_count: 50
+expected_workloads_per_family: 200
+expected_sample_count: 10000
+launch_approved_after_phase3: true
+selection_content_sha256: b75770181f689ae25349431abf99c900595fb1cc9174f83c909cbef9097d628b
+selection_rule: all_phase1_families_in_uid_order
+selected_family_uids:
+  [f001, f002, f003, f004, f005, f006, f007, f008, f009, f010,
+   f011, f012, f013, f014, f015, f016, f017, f018, f019, f020,
+   f021, f022, f023, f024, f025, f026, f027, f028, f029, f030,
+   f031, f032, f033, f034, f035, f036, f037, f038, f039, f040,
+   f041, f042, f043, f044, f045, f046, f047, f048, f049, f050]
+primary_family_split:
+  train: [f001, f002, f003, f004, f005, f006, f009, f010, f011, f013, f014, f015, f017, f018, f019, f020, f021, f022, f024, f025, f026, f028, f029, f031, f032, f034, f035, f036, f037, f038, f039, f040, f042, f043, f045, f046, f047, f048, f049, f050]
+  val: [f007, f012, f023, f030, f041]
+  test: [f008, f016, f027, f033, f044]
+source_response_policy:
+  train_eligible_families: [f001, f002, f003, f004, f005, f006, f009, f010, f011, f013, f014, f015, f017, f018, f019, f020, f021, f022, f024, f025, f026, f028, f029, f031, f032, f034, f035, f036, f037, f038, f039, f040, f042, f043, f045, f046, f047, f048, f049, f050]
+  validation_oracle_families: [f007, f012, f023, f030, f041]
+  test_oracle_families: [f008, f016, f027, f033, f044]
+  oracle_only_families: [f007, f008, f012, f016, f023, f027, f030, f033, f041, f044]
+  isolation_frequency: once_per_chiplet_per_fixed_family
+  validation_test_usage: oracle_only_no_fit_no_normalization_no_selection_no_early_stopping_no_calibration
+sample_split_assignment:
+  scope: train_families_only
+  train_workload_ordinal_range: [1, 160]
+  val_workload_ordinal_range: [161, 180]
+  test_workload_ordinal_range: [181, 200]
+workload_design:
+  matrix: 10_power_regimes_x_20_activity_topology_regimes
+  workload_cell_spec_path: configs/benchmark_v2_50family/full_50x200_workload_cells.yaml
+  workload_cell_spec_sha256: 5601aed49558b97c4bf70ae5873acd4f56e205cd9b5bd0a75f78dda0b1dcb675
+  accepted_phase3_prefix_ordinals: [1, 50]
+  expected_phase3_package_reuse: 500
+  power_regimes: [phase2_reference, very_low, moderate, high, stress, low, medium_low, medium, medium_high, very_high]
+  topology_regimes: [balanced, memory_dominant, compute_dominant, type_specific, heterogeneous_cross_type, dense_balanced, single_source_dominant, clustered_interaction, spatially_distributed_sparse, dense_cross_type, io_analog_mems_dominant, two_source_near, two_source_far, three_source_cluster, edge_corner_dominant, center_dominant, sparse_asymmetric, medium_density_asymmetric, dense_asymmetric, symmetric_pairs]
+pilot_reuse_policy:
+  source_stage_priority: [pilot_10x50, pilot_5x10]
+  require_content_hash_match: true
+  require_family_structural_hash_match: true
+  require_hotspot_config_hash_match: true
+  allow_partial_match: false
+artifact_policy:
+  canonical_checkpoint_independent: [families, workloads, hotspot_inputs, hotspot_labels, encoded_13ch, metadata, graphs, manifests, indices]
+  checkpoint_dependent: [source_response_model, source_superposition, residual_model_outputs]
+  prototype_source_status: provisional_source_checkpoint_dependent
+retention_policy:
+  must_retain: [canonical_families, canonical_workloads, canonical_hotspot_labels, encoded_13ch, metadata, graphs, final_indices, manifests]
+  may_regenerate: [context_17ch, context_33ch, source_superposition]
+  staging_only: [hotspot_workdirs, builder_views, retry_scratch]
+  safe_to_delete_after_full_validation: [staging/runs/full-50x200-20260721/derived, staging/hotspot_workdirs]

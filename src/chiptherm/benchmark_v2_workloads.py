@@ -18,6 +18,7 @@ MANIFEST_SCHEMA_VERSION = "benchmark_v2_workload_manifest/1"
 DEFAULT_SEED = 20260721
 PHASE2_STAGE = "pilot_5x10"
 PHASE3_STAGE = "pilot_10x50"
+FULL_STAGE = "full_50x200"
 IDLE_POWER_FLOOR_W = 0.01  # Numerical lower bound; canonical per-type density floors dominate.
 NEAR_DUPLICATE_LINF_FRACTION = 1.0e-3
 IDLE_DENSITY_EPS_W_PER_MM2 = 1.0e-6
@@ -49,6 +50,8 @@ class ScaleTopology:
     active_fraction: float
     mode: str
     description: str
+    active_count: int | None = None
+    spatial_classification: str = "mixed"
 
 
 @dataclass(frozen=True)
@@ -94,6 +97,63 @@ SCALE_TOPOLOGIES: tuple[ScaleTopology, ...] = (
     ScaleTopology("spatially_distributed_sparse", "sparse_active_subset_stress", 0.15, "distributed", "Farthest-point sparse activity."),
     ScaleTopology("dense_cross_type", "dense_active_subset_stress", 0.90, "cross_type", "Dense heterogeneous activity."),
 )
+
+# Phase 4 completes a 10 x 20 Cartesian design while preserving the accepted
+# Phase 3 cells as ordinals 1..50. The five added levels fill gaps between the
+# already accepted broad loading regimes.
+FULL_ADDITIONAL_POWER_REGIMES: tuple[ScalePowerRegime, ...] = (
+    ScalePowerRegime("low", 0.16, "Low active-source loading."),
+    ScalePowerRegime("medium_low", 0.28, "Medium-low active-source loading."),
+    ScalePowerRegime("medium", 0.52, "Nominal medium active-source loading."),
+    ScalePowerRegime("medium_high", 0.64, "Medium-high active-source loading."),
+    ScalePowerRegime("very_high", 0.84, "Very-high but sub-stress active-source loading."),
+)
+
+FULL_ADDITIONAL_TOPOLOGIES: tuple[ScaleTopology, ...] = (
+    ScaleTopology(
+        "io_analog_mems_dominant", "medium_type_specific", 0.40, "peripheral_dominant",
+        "IO/analog/MEMS activity where those types are available.", spatial_classification="type_specific",
+    ),
+    ScaleTopology(
+        "two_source_near", "high_interacting_multi_source", 0.20, "two_source_near",
+        "Exactly two nearest sources interact.", active_count=2, spatial_classification="clustered",
+    ),
+    ScaleTopology(
+        "two_source_far", "high_interacting_multi_source", 0.20, "two_source_far",
+        "Exactly two maximally separated sources interact.", active_count=2, spatial_classification="distributed",
+    ),
+    ScaleTopology(
+        "three_source_cluster", "high_interacting_multi_source", 0.30, "three_source_cluster",
+        "Three-source compact cluster interaction.", active_count=3, spatial_classification="clustered",
+    ),
+    ScaleTopology(
+        "edge_corner_dominant", "high_single_dominant", 0.30, "edge_corner",
+        "Sources nearest package edges/corners dominate.", spatial_classification="edge_corner",
+    ),
+    ScaleTopology(
+        "center_dominant", "high_single_dominant", 0.30, "center",
+        "Sources nearest package center dominate.", spatial_classification="center",
+    ),
+    ScaleTopology(
+        "sparse_asymmetric", "sparse_active_subset_stress", 0.18, "sparse_asymmetric",
+        "Sparse intentionally asymmetric activity.", spatial_classification="sparse_asymmetric",
+    ),
+    ScaleTopology(
+        "medium_density_asymmetric", "medium_skewed", 0.50, "medium_asymmetric",
+        "Medium-density intentionally asymmetric activity.", spatial_classification="medium_asymmetric",
+    ),
+    ScaleTopology(
+        "dense_asymmetric", "dense_active_subset_stress", 0.82, "dense_asymmetric",
+        "Dense intentionally asymmetric activity.", spatial_classification="dense_asymmetric",
+    ),
+    ScaleTopology(
+        "symmetric_pairs", "medium_balanced", 0.35, "symmetric_pairs",
+        "Approximately package-symmetric source pairs.", active_count=2, spatial_classification="symmetric",
+    ),
+)
+
+FULL_POWER_REGIMES: tuple[ScalePowerRegime, ...] = SCALE_POWER_REGIMES + FULL_ADDITIONAL_POWER_REGIMES
+FULL_TOPOLOGIES: tuple[ScaleTopology, ...] = SCALE_TOPOLOGIES + FULL_ADDITIONAL_TOPOLOGIES
 
 
 def sha256_bytes(payload: bytes) -> str:
@@ -171,6 +231,42 @@ def scale_workload_cells() -> list[dict[str, Any]]:
     return cells
 
 
+def full_workload_cells() -> list[dict[str, Any]]:
+    """Return the frozen 200-cell Phase 4 design with Phase 3 as prefix."""
+    cells = [dict(cell) for cell in scale_workload_cells()]
+    ordinal = len(cells) + 1
+
+    # Complete the accepted five power levels for the ten new topologies.
+    for power in SCALE_POWER_REGIMES:
+        for topology in FULL_ADDITIONAL_TOPOLOGIES:
+            cells.append(_full_cell(ordinal, power, topology))
+            ordinal += 1
+    # Complete all twenty topologies for the five added power levels.
+    for power in FULL_ADDITIONAL_POWER_REGIMES:
+        for topology in FULL_TOPOLOGIES:
+            cells.append(_full_cell(ordinal, power, topology))
+            ordinal += 1
+    if len(cells) != 200 or len({str(cell["workload_cell"]) for cell in cells}) != 200:
+        raise AssertionError("Phase 4 workload-cell construction must produce 200 unique cells")
+    return cells
+
+
+def _full_cell(ordinal: int, power: ScalePowerRegime, topology: ScaleTopology) -> dict[str, Any]:
+    return {
+        "workload_ordinal": ordinal,
+        "workload_cell": f"{power.key}__{topology.key}",
+        "power_regime": power.key,
+        "power_load_fraction": power.load_fraction,
+        "topology_regime": topology.key,
+        "reference_stratum": topology.reference_stratum,
+        "active_fraction": topology.active_fraction,
+        "active_count": topology.active_count,
+        "mode": topology.mode,
+        "spatial_activity_classification": topology.spatial_classification,
+        "description": f"{power.description} {topology.description}",
+    }
+
+
 def generate_scale_family_workloads(
     family: dict[str, Any],
     *,
@@ -224,6 +320,104 @@ def generate_scale_family_workloads(
         vectors.append(vector)
         records.append(record)
     return records
+
+
+def generate_full_family_workloads(
+    family: dict[str, Any],
+    *,
+    base_seed: int = DEFAULT_SEED,
+) -> list[dict[str, Any]]:
+    """Generate Phase 4's 200 cells, retaining Phase 3 rows byte-semantically."""
+    phase3 = generate_scale_family_workloads(family, base_seed=base_seed)
+    records = [dict(record) for record in phase3]
+    chiplets = list(family["fixed_structure"]["layout"]["chiplets"])
+    ordered_chiplets = sorted(chiplets, key=lambda item: str(item["name"]))
+    reference_loads = {item.key: item.load_fraction for item in PILOT_STRATA}
+    for cell in full_workload_cells()[len(phase3) :]:
+        ordinal = int(cell["workload_ordinal"])
+        load_fraction = cell["power_load_fraction"]
+        if load_fraction is None:
+            load_fraction = reference_loads[str(cell["reference_stratum"])]
+        stratum = WorkloadStratum(
+            str(cell["reference_stratum"]),
+            float(cell["active_fraction"]),
+            float(load_fraction),
+            str(cell["mode"]),
+        )
+        seed = _workload_seed(base_seed, str(family["family_uid"]), ordinal)
+        record = _generate_workload(
+            family,
+            chiplets,
+            stratum,
+            ordinal,
+            seed,
+            active_count_override=(int(cell["active_count"]) if cell.get("active_count") is not None else None),
+        )
+        record["workload_cell"] = str(cell["workload_cell"])
+        record["power_regime"] = str(cell["power_regime"])
+        record["topology_regime"] = str(cell["topology_regime"])
+        record["sub_stratum"] = str(cell["workload_cell"])
+        record["broad_stratum"] = _broad_power_stratum(str(cell["power_regime"]))
+        record["spatial_activity_classification"] = str(cell["spatial_activity_classification"])
+        record["active_chiplet_fraction"] = float(record["active_chiplet_count"]) / len(chiplets)
+        record["phase2_reference"] = False
+        record["phase3_reference"] = False
+        records.append(record)
+
+    for ordinal, (record, cell) in enumerate(zip(records, full_workload_cells(), strict=True), start=1):
+        record.setdefault("broad_stratum", _broad_power_stratum(str(cell["power_regime"])))
+        record.setdefault("spatial_activity_classification", str(cell.get("spatial_activity_classification", "mixed")))
+        record["phase3_reference"] = ordinal <= 50
+        record["selected_interaction_source_ids"] = list(record.get("interacting_hot_source_ids", []))
+        problems = validate_workload(record, family)
+        if problems:
+            raise ValueError("\n".join(problems))
+    _validate_unique_workload_vectors(records, ordered_chiplets, family_uid=str(family["family_uid"]), stage="Phase 4")
+    return records
+
+
+def _broad_power_stratum(power_regime: str) -> str:
+    return {
+        "phase2_reference": "reference",
+        "very_low": "very_low",
+        "low": "low",
+        "medium_low": "medium_low",
+        "moderate": "medium",
+        "medium": "medium",
+        "medium_high": "medium_high",
+        "high": "high",
+        "very_high": "high",
+        "stress": "stress",
+    }[power_regime]
+
+
+def _validate_unique_workload_vectors(
+    records: Sequence[dict[str, Any]],
+    ordered_chiplets: Sequence[dict[str, Any]],
+    *,
+    family_uid: str,
+    stage: str,
+) -> None:
+    hashes: dict[str, int] = {}
+    vectors: list[list[float]] = []
+    for ordinal, record in enumerate(records, start=1):
+        content_hash = str(record["content_hash"])
+        if content_hash in hashes:
+            raise ValueError(
+                f"{family_uid}: duplicate {stage} workload hash {content_hash} "
+                f"at ordinals {hashes[content_hash]} and {ordinal}"
+            )
+        vector = [float(record["chiplet_power_W"][str(item["name"])]) for item in ordered_chiplets]
+        for previous_index, previous in enumerate(vectors, start=1):
+            denominator = max(max(previous), max(vector), IDLE_POWER_FLOOR_W)
+            distance = max(abs(left - right) for left, right in zip(previous, vector, strict=True)) / denominator
+            if distance <= NEAR_DUPLICATE_LINF_FRACTION:
+                raise ValueError(
+                    f"{family_uid}: {stage} workload {ordinal} is near-identical to workload "
+                    f"{previous_index} (normalized L-inf={distance:.3g})"
+                )
+        hashes[content_hash] = ordinal
+        vectors.append(vector)
 
 
 def validate_workload(workload: dict[str, Any], family: dict[str, Any]) -> list[str]:
@@ -306,11 +500,12 @@ def write_workload_tree(
     for family in families:
         family_uid = str(family["family_uid"])
         family_hashes[family_uid] = str(family.get("structural_fingerprint") or family.get("review", {}).get("structural_fingerprint", ""))
-        records = (
-            generate_scale_family_workloads(family, base_seed=base_seed)
-            if stage == PHASE3_STAGE
-            else generate_family_workloads(family, base_seed=base_seed)
-        )
+        if stage == FULL_STAGE:
+            records = generate_full_family_workloads(family, base_seed=base_seed)
+        elif stage == PHASE3_STAGE:
+            records = generate_scale_family_workloads(family, base_seed=base_seed)
+        else:
+            records = generate_family_workloads(family, base_seed=base_seed)
         family_dir = output_root / family_uid
         family_dir.mkdir(parents=True, exist_ok=True)
         for record in records:
@@ -325,10 +520,18 @@ def write_workload_tree(
         "family_uids": sorted({str(record["family_uid"]) for record in all_records}),
         "family_structural_fingerprints": family_hashes,
         "family_count": len({record["family_uid"] for record in all_records}),
-        "workloads_per_family": len(scale_workload_cells()) if stage == PHASE3_STAGE else len(PILOT_STRATA),
+        "workloads_per_family": (
+            len(full_workload_cells()) if stage == FULL_STAGE
+            else len(scale_workload_cells()) if stage == PHASE3_STAGE
+            else len(PILOT_STRATA)
+        ),
         "workload_count": len(all_records),
         "strata": [item.key for item in PILOT_STRATA],
-        "workload_cells": scale_workload_cells() if stage == PHASE3_STAGE else [],
+        "workload_cells": (
+            full_workload_cells() if stage == FULL_STAGE
+            else scale_workload_cells() if stage == PHASE3_STAGE
+            else []
+        ),
         "workload_hashes": [record["content_hash"] for record in all_records],
         "manifest_content_sha256": sha256_json(
             [{key: record[key] for key in ("family_uid", "workload_uid", "content_hash")} for record in all_records]
@@ -344,13 +547,26 @@ def _generate_workload(
     stratum: WorkloadStratum,
     workload_index: int,
     seed: int,
+    active_count_override: int | None = None,
 ) -> dict[str, Any]:
     rng = random.Random(seed)
     family_uid = str(family["family_uid"])
     ordered = sorted(chiplets, key=lambda item: str(item["name"]))
-    active_count = max(1, min(len(ordered), int(round(len(ordered) * stratum.active_fraction))))
-    active = _select_active_chiplets(ordered, active_count, stratum.mode, rng)
+    active_count = (
+        max(1, min(len(ordered), int(active_count_override)))
+        if active_count_override is not None
+        else max(1, min(len(ordered), int(round(len(ordered) * stratum.active_fraction))))
+    )
+    package_size = family["fixed_structure"]["layout"]["package"]["size"]
+    active = _select_active_chiplets(
+        ordered,
+        active_count,
+        stratum.mode,
+        rng,
+        package_size=(float(package_size["width"]), float(package_size["height"])),
+    )
     active_names = {str(item["name"]) for item in active}
+    active_rank = {str(item["name"]): index for index, item in enumerate(active)}
     interacting = _interacting_sources(active, stratum.mode)
     dominant_name = _dominant_name(active, stratum.mode)
     powers: dict[str, float] = {}
@@ -362,6 +578,7 @@ def _generate_workload(
             density = float(CANONICAL_POWER_DENSITY_LIMITS[str(chiplet["type"])][0]) + IDLE_DENSITY_EPS_W_PER_MM2
             power = density * area
         else:
+            source_rank = active_rank[name]
             low, high = POWER_DENSITY_RANGES_W_PER_MM2[str(chiplet["type"])]
             fraction = stratum.load_fraction
             if stratum.mode == "skewed":
@@ -374,6 +591,20 @@ def _generate_workload(
                 fraction = min(0.98, fraction + 0.10) if name == dominant_name else max(0.03, 0.30 * fraction + 0.04 * rng.random())
             elif stratum.mode == "scale_clustered":
                 fraction = min(0.98, fraction + 0.08) if name in interacting else max(0.03, 0.55 * fraction + 0.05 * rng.random())
+            elif stratum.mode == "two_source_near":
+                fraction = min(0.98, max(0.04, fraction + (0.10 if source_rank % 2 == 0 else -0.06)))
+            elif stratum.mode == "two_source_far":
+                fraction = min(0.98, max(0.04, fraction + (0.16 if source_rank % 2 == 0 else -0.10)))
+            elif stratum.mode == "three_source_cluster":
+                fraction = min(0.98, max(0.04, fraction * (1.13 - 0.11 * (source_rank % 3))))
+            elif stratum.mode in {"edge_corner", "center"}:
+                fraction = min(0.98, max(0.04, fraction * (1.18 if source_rank == 0 else 0.72 + 0.04 * (source_rank % 3))))
+            elif stratum.mode in {"sparse_asymmetric", "medium_asymmetric", "dense_asymmetric"}:
+                fraction = min(0.98, max(0.03, fraction * (0.52 + 0.14 * ((source_rank * 3 + 1) % 5))))
+            elif stratum.mode == "symmetric_pairs":
+                fraction = min(0.98, max(0.03, fraction * (0.91 if source_rank % 2 == 0 else 1.09)))
+            elif stratum.mode == "peripheral_dominant":
+                fraction = min(0.98, max(0.03, fraction * (1.12 if str(chiplet["type"]) in {"IO", "ANALOG", "MEMS"} else 0.68)))
             elif stratum.mode in {"sparse_subset", "dense_subset"}:
                 fraction = min(0.98, max(0.65, fraction - 0.08 * rng.random()))
             else:
@@ -410,14 +641,20 @@ def _generate_workload(
 
 
 def _select_active_chiplets(
-    chiplets: list[dict[str, Any]], active_count: int, mode: str, rng: random.Random
+    chiplets: list[dict[str, Any]],
+    active_count: int,
+    mode: str,
+    rng: random.Random,
+    *,
+    package_size: tuple[float, float] | None = None,
 ) -> list[dict[str, Any]]:
     if active_count >= len(chiplets):
         return list(chiplets)
-    if mode in {"type_specific", "memory_dominant", "compute_dominant"}:
+    if mode in {"type_specific", "memory_dominant", "compute_dominant", "peripheral_dominant"}:
         preferred_types = {
             "memory_dominant": {"HBM", "DRAM"},
             "compute_dominant": {"CPU", "GPU", "NPU"},
+            "peripheral_dominant": {"IO", "ANALOG", "MEMS"},
         }.get(mode)
         if preferred_types is not None:
             preferred = [item for item in chiplets if str(item["type"]) in preferred_types]
@@ -434,13 +671,24 @@ def _select_active_chiplets(
         remaining = [item for item in chiplets if item not in selected]
         rng.shuffle(remaining)
         return (selected + remaining)[:active_count]
-    if mode in {"interacting", "scale_clustered"}:
+    if mode in {"interacting", "scale_clustered", "two_source_near", "three_source_cluster"}:
         pair = _closest_pair(chiplets)
         remaining = [item for item in chiplets if item not in pair]
         remaining.sort(key=lambda item: min(_center_distance(item, source) for source in pair))
         return (list(pair) + remaining)[:active_count]
-    if mode == "distributed":
+    if mode in {"distributed", "two_source_far"}:
         return _farthest_point_subset(chiplets, active_count)
+    if mode == "edge_corner":
+        package = package_size or _package_size_from_chiplets(chiplets)
+        return sorted(chiplets, key=lambda item: (_edge_distance(item, package), str(item["name"])))[:active_count]
+    if mode == "center":
+        package = package_size or _package_size_from_chiplets(chiplets)
+        return sorted(chiplets, key=lambda item: (_package_center_distance(item, package), str(item["name"])))[:active_count]
+    if mode == "symmetric_pairs":
+        package = package_size or _package_size_from_chiplets(chiplets)
+        pair = _most_symmetric_pair(chiplets, package)
+        remaining = [item for item in chiplets if item not in pair]
+        return (list(pair) + remaining)[:active_count]
     if mode == "cross_type":
         by_type: dict[str, list[dict[str, Any]]] = {}
         for item in chiplets:
@@ -463,6 +711,10 @@ def _select_active_chiplets(
 
 
 def _interacting_sources(active: list[dict[str, Any]], mode: str) -> list[str]:
+    if mode in {"two_source_near", "two_source_far", "symmetric_pairs"}:
+        return [str(item["name"]) for item in active[:2]]
+    if mode == "three_source_cluster":
+        return [str(item["name"]) for item in active[:3]]
     if mode not in {"interacting", "scale_clustered"} or len(active) < 2:
         return []
     pair = _closest_pair(active)
@@ -509,6 +761,53 @@ def _farthest_point_subset(chiplets: list[dict[str, Any]], count: int) -> list[d
         selected.append(candidate)
         remaining.remove(candidate)
     return selected
+
+
+def _package_size_from_chiplets(chiplets: Sequence[dict[str, Any]]) -> tuple[float, float]:
+    # Fixed layouts use a common package coordinate frame. Its extents are
+    # recoverable here without mutating or rasterizing geometry.
+    width = max(float(item["position"]["x"]) + float(item["size"]["width"]) for item in chiplets)
+    height = max(float(item["position"]["y"]) + float(item["size"]["height"]) for item in chiplets)
+    return width, height
+
+
+def _edge_distance(chiplet: dict[str, Any], package: tuple[float, float]) -> float:
+    x = float(chiplet["position"]["x"])
+    y = float(chiplet["position"]["y"])
+    width = float(chiplet["size"]["width"])
+    height = float(chiplet["size"]["height"])
+    return min(x, y, max(0.0, package[0] - x - width), max(0.0, package[1] - y - height))
+
+
+def _package_center_distance(chiplet: dict[str, Any], package: tuple[float, float]) -> float:
+    x = float(chiplet["position"]["x"]) + 0.5 * float(chiplet["size"]["width"])
+    y = float(chiplet["position"]["y"]) + 0.5 * float(chiplet["size"]["height"])
+    return math.hypot(x - 0.5 * package[0], y - 0.5 * package[1])
+
+
+def _most_symmetric_pair(
+    chiplets: Sequence[dict[str, Any]], package: tuple[float, float]
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    pairs = [
+        (left, right)
+        for index, left in enumerate(chiplets)
+        for right in chiplets[index + 1 :]
+    ]
+    center_x, center_y = 0.5 * package[0], 0.5 * package[1]
+
+    def score(pair: tuple[dict[str, Any], dict[str, Any]]) -> tuple[float, str, str]:
+        centers = []
+        for item in pair:
+            centers.append((
+                float(item["position"]["x"]) + 0.5 * float(item["size"]["width"]),
+                float(item["position"]["y"]) + 0.5 * float(item["size"]["height"]),
+            ))
+        symmetry = abs(centers[0][0] + centers[1][0] - 2.0 * center_x) + abs(
+            centers[0][1] + centers[1][1] - 2.0 * center_y
+        )
+        return symmetry, str(pair[0]["name"]), str(pair[1]["name"])
+
+    return min(pairs, key=score)
 
 
 def _workload_seed(base_seed: int, family_uid: str, workload_index: int) -> int:
