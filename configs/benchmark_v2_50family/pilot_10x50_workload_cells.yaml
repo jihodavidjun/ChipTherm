@@ -1,0 +1,55 @@
+schema_version: benchmark_v2_workload_cell_spec/1
+benchmark_id: benchmark_v2_50family
+stage: pilot_10x50
+matrix: 5_power_regimes_x_10_activity_topology_regimes
+cells:
+  - {workload_ordinal: 1, power_regime: phase2_reference, topology_regime: balanced}
+  - {workload_ordinal: 2, power_regime: phase2_reference, topology_regime: memory_dominant}
+  - {workload_ordinal: 3, power_regime: phase2_reference, topology_regime: compute_dominant}
+  - {workload_ordinal: 4, power_regime: phase2_reference, topology_regime: type_specific}
+  - {workload_ordinal: 5, power_regime: phase2_reference, topology_regime: heterogeneous_cross_type}
+  - {workload_ordinal: 6, power_regime: phase2_reference, topology_regime: dense_balanced}
+  - {workload_ordinal: 7, power_regime: phase2_reference, topology_regime: single_source_dominant}
+  - {workload_ordinal: 8, power_regime: phase2_reference, topology_regime: clustered_interaction}
+  - {workload_ordinal: 9, power_regime: phase2_reference, topology_regime: spatially_distributed_sparse}
+  - {workload_ordinal: 10, power_regime: phase2_reference, topology_regime: dense_cross_type}
+  - {workload_ordinal: 11, power_regime: very_low, topology_regime: balanced}
+  - {workload_ordinal: 12, power_regime: very_low, topology_regime: memory_dominant}
+  - {workload_ordinal: 13, power_regime: very_low, topology_regime: compute_dominant}
+  - {workload_ordinal: 14, power_regime: very_low, topology_regime: type_specific}
+  - {workload_ordinal: 15, power_regime: very_low, topology_regime: heterogeneous_cross_type}
+  - {workload_ordinal: 16, power_regime: very_low, topology_regime: dense_balanced}
+  - {workload_ordinal: 17, power_regime: very_low, topology_regime: single_source_dominant}
+  - {workload_ordinal: 18, power_regime: very_low, topology_regime: clustered_interaction}
+  - {workload_ordinal: 19, power_regime: very_low, topology_regime: spatially_distributed_sparse}
+  - {workload_ordinal: 20, power_regime: very_low, topology_regime: dense_cross_type}
+  - {workload_ordinal: 21, power_regime: moderate, topology_regime: balanced}
+  - {workload_ordinal: 22, power_regime: moderate, topology_regime: memory_dominant}
+  - {workload_ordinal: 23, power_regime: moderate, topology_regime: compute_dominant}
+  - {workload_ordinal: 24, power_regime: moderate, topology_regime: type_specific}
+  - {workload_ordinal: 25, power_regime: moderate, topology_regime: heterogeneous_cross_type}
+  - {workload_ordinal: 26, power_regime: moderate, topology_regime: dense_balanced}
+  - {workload_ordinal: 27, power_regime: moderate, topology_regime: single_source_dominant}
+  - {workload_ordinal: 28, power_regime: moderate, topology_regime: clustered_interaction}
+  - {workload_ordinal: 29, power_regime: moderate, topology_regime: spatially_distributed_sparse}
+  - {workload_ordinal: 30, power_regime: moderate, topology_regime: dense_cross_type}
+  - {workload_ordinal: 31, power_regime: high, topology_regime: balanced}
+  - {workload_ordinal: 32, power_regime: high, topology_regime: memory_dominant}
+  - {workload_ordinal: 33, power_regime: high, topology_regime: compute_dominant}
+  - {workload_ordinal: 34, power_regime: high, topology_regime: type_specific}
+  - {workload_ordinal: 35, power_regime: high, topology_regime: heterogeneous_cross_type}
+  - {workload_ordinal: 36, power_regime: high, topology_regime: dense_balanced}
+  - {workload_ordinal: 37, power_regime: high, topology_regime: single_source_dominant}
+  - {workload_ordinal: 38, power_regime: high, topology_regime: clustered_interaction}
+  - {workload_ordinal: 39, power_regime: high, topology_regime: spatially_distributed_sparse}
+  - {workload_ordinal: 40, power_regime: high, topology_regime: dense_cross_type}
+  - {workload_ordinal: 41, power_regime: stress, topology_regime: balanced}
+  - {workload_ordinal: 42, power_regime: stress, topology_regime: memory_dominant}
+  - {workload_ordinal: 43, power_regime: stress, topology_regime: compute_dominant}
+  - {workload_ordinal: 44, power_regime: stress, topology_regime: type_specific}
+  - {workload_ordinal: 45, power_regime: stress, topology_regime: heterogeneous_cross_type}
+  - {workload_ordinal: 46, power_regime: stress, topology_regime: dense_balanced}
+  - {workload_ordinal: 47, power_regime: stress, topology_regime: single_source_dominant}
+  - {workload_ordinal: 48, power_regime: stress, topology_regime: clustered_interaction}
+  - {workload_ordinal: 49, power_regime: stress, topology_regime: spatially_distributed_sparse}
+  - {workload_ordinal: 50, power_regime: stress, topology_regime: dense_cross_type}

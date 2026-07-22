@@ -16,6 +16,8 @@ from .validate import POWER_DENSITY_LIMITS_W_PER_MM2 as CANONICAL_POWER_DENSITY_
 SCHEMA_VERSION = "benchmark_v2_workload/1"
 MANIFEST_SCHEMA_VERSION = "benchmark_v2_workload_manifest/1"
 DEFAULT_SEED = 20260721
+PHASE2_STAGE = "pilot_5x10"
+PHASE3_STAGE = "pilot_10x50"
 IDLE_POWER_FLOOR_W = 0.01  # Numerical lower bound; canonical per-type density floors dominate.
 NEAR_DUPLICATE_LINF_FRACTION = 1.0e-3
 IDLE_DENSITY_EPS_W_PER_MM2 = 1.0e-6
@@ -40,6 +42,22 @@ class WorkloadStratum:
     mode: str
 
 
+@dataclass(frozen=True)
+class ScaleTopology:
+    key: str
+    reference_stratum: str
+    active_fraction: float
+    mode: str
+    description: str
+
+
+@dataclass(frozen=True)
+class ScalePowerRegime:
+    key: str
+    load_fraction: float | None
+    description: str
+
+
 PILOT_STRATA: tuple[WorkloadStratum, ...] = (
     WorkloadStratum("low_balanced", 1.00, 0.10, "balanced"),
     WorkloadStratum("low_sparse_or_type_specific", 0.30, 0.16, "type_specific"),
@@ -51,6 +69,30 @@ PILOT_STRATA: tuple[WorkloadStratum, ...] = (
     WorkloadStratum("high_interacting_multi_source", 0.65, 0.88, "interacting"),
     WorkloadStratum("sparse_active_subset_stress", 0.15, 0.94, "sparse_subset"),
     WorkloadStratum("dense_active_subset_stress", 0.90, 0.94, "dense_subset"),
+)
+
+# The reference regime is exactly the accepted Phase 2 workload for a topology.
+# The four additional regimes use absolute within-type load fractions so their
+# meaning is stable across chiplet types and package families.
+SCALE_POWER_REGIMES: tuple[ScalePowerRegime, ...] = (
+    ScalePowerRegime("phase2_reference", None, "Accepted Phase 2 workload, reused by content hash."),
+    ScalePowerRegime("very_low", 0.06, "Near-idle active sources."),
+    ScalePowerRegime("moderate", 0.36, "Moderate package loading."),
+    ScalePowerRegime("high", 0.72, "High package loading."),
+    ScalePowerRegime("stress", 0.96, "Near-upper-bound active-source loading."),
+)
+
+SCALE_TOPOLOGIES: tuple[ScaleTopology, ...] = (
+    ScaleTopology("balanced", "low_balanced", 1.00, "balanced", "All-source balanced activity."),
+    ScaleTopology("memory_dominant", "low_sparse_or_type_specific", 0.30, "memory_dominant", "Memory-type activity where available."),
+    ScaleTopology("compute_dominant", "medium_balanced", 0.50, "compute_dominant", "CPU/GPU/NPU activity where available."),
+    ScaleTopology("type_specific", "medium_type_specific", 0.50, "type_specific", "Dominant chiplet-type subset."),
+    ScaleTopology("heterogeneous_cross_type", "medium_skewed", 0.70, "cross_type", "Round-robin heterogeneous activity."),
+    ScaleTopology("dense_balanced", "high_balanced_dense", 1.00, "balanced", "Dense balanced activity."),
+    ScaleTopology("single_source_dominant", "high_single_dominant", 0.55, "scale_single_dominant", "One dominant source with weak peers."),
+    ScaleTopology("clustered_interaction", "high_interacting_multi_source", 0.65, "scale_clustered", "Closest-source cluster interaction."),
+    ScaleTopology("spatially_distributed_sparse", "sparse_active_subset_stress", 0.15, "distributed", "Farthest-point sparse activity."),
+    ScaleTopology("dense_cross_type", "dense_active_subset_stress", 0.90, "cross_type", "Dense heterogeneous activity."),
 )
 
 
@@ -103,6 +145,84 @@ def generate_family_workloads(
         seen_hashes.add(content_hash)
         vectors.append(vector)
         records.append(workload)
+    return records
+
+
+def scale_workload_cells() -> list[dict[str, Any]]:
+    """Return the frozen, ordered 50-cell Phase 3 workload design."""
+    cells: list[dict[str, Any]] = []
+    ordinal = 1
+    for power in SCALE_POWER_REGIMES:
+        for topology in SCALE_TOPOLOGIES:
+            cells.append(
+                {
+                    "workload_ordinal": ordinal,
+                    "workload_cell": f"{power.key}__{topology.key}",
+                    "power_regime": power.key,
+                    "power_load_fraction": power.load_fraction,
+                    "topology_regime": topology.key,
+                    "reference_stratum": topology.reference_stratum,
+                    "active_fraction": topology.active_fraction,
+                    "mode": topology.mode,
+                    "description": f"{power.description} {topology.description}",
+                }
+            )
+            ordinal += 1
+    return cells
+
+
+def generate_scale_family_workloads(
+    family: dict[str, Any],
+    *,
+    base_seed: int = DEFAULT_SEED,
+) -> list[dict[str, Any]]:
+    """Generate Phase 3's 50 deterministic cells without changing geometry."""
+    reference_by_stratum = {
+        str(record["stratum"]): record
+        for record in generate_family_workloads(family, base_seed=base_seed)
+    }
+    chiplets = list(family["fixed_structure"]["layout"]["chiplets"])
+    records: list[dict[str, Any]] = []
+    vectors: list[list[float]] = []
+    hashes: set[str] = set()
+    ordered_chiplets = sorted(chiplets, key=lambda item: str(item["name"]))
+    for cell in scale_workload_cells():
+        ordinal = int(cell["workload_ordinal"])
+        if cell["power_regime"] == "phase2_reference":
+            record = dict(reference_by_stratum[str(cell["reference_stratum"])])
+        else:
+            stratum = WorkloadStratum(
+                str(cell["reference_stratum"]),
+                float(cell["active_fraction"]),
+                float(cell["power_load_fraction"]),
+                str(cell["mode"]),
+            )
+            seed = _workload_seed(base_seed, str(family["family_uid"]), ordinal)
+            record = _generate_workload(family, chiplets, stratum, ordinal, seed)
+        record["workload_cell"] = str(cell["workload_cell"])
+        record["power_regime"] = str(cell["power_regime"])
+        record["topology_regime"] = str(cell["topology_regime"])
+        record["sub_stratum"] = str(cell["workload_cell"])
+        record["active_chiplet_fraction"] = float(record["active_chiplet_count"]) / len(chiplets)
+        record["phase2_reference"] = bool(cell["power_regime"] == "phase2_reference")
+        problems = validate_workload(record, family)
+        if problems:
+            raise ValueError("\n".join(problems))
+        content_hash = str(record["content_hash"])
+        if content_hash in hashes:
+            raise ValueError(f"{family['family_uid']}: duplicate Phase 3 workload hash {content_hash}")
+        vector = [float(record["chiplet_power_W"][str(item["name"])]) for item in ordered_chiplets]
+        for previous_index, previous in enumerate(vectors, start=1):
+            denominator = max(max(previous), max(vector), IDLE_POWER_FLOOR_W)
+            distance = max(abs(left - right) for left, right in zip(previous, vector, strict=True)) / denominator
+            if distance <= NEAR_DUPLICATE_LINF_FRACTION:
+                raise ValueError(
+                    f"{family['family_uid']}: Phase 3 workload {ordinal} is near-identical to "
+                    f"workload {previous_index} (normalized L-inf={distance:.3g})"
+                )
+        hashes.add(content_hash)
+        vectors.append(vector)
+        records.append(record)
     return records
 
 
@@ -177,6 +297,7 @@ def write_workload_tree(
     output_root: str | Path,
     *,
     base_seed: int = DEFAULT_SEED,
+    stage: str = PHASE2_STAGE,
 ) -> dict[str, Any]:
     output_root = Path(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -185,7 +306,11 @@ def write_workload_tree(
     for family in families:
         family_uid = str(family["family_uid"])
         family_hashes[family_uid] = str(family.get("structural_fingerprint") or family.get("review", {}).get("structural_fingerprint", ""))
-        records = generate_family_workloads(family, base_seed=base_seed)
+        records = (
+            generate_scale_family_workloads(family, base_seed=base_seed)
+            if stage == PHASE3_STAGE
+            else generate_family_workloads(family, base_seed=base_seed)
+        )
         family_dir = output_root / family_uid
         family_dir.mkdir(parents=True, exist_ok=True)
         for record in records:
@@ -195,14 +320,15 @@ def write_workload_tree(
     manifest = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "benchmark_id": "benchmark_v2_50family",
-        "stage": "pilot_5x10",
+        "stage": stage,
         "base_seed": int(base_seed),
         "family_uids": sorted({str(record["family_uid"]) for record in all_records}),
         "family_structural_fingerprints": family_hashes,
         "family_count": len({record["family_uid"] for record in all_records}),
-        "workloads_per_family": len(PILOT_STRATA),
+        "workloads_per_family": len(scale_workload_cells()) if stage == PHASE3_STAGE else len(PILOT_STRATA),
         "workload_count": len(all_records),
         "strata": [item.key for item in PILOT_STRATA],
+        "workload_cells": scale_workload_cells() if stage == PHASE3_STAGE else [],
         "workload_hashes": [record["content_hash"] for record in all_records],
         "manifest_content_sha256": sha256_json(
             [{key: record[key] for key in ("family_uid", "workload_uid", "content_hash")} for record in all_records]
@@ -244,6 +370,10 @@ def _generate_workload(
                 fraction = 0.98 if name == dominant_name else 0.24 + 0.10 * rng.random()
             elif stratum.mode == "interacting":
                 fraction = 0.96 if name in interacting else 0.42 + 0.12 * rng.random()
+            elif stratum.mode == "scale_single_dominant":
+                fraction = min(0.98, fraction + 0.10) if name == dominant_name else max(0.03, 0.30 * fraction + 0.04 * rng.random())
+            elif stratum.mode == "scale_clustered":
+                fraction = min(0.98, fraction + 0.08) if name in interacting else max(0.03, 0.55 * fraction + 0.05 * rng.random())
             elif stratum.mode in {"sparse_subset", "dense_subset"}:
                 fraction = min(0.98, max(0.65, fraction - 0.08 * rng.random()))
             else:
@@ -284,7 +414,18 @@ def _select_active_chiplets(
 ) -> list[dict[str, Any]]:
     if active_count >= len(chiplets):
         return list(chiplets)
-    if mode == "type_specific":
+    if mode in {"type_specific", "memory_dominant", "compute_dominant"}:
+        preferred_types = {
+            "memory_dominant": {"HBM", "DRAM"},
+            "compute_dominant": {"CPU", "GPU", "NPU"},
+        }.get(mode)
+        if preferred_types is not None:
+            preferred = [item for item in chiplets if str(item["type"]) in preferred_types]
+            remainder = [item for item in chiplets if item not in preferred]
+            rng.shuffle(preferred)
+            rng.shuffle(remainder)
+            if preferred:
+                return (preferred + remainder)[:active_count]
         by_type: dict[str, list[dict[str, Any]]] = {}
         for item in chiplets:
             by_type.setdefault(str(item["type"]), []).append(item)
@@ -293,25 +434,43 @@ def _select_active_chiplets(
         remaining = [item for item in chiplets if item not in selected]
         rng.shuffle(remaining)
         return (selected + remaining)[:active_count]
-    if mode == "interacting":
+    if mode in {"interacting", "scale_clustered"}:
         pair = _closest_pair(chiplets)
         remaining = [item for item in chiplets if item not in pair]
         remaining.sort(key=lambda item: min(_center_distance(item, source) for source in pair))
         return (list(pair) + remaining)[:active_count]
+    if mode == "distributed":
+        return _farthest_point_subset(chiplets, active_count)
+    if mode == "cross_type":
+        by_type: dict[str, list[dict[str, Any]]] = {}
+        for item in chiplets:
+            by_type.setdefault(str(item["type"]), []).append(item)
+        for values in by_type.values():
+            values.sort(key=lambda item: str(item["name"]))
+        selected: list[dict[str, Any]] = []
+        while len(selected) < active_count:
+            changed = False
+            for chiplet_type in sorted(by_type):
+                if by_type[chiplet_type] and len(selected) < active_count:
+                    selected.append(by_type[chiplet_type].pop(0))
+                    changed = True
+            if not changed:
+                break
+        return selected
     selected = list(chiplets)
     rng.shuffle(selected)
     return selected[:active_count]
 
 
 def _interacting_sources(active: list[dict[str, Any]], mode: str) -> list[str]:
-    if mode != "interacting" or len(active) < 2:
+    if mode not in {"interacting", "scale_clustered"} or len(active) < 2:
         return []
     pair = _closest_pair(active)
     return [str(item["name"]) for item in pair]
 
 
 def _dominant_name(active: list[dict[str, Any]], mode: str) -> str | None:
-    if mode != "single_dominant":
+    if mode not in {"single_dominant", "scale_single_dominant"}:
         return None
     return str(max(active, key=lambda item: float(item["size"]["width"]) * float(item["size"]["height"]))["name"])
 
@@ -333,6 +492,23 @@ def _center_distance(left: dict[str, Any], right: dict[str, Any]) -> float:
     right_x = float(right["position"]["x"]) + 0.5 * float(right["size"]["width"])
     right_y = float(right["position"]["y"]) + 0.5 * float(right["size"]["height"])
     return math.hypot(left_x - right_x, left_y - right_y)
+
+
+def _farthest_point_subset(chiplets: list[dict[str, Any]], count: int) -> list[dict[str, Any]]:
+    ordered = sorted(chiplets, key=lambda item: str(item["name"]))
+    selected = [ordered[0]]
+    remaining = ordered[1:]
+    while remaining and len(selected) < count:
+        candidate = max(
+            remaining,
+            key=lambda item: (
+                min(_center_distance(item, chosen) for chosen in selected),
+                str(item["name"]),
+            ),
+        )
+        selected.append(candidate)
+        remaining.remove(candidate)
+    return selected
 
 
 def _workload_seed(base_seed: int, family_uid: str, workload_index: int) -> int:

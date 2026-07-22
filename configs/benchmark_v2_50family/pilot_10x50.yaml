@@ -1,0 +1,95 @@
+schema_version: benchmark_v2_pilot_selection/2
+benchmark_id: benchmark_v2_50family
+stage: pilot_10x50
+base_seed: 20260721
+expected_family_count: 10
+expected_workloads_per_family: 50
+expected_sample_count: 500
+selection_content_sha256: d9e0ad3c9d47a4b7d91289d38f9f1d30467ec9fe4871d4551d5a3097398feb90
+selected_families:
+  - family_uid: f002
+    taxonomy_category: hpc
+    role: hpc_train
+    primary_split: train
+    source_isolation_eligibility: learned_train
+    phase2_overlap: true
+    rationale: Accepted two-cluster HPC family with central memory and reusable Phase 2 reference workloads.
+  - family_uid: f007
+    taxonomy_category: hpc
+    role: hpc_validation
+    primary_split: val
+    source_isolation_eligibility: oracle_only
+    phase2_overlap: false
+    rationale: Validation HPC family broadens compute/memory scale without entering source-model fitting.
+  - family_uid: f009
+    taxonomy_category: memory_heavy
+    role: memory_heavy
+    primary_split: train
+    source_isolation_eligibility: learned_train
+    phase2_overlap: false
+    rationale: Memory-dominant package with HBM and DRAM majority.
+  - family_uid: f014
+    taxonomy_category: compute_heavy
+    role: compute_heavy
+    primary_split: train
+    source_isolation_eligibility: learned_train
+    phase2_overlap: false
+    rationale: GPU/NPU-heavy package stresses compute-dominant workload cells.
+  - family_uid: f023
+    taxonomy_category: mixed_heterogeneous
+    role: mixed_heterogeneous_validation
+    primary_split: val
+    source_isolation_eligibility: oracle_only
+    phase2_overlap: true
+    rationale: Accepted validation family spans all supported functional classes; isolated labels remain oracle-only.
+  - family_uid: f029
+    taxonomy_category: sparse_low_die
+    role: sparse_or_distributed
+    primary_split: train
+    source_isolation_eligibility: learned_train
+    phase2_overlap: true
+    rationale: Accepted sparse family supplies long-distance interactions and high whitespace.
+  - family_uid: f032
+    taxonomy_category: dense_high_die
+    role: dense_high_die
+    primary_split: train
+    source_isolation_eligibility: learned_train
+    phase2_overlap: true
+    rationale: Accepted 64-chiplet family is the graph, rasterization, and inode-throughput stress case.
+  - family_uid: f039
+    taxonomy_category: distributed
+    role: distributed
+    primary_split: train
+    source_isolation_eligibility: learned_train
+    phase2_overlap: false
+    rationale: Large distributed family tests far-field coupling across physical whitespace.
+  - family_uid: f040
+    taxonomy_category: edge_constrained
+    role: edge_constrained
+    primary_split: train
+    source_isolation_eligibility: learned_train
+    phase2_overlap: false
+    rationale: Edge-constrained placement tests package-boundary spreading behavior.
+  - family_uid: f044
+    taxonomy_category: package_scale_aspect
+    role: compound_ood_test
+    primary_split: test
+    source_isolation_eligibility: oracle_only
+    phase2_overlap: true
+    rationale: Accepted high-aspect compound-OOD family remains the strict evaluation-only package.
+source_response_policy:
+  train_eligible_families: [f002, f009, f014, f029, f032, f039, f040]
+  oracle_only_families: [f007, f023, f044]
+  isolation_frequency: once_per_chiplet_per_fixed_family
+  validation_test_usage: oracle_only_no_fit_no_normalization_no_selection
+sample_split_assignment:
+  train_workload_ordinals: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40]
+  val_workload_ordinals: [41, 42, 43, 44, 45]
+  test_workload_ordinals: [46, 47, 48, 49, 50]
+workload_design:
+  matrix: 5_power_regimes_x_10_activity_topology_regimes
+  workload_cell_spec_path: configs/benchmark_v2_50family/pilot_10x50_workload_cells.yaml
+  workload_cell_spec_sha256: 7e72f2a4996f843b40bffa82464dc50dbaad8be307933ebe6c19c105d2830788
+  reference_cells_reuse_phase2: true
+  power_regimes: [phase2_reference, very_low, moderate, high, stress]
+  topology_regimes: [balanced, memory_dominant, compute_dominant, type_specific, heterogeneous_cross_type, dense_balanced, single_source_dominant, clustered_interaction, spatially_distributed_sparse, dense_cross_type]
