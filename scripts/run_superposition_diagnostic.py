@@ -59,6 +59,12 @@ class HotSpotRunError(RuntimeError):
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run source-isolation superposition diagnostics for ChipTherm HotSpot samples.")
     parser.add_argument("--index", default=REPO_ROOT / "data/runs/benchmarks/dataset_v2_clean_impedance_graph/package_plus_power/test_index.csv", type=Path)
+    parser.add_argument(
+        "--data-root",
+        default=None,
+        type=Path,
+        help="Resolve relative index paths against this root. Without it, retain legacy repository-relative behavior.",
+    )
     parser.add_argument("--out-dir", default=REPO_ROOT / "outputs/superposition_diagnostic", type=Path)
     parser.add_argument("--sample-uids", nargs="*", default=None)
     parser.add_argument("--cases", nargs="*", default=None)
@@ -96,7 +102,12 @@ def main() -> int:
     if not selected:
         raise SystemExit("No samples selected.")
 
-    plan = estimate_hotspot_runs(selected, run_zero_power=bool(args.run_zero_power), power_scales=args.power_scale_test)
+    plan = estimate_hotspot_runs(
+        selected,
+        run_zero_power=bool(args.run_zero_power),
+        power_scales=args.power_scale_test,
+        data_root=args.data_root,
+    )
     print_selection_plan(selected, plan)
     if args.dry_run:
         write_run_manifest(args.out_dir, args, selected, plan, dry_run=True)
@@ -118,6 +129,7 @@ def main() -> int:
                 power_scale_source_index=int(args.power_scale_source_index),
                 resume=bool(args.resume),
                 overwrite=bool(args.overwrite),
+                data_root=args.data_root,
             )
             sample_records.append(sample_result["sample_metrics"])
             power_scaling_records.extend(sample_result["power_scaling"])
@@ -196,11 +208,12 @@ def estimate_hotspot_runs(
     *,
     run_zero_power: bool,
     power_scales: list[float] | None,
+    data_root: Path | None = None,
 ) -> dict[str, Any]:
     isolated = 0
     chiplet_counts: dict[str, int] = {}
     for row in rows:
-        source_dir = source_dir_for_row(row)
+        source_dir = source_dir_for_row(row, data_root=data_root)
         layout = load_json(source_dir / "layout.json")
         count = len(layout.get("chiplets", []))
         chiplet_counts[row["sample_uid"]] = count
@@ -242,8 +255,9 @@ def process_sample(
     power_scale_source_index: int,
     resume: bool,
     overwrite: bool,
+    data_root: Path | None = None,
 ) -> dict[str, Any]:
-    source_dir = source_dir_for_row(row)
+    source_dir = source_dir_for_row(row, data_root=data_root)
     layout = load_json(source_dir / "layout.json")
     package = load_yaml(source_dir / "package.yaml")
     power = load_yaml(source_dir / "power.yaml")
@@ -263,7 +277,8 @@ def process_sample(
         shutil.rmtree(sample_dir)
     sample_dir.mkdir(parents=True, exist_ok=True)
 
-    full_temperature = np.load(row["y_path"]).astype(np.float64, copy=False)
+    full_temperature_path = resolve_index_path(row["y_path"], data_root=data_root, field_name="y_path", must_exist=True)
+    full_temperature = np.load(full_temperature_path).astype(np.float64, copy=False)
     np.save(sample_dir / "full_temperature.npy", full_temperature.astype(np.float32))
     original_power_path = sample_dir / "original_power.json"
     original_power_path.write_text(json.dumps(powers, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -328,11 +343,12 @@ def process_sample(
         row=row,
         layout=layout,
         hotspot=hotspot,
-        x_path=Path(row["x_path"]),
+        x_path=resolve_index_path(row["x_path"], data_root=data_root, field_name="x_path", must_exist=True),
         baseline=baseline,
         ambient_K=ambient,
         zero_run=zero_run,
         isolated_runs=isolated_runs,
+        source_dir=source_dir,
     )
     metrics["sources"] = per_source_records
     metrics["full_temperature_path"] = row["y_path"]
@@ -718,6 +734,7 @@ def sample_metrics(
     ambient_K: float,
     zero_run: SourceRun | None,
     isolated_runs: list[SourceRun],
+    source_dir: Path,
 ) -> dict[str, Any]:
     package_size = layout["package"]["size"]
     width_mm = float(package_size["width"])
@@ -743,7 +760,7 @@ def sample_metrics(
         "case_id": row["case_id"],
         "sample_uid": row["sample_uid"],
         "num_chiplets": len(layout.get("chiplets", [])),
-        "total_power_W": float(row.get("total_power_W") or sum(active_power_map(load_yaml(source_dir_for_row(row) / "power.yaml")).values())),
+        "total_power_W": float(row.get("total_power_W") or sum(active_power_map(load_yaml(source_dir / "power.yaml")).values())),
         "package_width_mm": width_mm,
         "package_height_mm": height_mm,
         "grid_rows": int(hotspot.get("grid", {}).get("rows", target.shape[0])),
@@ -1131,14 +1148,79 @@ def write_run_manifest(out_dir: Path, args: argparse.Namespace, selected: list[d
     (out_dir / "selection_manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def source_dir_for_row(row: dict[str, str]) -> Path:
+def resolve_index_path(
+    logical_path: str | Path,
+    *,
+    data_root: Path | None = None,
+    field_name: str = "path",
+    must_exist: bool = False,
+) -> Path:
+    """Resolve one index path without mixing v2 and legacy path roots."""
+    logical = str(logical_path).strip()
+    if not logical:
+        raise ValueError(f"empty logical {field_name}")
+    path = Path(logical).expanduser()
+    if path.is_absolute():
+        resolved = path.resolve()
+        resolution_root = "<absolute legacy path>"
+    elif data_root is not None:
+        root = Path(data_root).expanduser().resolve()
+        resolved = (root / path).resolve()
+        try:
+            resolved.relative_to(root)
+        except ValueError as exc:
+            raise ValueError(
+                f"{field_name} logical path {logical!r} escapes explicit data root {root}"
+            ) from exc
+        resolution_root = str(root)
+    else:
+        resolved = (REPO_ROOT / path).resolve()
+        resolution_root = str(REPO_ROOT)
+    if must_exist and not resolved.exists():
+        raise FileNotFoundError(
+            f"missing {field_name}: logical path={logical!r}, resolution root={resolution_root}, resolved path={resolved}"
+        )
+    return resolved
+
+
+def source_dir_for_row(row: dict[str, str], *, data_root: Path | None = None) -> Path:
+    explicit_source_dir = str(row.get("source_dir", "")).strip()
+    if explicit_source_dir:
+        return resolve_index_path(
+            explicit_source_dir,
+            data_root=data_root,
+            field_name="source_dir",
+            must_exist=True,
+        )
+    layout_path = str(row.get("layout_path", "")).strip()
+    if layout_path:
+        layout = resolve_index_path(
+            layout_path,
+            data_root=data_root,
+            field_name="layout_path",
+            must_exist=True,
+        )
+        return layout.parent
+    if data_root is not None:
+        raise FileNotFoundError(
+            "row has neither source_dir nor layout_path; refusing legacy source reconstruction "
+            f"under explicit data root {Path(data_root).expanduser().resolve()} "
+            f"for sample_uid={row.get('sample_uid', '')!r}"
+        )
     case_id = row["case_id"]
     original = row.get("original_sample_uid") or row["sample_uid"]
     sample_name = original
     prefix = f"{case_id}_"
     if sample_name.startswith(prefix):
         sample_name = sample_name[len(prefix) :]
-    return REPO_ROOT / "data/runs/benchmarks" / row["dataset_source"] / case_id / sample_name / "source"
+    source_dir = REPO_ROOT / "data/runs/benchmarks" / row["dataset_source"] / case_id / sample_name / "source"
+    if not source_dir.exists():
+        raise FileNotFoundError(
+            "missing legacy source_dir: "
+            f"logical path=<reconstructed from dataset_source/case/sample>, resolution root={REPO_ROOT}, "
+            f"resolved path={source_dir}"
+        )
+    return source_dir
 
 
 def load_json(path: Path) -> dict[str, Any]:

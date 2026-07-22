@@ -31,6 +31,7 @@ from scripts.run_superposition_diagnostic import (
     modified_power_yaml,
     run_power_case,
     safe_name,
+    resolve_index_path,
     source_dir_for_row,
 )
 
@@ -40,6 +41,12 @@ def main() -> int:
     parser.add_argument("--train-index", required=True, type=Path)
     parser.add_argument("--val-index", required=True, type=Path)
     parser.add_argument("--test-index", required=True, type=Path)
+    parser.add_argument(
+        "--data-root",
+        default=None,
+        type=Path,
+        help="Resolve relative input-index paths against this declared benchmark root.",
+    )
     parser.add_argument("--out-root", default=REPO_ROOT / "data/runs/derived/source_response_v1", type=Path)
     parser.add_argument("--cases", nargs="*", default=None)
     parser.add_argument("--samples-per-case", default=None, type=int)
@@ -54,6 +61,7 @@ def main() -> int:
     args = parser.parse_args()
 
     out_root = args.out_root.resolve()
+    data_root = args.data_root.expanduser().resolve() if args.data_root is not None else None
     assert_safe_derived_root(out_root)
     if args.overwrite and out_root.exists() and not args.dry_run:
         shutil.rmtree(out_root)
@@ -69,7 +77,11 @@ def main() -> int:
         split: select_split_rows(rows, cases=args.cases, samples_per_case=args.samples_per_case, sample_uids=args.sample_uids, seed=args.seed + offset)
         for offset, (split, rows) in enumerate(split_inputs.items())
     }
-    plan = plan_generation(selected_by_split, max_sources_per_sample=args.max_sources_per_sample)
+    plan = plan_generation(
+        selected_by_split,
+        max_sources_per_sample=args.max_sources_per_sample,
+        data_root=data_root,
+    )
     print_plan(plan)
     if args.dry_run:
         return 0
@@ -89,6 +101,7 @@ def main() -> int:
                         hotspot_home=args.hotspot_home,
                         config_template=args.config_template,
                         resume=args.resume,
+                        data_root=data_root,
                     )
                 )
             except Exception as exc:
@@ -153,7 +166,12 @@ def select_split_rows(
     return selected
 
 
-def plan_generation(selected_by_split: dict[str, list[dict[str, str]]], *, max_sources_per_sample: int | None) -> dict[str, Any]:
+def plan_generation(
+    selected_by_split: dict[str, list[dict[str, str]]],
+    *,
+    max_sources_per_sample: int | None,
+    data_root: Path | None = None,
+) -> dict[str, Any]:
     split_counts: dict[str, Any] = {}
     total_runs = 0
     total_bytes = 0
@@ -161,7 +179,7 @@ def plan_generation(selected_by_split: dict[str, list[dict[str, str]]], *, max_s
     for split, rows in selected_by_split.items():
         runs = 0
         for row in rows:
-            layout = load_json(source_dir_for_row(row) / "layout.json")
+            layout = load_json(source_dir_for_row(row, data_root=data_root) / "layout.json")
             count = len(layout.get("chiplets", []))
             if max_sources_per_sample is not None:
                 count = min(count, int(max_sources_per_sample))
@@ -197,15 +215,22 @@ def process_sample(
     hotspot_home: Path | None,
     config_template: Path,
     resume: bool,
+    data_root: Path | None = None,
 ) -> list[dict[str, Any]]:
-    source_dir = source_dir_for_row(row)
+    source_dir = source_dir_for_row(row, data_root=data_root)
     layout = load_json(source_dir / "layout.json")
     power_yaml = load_yaml(source_dir / "power.yaml")
     package = load_yaml(source_dir / "package.yaml")
     chiplets = list(layout.get("chiplets", []))
     powers = active_power_map(power_yaml)
     ambient_K = float(package["ambient_K"])
-    full_temperature = np.load(row["y_path"]).astype(np.float32, copy=False)
+    full_temperature_path = resolve_index_path(
+        row["y_path"],
+        data_root=data_root,
+        field_name="y_path",
+        must_exist=True,
+    )
+    full_temperature = np.load(full_temperature_path).astype(np.float32, copy=False)
     limit = len(chiplets) if max_sources_per_sample is None else min(len(chiplets), int(max_sources_per_sample))
     records: list[dict[str, Any]] = []
     for source_index, chiplet in enumerate(chiplets[:limit]):
@@ -218,7 +243,7 @@ def process_sample(
         if resume and target_path.exists():
             rise = np.load(target_path)
             if rise.shape == full_temperature.shape and np.isfinite(rise).all():
-                records.append(make_record(row, split, source_uid, source_index, chiplet, source_power, ambient_K, target_path, layout, len(chiplets), limit))
+                records.append(make_record(row, split, source_uid, source_index, chiplet, source_power, ambient_K, target_path, layout, len(chiplets), limit, data_root=data_root))
                 continue
         run = run_power_case(
             source_dir=source_dir,
@@ -233,7 +258,7 @@ def process_sample(
         isolated_temperature = np.load(run.temperature_path).astype(np.float32, copy=False)
         rise = isolated_temperature - np.float32(ambient_K)
         np.save(target_path, rise.astype(np.float32, copy=False))
-        records.append(make_record(row, split, source_uid, source_index, chiplet, source_power, ambient_K, target_path, layout, len(chiplets), limit, run.runtime_s))
+        records.append(make_record(row, split, source_uid, source_index, chiplet, source_power, ambient_K, target_path, layout, len(chiplets), limit, run.runtime_s, data_root=data_root))
     return records
 
 
@@ -250,10 +275,12 @@ def make_record(
     num_chiplets: int,
     num_sources_included: int,
     runtime_s: float | None = None,
+    *,
+    data_root: Path | None = None,
 ) -> dict[str, Any]:
     size = chiplet["size"]
     area = float(size["width"]) * float(size["height"])
-    source_dir = source_dir_for_row(row)
+    source_dir = source_dir_for_row(row, data_root=data_root)
     return {
         "source_response_uid": source_uid,
         "original_sample_uid": row["sample_uid"],
@@ -264,10 +291,10 @@ def make_record(
         "original_x_path": row["x_path"],
         "original_y_path": row["y_path"],
         "full_temperature_path": row["y_path"],
-        "layout_path": repo_relative(source_dir / "layout.json"),
-        "power_path": repo_relative(source_dir / "power.yaml"),
-        "package_path": repo_relative(source_dir / "package.yaml"),
-        "hotspot_path": repo_relative(source_dir / "hotspot.yaml"),
+        "layout_path": portable_path(source_dir / "layout.json", data_root=data_root),
+        "power_path": portable_path(source_dir / "power.yaml", data_root=data_root),
+        "package_path": portable_path(source_dir / "package.yaml", data_root=data_root),
+        "hotspot_path": portable_path(source_dir / "hotspot.yaml", data_root=data_root),
         "source_index": source_index,
         "source_name": str(chiplet["name"]),
         "source_type": str(chiplet.get("type", "")),
@@ -275,7 +302,7 @@ def make_record(
         "source_area_mm2": area,
         "source_power_density_W_per_mm2": source_power / max(area, 1.0e-12),
         "ambient_K": ambient_K,
-        "target_rise_path": repo_relative(target_path),
+        "target_rise_path": portable_path(target_path, data_root=data_root),
         "num_chiplets": num_chiplets,
         "num_sources_included": num_sources_included,
         "source_response_runtime_s": runtime_s,
@@ -323,6 +350,17 @@ def repo_relative(path: Path) -> str:
         return str(path.resolve().relative_to(REPO_ROOT))
     except ValueError:
         return str(path)
+
+
+def portable_path(path: Path, *, data_root: Path | None = None) -> str:
+    resolved = path.resolve()
+    if data_root is not None:
+        root = Path(data_root).resolve()
+        try:
+            return str(resolved.relative_to(root))
+        except ValueError:
+            pass
+    return repo_relative(resolved)
 
 
 def assert_safe_derived_root(out_root: Path) -> None:

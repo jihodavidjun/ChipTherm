@@ -849,7 +849,11 @@ def build_derived_pipeline(
         add_source_lineage_columns(source_stage, source_lineage, portable_checkpoint, paths.data_root)
         promote_directory(source_stage, source_dest, resume=False)
 
-    isolation = build_isolation_inputs(raw_rows, selection, derived_run / "isolation_inputs", paths.data_root)
+    # Source-response records require the encoded X path as well as the raw
+    # source/label paths. The promoted graph index is the first canonical view
+    # that contains the complete portable row contract.
+    isolation_rows = read_csv(graph_dest / "combined_encoded_index.csv")
+    isolation = build_isolation_inputs(isolation_rows, selection, derived_run / "isolation_inputs", paths.data_root)
     return {
         "encoded_13ch": encoded_dest,
         "context_17ch": finite_dest,
@@ -887,7 +891,24 @@ def build_isolation_inputs(
     result: dict[str, Path] = {}
     for split, rows in selected.items():
         path = output_root / f"{split}_index.csv"
-        write_csv(path, absolutize_rows(rows, data_root))
+        for row in rows:
+            for key in PATH_COLUMNS:
+                value = str(row.get(key, "")).strip()
+                if not value:
+                    continue
+                if Path(value).is_absolute() or value.startswith("../"):
+                    raise ValueError(
+                        f"source-isolation input must remain data-root-relative: "
+                        f"sample_uid={row.get('sample_uid')} field={key} value={value!r}"
+                    )
+                resolved = resolve_data_path(value, data_root)
+                if not resolved.exists():
+                    raise FileNotFoundError(
+                        f"source-isolation input is unresolved: sample_uid={row.get('sample_uid')} "
+                        f"field={key} logical path={value!r} resolution root={Path(data_root).resolve()} "
+                        f"resolved path={resolved}"
+                    )
+        write_csv(path, rows)
         result[split] = path
     return result
 
@@ -911,6 +932,7 @@ def run_source_isolation(
         "--train-index", str(isolation_inputs["train"]),
         "--val-index", str(isolation_inputs["val"]),
         "--test-index", str(isolation_inputs["test"]),
+        "--data-root", str(paths.data_root),
         "--out-root", str(stage),
         "--cases", *selected_families,
         "--samples-per-case", "1",

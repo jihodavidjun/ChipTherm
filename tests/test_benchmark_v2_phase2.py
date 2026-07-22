@@ -15,6 +15,8 @@ from torch.utils.data import DataLoader
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 if str(REPO_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "src"))
 
@@ -23,6 +25,7 @@ from chiptherm.benchmark_v2_pipeline import (  # noqa: E402
     PilotBuildOptions,
     audit_index_paths,
     audit_portable_documents,
+    build_isolation_inputs,
     build_pilot,
     load_selection,
     relocate_pilot,
@@ -42,6 +45,8 @@ from chiptherm.ml.dataset import ChipThermDataset, chiptherm_collate  # noqa: E4
 from chiptherm.ml.encoder import CHANNEL_NAMES  # noqa: E402
 from chiptherm.ml.graph_models import EDGE_FEATURE_NAMES, NODE_FEATURE_NAMES  # noqa: E402
 from chiptherm.parsers import parse_layer_grid  # noqa: E402
+from scripts.build_source_response_dataset import plan_generation  # noqa: E402
+from scripts.run_superposition_diagnostic import resolve_index_path, source_dir_for_row  # noqa: E402
 
 
 SELECTION_PATH = REPO_ROOT / "configs/benchmark_v2_50family/pilot_5x10.yaml"
@@ -170,6 +175,95 @@ class BenchmarkV2Phase2Tests(unittest.TestCase):
             self.assertTrue(torch.isfinite(sample["physics"]).all())
             self.assertEqual(audit_index_paths(relocated.rows, destination), [])
             self.assertEqual(audit_portable_documents(destination)["violation_count"], 0)
+
+    def test_source_isolation_paths_use_explicit_root_and_relocate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary)
+            source_root = parent / "external_benchmark_root"
+            raw_rows: list[dict[str, str]] = []
+            for family_index, family_uid in enumerate(self.family_uids):
+                uid = f"{family_uid}_w001_low_balanced"
+                sample_root = source_root / f"canonical/hotspot_labels/{family_uid}/{uid}"
+                source_dir = sample_root / "source"
+                parsed_dir = sample_root / "parsed"
+                encoded_dir = source_root / f"derived/graphs/{family_uid}"
+                source_dir.mkdir(parents=True)
+                parsed_dir.mkdir(parents=True)
+                encoded_dir.mkdir(parents=True, exist_ok=True)
+                (source_dir / "layout.json").write_text(
+                    json.dumps({"chiplets": [{"name": "CPU0"}], "package": {"size": {"width": 10, "height": 10}}}),
+                    encoding="utf-8",
+                )
+                for name in ("power.yaml", "package.yaml", "hotspot.yaml"):
+                    (source_dir / name).write_text("fixture: true\n", encoding="utf-8")
+                np.save(parsed_dir / "temp_layer0.npy", np.zeros((64, 64), dtype=np.float32))
+                np.save(encoded_dir / f"{uid}_x.npy", np.zeros((33, 64, 64), dtype=np.float32))
+                raw_rows.append({
+                    "benchmark_id": "benchmark_v2_50family",
+                    "family_uid": family_uid,
+                    "workload_uid": "w001",
+                    "sample_uid": uid,
+                    "original_sample_uid": uid,
+                    "case_id": family_uid,
+                    "dataset_source": "benchmark_v2_50family",
+                    "split": "train",
+                    "source_dir": f"canonical/hotspot_labels/{family_uid}/{uid}/source",
+                    "layout_path": f"canonical/hotspot_labels/{family_uid}/{uid}/source/layout.json",
+                    "power_path": f"canonical/hotspot_labels/{family_uid}/{uid}/source/power.yaml",
+                    "package_path": f"canonical/hotspot_labels/{family_uid}/{uid}/source/package.yaml",
+                    "hotspot_path": f"canonical/hotspot_labels/{family_uid}/{uid}/source/hotspot.yaml",
+                    "x_path": f"derived/graphs/{family_uid}/{uid}_x.npy",
+                    "y_path": f"canonical/hotspot_labels/{family_uid}/{uid}/parsed/temp_layer0.npy",
+                })
+
+            indices = build_isolation_inputs(raw_rows, self.selection, parent / "isolation_inputs", source_root)
+            all_rows: list[dict[str, str]] = []
+            for index_path in indices.values():
+                text = index_path.read_text(encoding="utf-8")
+                self.assertFalse(any(prefix in text for prefix in ("/nethome/", "/Users/", "/tmp/", "/export/hdd/")))
+                with index_path.open("r", newline="", encoding="utf-8") as handle:
+                    rows = list(csv.DictReader(handle))
+                all_rows.extend(rows)
+                for row in rows:
+                    self.assertFalse(Path(row["source_dir"]).is_absolute())
+                    self.assertFalse(Path(row["x_path"]).is_absolute())
+                    self.assertTrue(source_dir_for_row(row, data_root=source_root).is_dir())
+
+            plan = plan_generation(
+                {
+                    split: [row for row in all_rows if row["split"] == split]
+                    for split in ("train", "val", "test")
+                },
+                max_sources_per_sample=None,
+                data_root=source_root,
+            )
+            self.assertEqual(plan["total_original_samples"], 5)
+            self.assertEqual(plan["total_isolated_hotspot_runs"], 5)
+
+            relocated_root = parent / "relocated_benchmark_root"
+            shutil.copytree(source_root, relocated_root)
+            for row in all_rows:
+                relocated_source = source_dir_for_row(row, data_root=relocated_root)
+                self.assertTrue(relocated_source.is_dir())
+                self.assertTrue((relocated_source / "layout.json").is_file())
+
+    def test_source_isolation_resolution_errors_and_legacy_fallback(self) -> None:
+        legacy = resolve_index_path("README.md", must_exist=True)
+        self.assertEqual(legacy, (REPO_ROOT / "README.md").resolve())
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "external_root"
+            root.mkdir()
+            row = {
+                "sample_uid": "f002_w001_low_balanced",
+                "case_id": "f002",
+                "dataset_source": "benchmark_v2_50family",
+                "source_dir": "canonical/hotspot_labels/f002/f002_w001_low_balanced/source",
+            }
+            with self.assertRaises(FileNotFoundError) as caught:
+                source_dir_for_row(row, data_root=root)
+            message = str(caught.exception)
+            self.assertIn(row["source_dir"], message)
+            self.assertIn(str(root.resolve()), message)
 
     def _dry_options(self, root: Path, run_id: str, *, resume: bool) -> PilotBuildOptions:
         return PilotBuildOptions(
