@@ -10,7 +10,7 @@
   },
   "required_parent_hashes": {
     "phase1_family_manifest_sha256": "18f8a646ce75b076ec690720034adc6590f6d753f3faa1b55bc608bb99cc609e",
-    "artifact_manifest_schema_sha256": "2f9876ac4a8abc62e201b747d05817c040651f54b1d8b5ee204533ad8d99c8a2",
+    "artifact_manifest_schema_sha256": "3ee53d410189507d57954eab99e0cb54e57a56f23b724a26124e328a6ebf698a",
     "pilot_selection_sha256": "576722ef160f59eb80d016443026b1d77bc68c3ca6d6bf34d004a5ed59f007d1"
   },
   "runtime_required_fields": [

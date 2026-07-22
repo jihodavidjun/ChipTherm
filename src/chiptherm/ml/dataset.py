@@ -17,6 +17,8 @@ PhysicalRepresentation = Literal["dimensional", "dimensionless_v1", "dimensionle
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DATA_ROOT_MARKER = ".chiptherm_data_root.json"
+V2_TEMPERATURE_PATH_FIELDS = ("y_path", "temp_layer0_path", "original_temp_path")
+LEGACY_TEMPERATURE_PATH_FIELDS = ("final_temperature",)
 
 
 DIMENSIONLESS_V1_TRANSFORMS = {
@@ -248,7 +250,7 @@ class ChipThermDataset(Dataset):
 
         x = self._load_tensor(row["x_path"], expected_ndim=3)
         x = self._apply_physical_representation(row, x)
-        temperature = self._load_tensor(row["y_path"], expected_ndim=2)
+        temperature = self._load_tensor(self._temperature_path_for_row(row), expected_ndim=2)
         physics_path_value = self._prediction_path_for_row(row)
         physics = self._load_tensor(physics_path_value, expected_ndim=2)
         residual_path_value = self._residual_path_for_row(row)
@@ -302,7 +304,7 @@ class ChipThermDataset(Dataset):
             "samples_per_case": dict(sorted(case_counts.items())),
             "dataset_sources": dict(sorted(source_counts.items())),
             "input_shape": self._array_shape("x_path"),
-            "target_shape": self._array_shape("residual_path" if self.target == "residual" else "y_path"),
+            "target_shape": self._array_shape("residual_path" if self.target == "residual" else "__temperature__"),
             "target": self.target,
             "physical_representation": self.physical_representation,
             "mean_hotspot_temperature_K": self._mean("mean_temperature_K"),
@@ -488,7 +490,7 @@ class ChipThermDataset(Dataset):
             "hotspot_runtime_s": self._optional_float(row.get("hotspot_runtime_s"), default=0.0),
             "physics_runtime_s": self._optional_float(row.get("physics_runtime_s"), default=0.0),
             "x_path": row["x_path"],
-            "y_path": row["y_path"],
+            "y_path": self._temperature_path_for_row(row),
             "prediction_path": row.get("prediction_path", ""),
             "residual_path": row.get("residual_path", ""),
             "effective_prediction_path": self._prediction_path_for_row(row),
@@ -551,6 +553,18 @@ class ChipThermDataset(Dataset):
             return value
         return row["prediction_path"]
 
+    def _temperature_path_for_row(self, row: dict[str, str]) -> str:
+        for field in (*V2_TEMPERATURE_PATH_FIELDS, *LEGACY_TEMPERATURE_PATH_FIELDS):
+            value = str(row.get(field, "")).strip()
+            if value:
+                return value
+        available = sorted(row.keys())
+        expected = [*V2_TEMPERATURE_PATH_FIELDS, *LEGACY_TEMPERATURE_PATH_FIELDS]
+        raise ValueError(
+            f"row {row.get('sample_uid', '<unknown>')} has no temperature target path; "
+            f"expected one of {expected}, available columns={available}"
+        )
+
     def _residual_path_for_row(self, row: dict[str, str]) -> str | None:
         mode = row.get("source_base_mode") or row.get("base_mode") or row.get("physics_input_mode")
         if mode == "source_superposition_v1":
@@ -604,7 +618,8 @@ class ChipThermDataset(Dataset):
         return candidates[0]
 
     def _array_shape(self, column: str) -> tuple[int, ...]:
-        path = self._resolve_path(self.rows[0][column])
+        value = self._temperature_path_for_row(self.rows[0]) if column == "__temperature__" else self.rows[0][column]
+        path = self._resolve_path(value)
         return tuple(int(size) for size in np.load(path, mmap_mode="r").shape)
 
     def _mean(self, column: str) -> float:

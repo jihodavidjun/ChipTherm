@@ -27,7 +27,11 @@ from chiptherm.benchmark_v2_pipeline import (  # noqa: E402
     audit_portable_documents,
     build_isolation_inputs,
     build_pilot,
+    durable_stage_complete,
+    loader_smoke,
     load_selection,
+    make_tree_manifest,
+    repair_pilot_portability,
     relocate_pilot,
     sha256_file,
     validate_artifact_manifest,
@@ -264,6 +268,83 @@ class BenchmarkV2Phase2Tests(unittest.TestCase):
             message = str(caught.exception)
             self.assertIn(row["source_dir"], message)
             self.assertIn(str(root.resolve()), message)
+
+    def test_portability_repair_preserves_completed_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "pilot"
+            stage = root / "derived/context_33ch"
+            stage.mkdir(parents=True)
+            (root / "canonical/manifests").mkdir(parents=True)
+            (root / ".chiptherm_data_root.json").write_text(
+                json.dumps({
+                    "schema_version": "chiptherm_data_root/1",
+                    "benchmark_id": "benchmark_v2_50family",
+                    "root_id": "fixture",
+                    "path_semantics": "relative_to_declared_data_root",
+                }),
+                encoding="utf-8",
+            )
+            tensor_path = stage / "sample_x.npy"
+            np.save(tensor_path, np.ones((33, 64, 64), dtype=np.float32))
+            tensor_hash = sha256_file(tensor_path)
+            self._write_csv(
+                stage / "combined_encoded_index.csv",
+                [{"sample_uid": "sample", "x_path": str(tensor_path), "y_path": ""}],
+            )
+            completion = make_tree_manifest(stage, exclude_names={".stage_complete.json"})
+            (stage / ".stage_complete.json").write_text(
+                json.dumps({
+                    "schema_version": "benchmark_v2_stage_completion/1",
+                    "file_count": completion["file_count"],
+                    "files": [{"path": item["path"], "sha256": item["sha256"]} for item in completion["files"]],
+                }),
+                encoding="utf-8",
+            )
+            provenance = {
+                "path_semantics": "informational_nonresolving",
+                "command": ["python3", "/nethome/example/chiptherm/script.py"],
+            }
+            (root / "canonical/manifests/informational.json").write_text(json.dumps(provenance), encoding="utf-8")
+            before = audit_portable_documents(root)
+            self.assertEqual(before["violation_count"], 1)
+            self.assertEqual(before["informational_nonresolving_count"], 1)
+
+            report = repair_pilot_portability(root, apply=True)
+            self.assertGreaterEqual(report["changed_file_count"], 2)
+            self.assertEqual(report["after"]["violation_count"], 0)
+            self.assertEqual(sha256_file(tensor_path), tensor_hash)
+            self.assertTrue(durable_stage_complete(stage))
+            with (stage / "combined_encoded_index.csv").open("r", newline="", encoding="utf-8") as handle:
+                repaired_row = next(csv.DictReader(handle))
+            self.assertEqual(repaired_row["x_path"], "derived/context_33ch/sample_x.npy")
+
+    def test_v2_and_legacy_temperature_target_adapters(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "pilot"
+            v2_index = self._make_loader_fixture(root)
+            v2_dataset = ChipThermDataset(v2_index, target="temperature", return_graph=True)
+            self.assertEqual(tuple(v2_dataset[0]["temperature"].shape), (64, 64))
+
+            with v2_index.open("r", newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            for row in rows:
+                row["final_temperature"] = row.pop("y_path")
+            legacy_index = v2_index.parent / "legacy_index.csv"
+            self._write_csv(legacy_index, rows)
+            legacy_dataset = ChipThermDataset(legacy_index, target="temperature", return_graph=True)
+            self.assertEqual(tuple(legacy_dataset[0]["temperature"].shape), (64, 64))
+
+            broken = dict(rows[0])
+            broken["final_temperature"] = ""
+            broken_index = v2_index.parent / "broken_index.csv"
+            self._write_csv(broken_index, [broken])
+            with self.assertRaisesRegex(ValueError, "available columns"):
+                ChipThermDataset(broken_index, target="temperature", return_graph=False)[0]
+
+            checkpoint = REPO_ROOT / "outputs/source_superposition_feature_fusion/source_superposition_cnn_feature_fusion_gnn_seed1/checkpoints/best.pt"
+            if checkpoint.exists():
+                smoke = loader_smoke(v2_index, residual_checkpoint=checkpoint)
+                self.assertTrue(smoke["passed"], smoke.get("details"))
 
     def _dry_options(self, root: Path, run_id: str, *, resume: bool) -> PilotBuildOptions:
         return PilotBuildOptions(

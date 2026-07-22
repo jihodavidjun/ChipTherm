@@ -57,12 +57,17 @@ PATH_COLUMNS = {
     "source_power_path",
     "source_package_path",
     "source_hotspot_path",
+    "source_checkpoint",
     "target_rise_path",
+    "temperature_path",
+    "final_temperature",
+    "final_temperature_path",
     "full_temperature_path",
     "original_x_path",
     "original_y_path",
 }
 PORTABLE_FORBIDDEN_PREFIXES = ("/Users/", "/nethome/", "/tmp/", "/export/hdd/")
+INFORMATIONAL_PATH_SEMANTICS = "informational_nonresolving"
 CANONICAL_METADATA_FEATURES = (
     "package_width_mm",
     "package_height_mm",
@@ -952,11 +957,15 @@ def create_final_indices(
     source_root: Path,
     selection: dict[str, Any],
     manifest_ids: Mapping[str, str],
+    *,
+    resume: bool = False,
 ) -> Path:
     rows = read_csv(source_root / "combined_encoded_index.csv")
     if len(rows) != 50:
         raise ValueError(f"source-superposition index must contain 50 rows, got {len(rows)}")
     output = paths.derived("indices") / PILOT_STAGE
+    if resume and durable_stage_complete(output):
+        return output
     stage = paths.run_root / "indices"
     if stage.exists():
         shutil.rmtree(stage)
@@ -1124,6 +1133,13 @@ def add_source_lineage_columns(
         payload["source_checkpoint_training_family_uids"] = sorted(str(value) for value in lineage["training_family_uids"])
         payload["source_checkpoint_training_family_set_sha256"] = sha256_json(sorted(lineage["training_family_uids"]))
         write_json(sidecar, payload)
+    manifest_path = stage_root / "manifest.json"
+    if manifest_path.exists():
+        payload = load_json(manifest_path)
+        payload["source_checkpoint"] = data_root_relative(checkpoint, data_root)
+        payload["source_checkpoint_sha256"] = sha256_file(checkpoint)
+        payload["source_checkpoint_lineage_sha256"] = lineage_hash
+        write_json(manifest_path, payload)
     write_json(stage_root / "source_checkpoint_lineage.json", lineage)
 
 
@@ -1592,7 +1608,13 @@ def build_pilot(options: PilotBuildOptions) -> dict[str, Any]:
         "phase1_family_manifest_sha256": phase1_hash,
         "source_checkpoint_lineage_sha256": sha256_json(lineage),
     }
-    index_root = create_final_indices(paths, derived["source_superposition"], selection, manifest_ids)
+    index_root = create_final_indices(
+        paths,
+        derived["source_superposition"],
+        selection,
+        manifest_ids,
+        resume=options.resume,
+    )
     artifact_manifests = write_pilot_artifact_manifests(
         paths,
         options,
@@ -1854,26 +1876,396 @@ def validate_pilot_root(
 
 
 def audit_portable_documents(data_root: Path) -> dict[str, Any]:
+    data_root = Path(data_root).resolve()
     violations: list[dict[str, str]] = []
+    informational: list[dict[str, str]] = []
     roots = [data_root / "canonical", data_root / "derived"]
     extensions = {".csv", ".json", ".jsonl", ".yaml", ".yml", ".txt", ".md"}
+    files_scanned = 0
     for root in roots:
         if not root.exists():
             continue
         for path in root.rglob("*"):
             if not path.is_file() or path.suffix not in extensions:
                 continue
-            text = path.read_text(encoding="utf-8", errors="replace")
-            for prefix in PORTABLE_FORBIDDEN_PREFIXES:
-                if prefix in text:
-                    violations.append({"path": str(path.relative_to(data_root)), "prefix": prefix})
+            files_scanned += 1
+            relative = str(path.relative_to(data_root))
             if path.suffix == ".csv":
                 for row in read_csv(path):
-                    for key in PATH_COLUMNS:
-                        value = row.get(key, "")
-                        if value and Path(value).is_absolute():
-                            violations.append({"path": str(path.relative_to(data_root)), "prefix": f"absolute:{key}"})
-    return {"files_scanned": sum(1 for root in roots if root.exists() for path in root.rglob("*") if path.is_file()), "violation_count": len(violations), "violations": violations[:100]}
+                    for key, value in row.items():
+                        _classify_portable_string(
+                            str(value or ""),
+                            document=relative,
+                            field=key,
+                            resolving=key in PATH_COLUMNS,
+                            informational=False,
+                            violations=violations,
+                            informational_occurrences=informational,
+                        )
+                continue
+            if path.suffix in {".json", ".yaml", ".yml", ".jsonl"}:
+                try:
+                    if path.suffix == ".json":
+                        payloads = [json.loads(path.read_text(encoding="utf-8"))]
+                    elif path.suffix == ".jsonl":
+                        payloads = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+                    else:
+                        payloads = [yaml.safe_load(path.read_text(encoding="utf-8"))]
+                    for payload in payloads:
+                        _audit_portable_value(
+                            payload,
+                            document=relative,
+                            json_path=(),
+                            inherited_informational=False,
+                            artifact_manifest=isinstance(payload, dict) and payload.get("schema_version") == ARTIFACT_SCHEMA_VERSION,
+                            violations=violations,
+                            informational_occurrences=informational,
+                        )
+                    continue
+                except Exception as exc:
+                    violations.append({"path": relative, "field": "<parse>", "reason": f"parse_error:{type(exc).__name__}"})
+                    continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+            _classify_portable_string(
+                text,
+                document=relative,
+                field="<text>",
+                resolving=False,
+                informational=False,
+                violations=violations,
+                informational_occurrences=informational,
+            )
+    return {
+        "schema_version": "benchmark_v2_portability_audit/2",
+        "files_scanned": files_scanned,
+        "violation_count": len(violations),
+        "violations": violations,
+        "informational_nonresolving_count": len(informational),
+        "informational_nonresolving": informational,
+    }
+
+
+def _audit_portable_value(
+    value: Any,
+    *,
+    document: str,
+    json_path: tuple[str, ...],
+    inherited_informational: bool,
+    artifact_manifest: bool,
+    violations: list[dict[str, str]],
+    informational_occurrences: list[dict[str, str]],
+) -> None:
+    if isinstance(value, dict):
+        marked = inherited_informational or value.get("path_semantics") == INFORMATIONAL_PATH_SEMANTICS
+        for key, item in value.items():
+            path = (*json_path, str(key))
+            schema_informational = artifact_manifest and (
+                path[:2] == ("producer", "command")
+                or path[:2] == ("reproducibility", "reproduction_command")
+            )
+            _audit_portable_value(
+                item,
+                document=document,
+                json_path=path,
+                inherited_informational=marked or schema_informational,
+                artifact_manifest=artifact_manifest,
+                violations=violations,
+                informational_occurrences=informational_occurrences,
+            )
+        return
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            _audit_portable_value(
+                item,
+                document=document,
+                json_path=(*json_path, str(index)),
+                inherited_informational=inherited_informational,
+                artifact_manifest=artifact_manifest,
+                violations=violations,
+                informational_occurrences=informational_occurrences,
+            )
+        return
+    if not isinstance(value, str):
+        return
+    key = json_path[-1] if json_path else "<root>"
+    resolving = key in PATH_COLUMNS or key.endswith("_path") or key in {"path", "relative_path"}
+    _classify_portable_string(
+        value,
+        document=document,
+        field=".".join(json_path) or "<root>",
+        resolving=resolving,
+        informational=inherited_informational,
+        violations=violations,
+        informational_occurrences=informational_occurrences,
+    )
+
+
+def _classify_portable_string(
+    value: str,
+    *,
+    document: str,
+    field: str,
+    resolving: bool,
+    informational: bool,
+    violations: list[dict[str, str]],
+    informational_occurrences: list[dict[str, str]],
+) -> None:
+    forbidden_ids = [
+        name
+        for prefix, name in zip(PORTABLE_FORBIDDEN_PREFIXES, ("users", "nethome", "tmp", "export_hdd"))
+        if prefix in value
+    ]
+    absolute_resolving = resolving and bool(value.strip()) and Path(value.strip()).is_absolute()
+    if not forbidden_ids and not absolute_resolving:
+        return
+    record = {
+        "path": document,
+        "field": field,
+        "reason": "absolute_resolving_path" if absolute_resolving else f"forbidden_prefix:{','.join(forbidden_ids)}",
+    }
+    if informational:
+        informational_occurrences.append(record)
+    else:
+        violations.append(record)
+
+
+def repair_pilot_portability(data_root: str | Path, *, apply: bool = False) -> dict[str, Any]:
+    """Repair portable metadata/index documents without touching array artifacts."""
+    root = Path(data_root).expanduser().resolve()
+    marker = load_json(root / ROOT_MARKER_NAME)
+    if marker.get("benchmark_id") != BENCHMARK_ID or marker.get("path_semantics") != PATH_SEMANTICS:
+        raise ValueError(f"invalid Benchmark v2 data root: {root}")
+    before = audit_portable_documents(root)
+    changes: dict[Path, str] = {}
+    extensions = {".csv", ".json", ".jsonl", ".yaml", ".yml", ".txt", ".md"}
+    for scope in (root / "canonical", root / "derived"):
+        if not scope.exists():
+            continue
+        for path in scope.rglob("*"):
+            if not path.is_file() or path.suffix not in extensions or path.name == "pilot_5x10_portability_repair.json":
+                continue
+            repaired = _repair_portable_document(path, root)
+            original = path.read_text(encoding="utf-8", errors="replace")
+            if repaired != original:
+                changes[path] = repaired
+    if apply:
+        for path, content in changes.items():
+            _atomic_write_text(path, content)
+        changed_paths = set(changes)
+        if changed_paths:
+            _refresh_artifact_tree_manifests(root, changed_paths)
+            _refresh_artifact_manifests(root)
+            _refresh_completion_markers(root, changed_paths)
+        after = audit_portable_documents(root)
+    else:
+        after = before
+    report = {
+        "schema_version": "benchmark_v2_portability_repair/1",
+        "benchmark_id": BENCHMARK_ID,
+        "mode": "apply" if apply else "dry_run",
+        "changed_file_count": len(changes),
+        "changed_files": [str(path.relative_to(root)) for path in sorted(changes)],
+        "before": before,
+        "after": after,
+        "thermal_or_array_artifacts_modified": False,
+    }
+    if apply:
+        write_json(root / "canonical/manifests/pilot_5x10_portability_repair.json", report)
+        if after["violation_count"]:
+            raise ValueError(f"portability repair left {after['violation_count']} resolving violations")
+    return report
+
+
+def _repair_portable_document(path: Path, data_root: Path) -> str:
+    original_text = path.read_text(encoding="utf-8", errors="replace")
+    if path.suffix == ".csv":
+        rows = read_csv(path)
+        if not rows:
+            return original_text
+        original_rows = [dict(row) for row in rows]
+        fieldnames = list(rows[0].keys())
+        for row in rows:
+            for key in fieldnames:
+                value = str(row.get(key, "") or "")
+                if key in PATH_COLUMNS:
+                    row[key] = _repair_resolving_path(value, key=key, row=row, data_root=data_root)
+                else:
+                    row[key] = _sanitize_nonresolving_text(value, data_root)
+        if rows == original_rows:
+            return original_text
+        import io
+
+        stream = io.StringIO(newline="")
+        writer = csv.DictWriter(stream, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+        return stream.getvalue()
+    if path.suffix == ".json":
+        payload = json.loads(original_text)
+        repaired = _repair_portable_value(payload, data_root=data_root, informational=False)
+        if repaired == payload:
+            return original_text
+        return json.dumps(repaired, indent=2, sort_keys=True) + "\n"
+    if path.suffix == ".jsonl":
+        rows = [json.loads(line) for line in original_text.splitlines() if line.strip()]
+        repaired_rows = [_repair_portable_value(row, data_root=data_root, informational=False) for row in rows]
+        if repaired_rows == rows:
+            return original_text
+        return "".join(json.dumps(row, sort_keys=True) + "\n" for row in repaired_rows)
+    if path.suffix in {".yaml", ".yml"}:
+        payload = yaml.safe_load(original_text)
+        repaired = _repair_portable_value(payload, data_root=data_root, informational=False)
+        if repaired == payload:
+            return original_text
+        return yaml.safe_dump(repaired, sort_keys=False, width=120)
+    return _sanitize_nonresolving_text(original_text, data_root)
+
+
+def _repair_portable_value(value: Any, *, data_root: Path, informational: bool, key: str = "") -> Any:
+    if isinstance(value, dict):
+        marked = informational or value.get("path_semantics") == INFORMATIONAL_PATH_SEMANTICS
+        repaired: dict[str, Any] = {}
+        for item_key, item in value.items():
+            if item_key == "source_checkpoint" and isinstance(item, str) and not marked:
+                repaired[item_key] = _repair_resolving_path(item, key=item_key, row=value, data_root=data_root)
+            else:
+                repaired[item_key] = _repair_portable_value(
+                    item,
+                    data_root=data_root,
+                    informational=marked or item_key in {"command", "reproduction_command"},
+                    key=str(item_key),
+                )
+        return repaired
+    if isinstance(value, list):
+        return [_repair_portable_value(item, data_root=data_root, informational=informational, key=key) for item in value]
+    if not isinstance(value, str):
+        return value
+    resolving = key in PATH_COLUMNS or key.endswith("_path") or key in {"path", "relative_path"}
+    if resolving and not informational:
+        return _repair_resolving_path(value, key=key, row={}, data_root=data_root)
+    return _sanitize_nonresolving_text(value, data_root)
+
+
+def _repair_resolving_path(value: str, *, key: str, row: Mapping[str, str], data_root: Path) -> str:
+    value = value.strip()
+    if not value:
+        return value
+    if key == "source_checkpoint":
+        path = Path(value).expanduser()
+        if not path.is_absolute() and (data_root / path).is_file():
+            return value
+        expected = str(row.get("source_checkpoint_sha256") or row.get("checkpoint_sha256") or "")
+        candidates = sorted((data_root / "checkpoints").rglob("*.pt")) if (data_root / "checkpoints").exists() else []
+        matches = [candidate for candidate in candidates if not expected or sha256_file(candidate) == expected]
+        if len(matches) == 1:
+            return data_root_relative(matches[0], data_root)
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        return value
+    path = path.resolve()
+    if _is_within(path, data_root):
+        return data_root_relative(path, data_root)
+    raise ValueError(
+        f"cannot repair resolving path outside declared data root: field={key} value={value!r} root={data_root}"
+    )
+
+
+def _sanitize_nonresolving_text(value: str, data_root: Path) -> str:
+    text = value.replace(str(data_root), "<CHIPTHERM_V2_DATA_ROOT>")
+    text = text.replace(str(REPO_ROOT.resolve()), "<CHIPTHERM_REPO_ROOT>")
+    for prefix, replacement in zip(
+        PORTABLE_FORBIDDEN_PREFIXES,
+        ("<NONRESOLVING_USERS>/", "<NONRESOLVING_NETHOME>/", "<NONRESOLVING_TMP>/", "<NONRESOLVING_EXPORT_HDD>/"),
+    ):
+        text = text.replace(prefix, replacement)
+    return text
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    temporary = path.with_name(f".{path.name}.repair-{uuid.uuid4().hex}")
+    temporary.write_text(content, encoding="utf-8")
+    temporary.replace(path)
+
+
+def _refresh_completion_markers(data_root: Path, changed_paths: set[Path]) -> None:
+    markers = sorted(
+        (path for scope in (data_root / "canonical", data_root / "derived") if scope.exists() for path in scope.rglob(".stage_complete.json")),
+        key=lambda path: len(path.parts),
+        reverse=True,
+    )
+    for marker in markers:
+        stage_root = marker.parent
+        if not any(_is_within(path, stage_root) and path != marker for path in changed_paths):
+            continue
+        completion = make_tree_manifest(stage_root, exclude_names={".stage_complete.json"})
+        write_json(
+            marker,
+            {
+                "schema_version": "benchmark_v2_stage_completion/1",
+                "file_count": completion["file_count"],
+                "files": [{"path": item["path"], "sha256": item["sha256"]} for item in completion["files"]],
+            },
+        )
+        changed_paths.add(marker)
+
+
+def _refresh_artifact_tree_manifests(data_root: Path, changed_paths: set[Path]) -> None:
+    tree_paths = sorted(
+        (path for scope in (data_root / "canonical", data_root / "derived") if scope.exists() for path in scope.rglob("tree_manifest.json")),
+        key=lambda path: len(path.parts),
+        reverse=True,
+    )
+    for tree_path in tree_paths:
+        artifact_root = tree_path.parent
+        if not any(_is_within(path, artifact_root) and path != tree_path for path in changed_paths):
+            continue
+        write_json(tree_path, make_tree_manifest(artifact_root, exclude_names={"tree_manifest.json"}))
+        changed_paths.add(tree_path)
+
+
+def _refresh_artifact_manifests(data_root: Path) -> None:
+    manifest_root = data_root / "canonical/manifests/artifacts"
+    manifest_paths = sorted(manifest_root.glob("*.json")) if manifest_root.exists() else []
+    if not manifest_paths:
+        return
+    by_id: dict[str, Path] = {}
+    for path in manifest_paths:
+        payload = load_json(path)
+        artifact_id = str(payload.get("artifact_id", ""))
+        if artifact_id:
+            by_id[artifact_id] = path
+        tree_value = str(payload.get("content", {}).get("tree_manifest_path", ""))
+        if tree_value:
+            tree_path = resolve_data_path(tree_value, data_root)
+            if tree_path.exists():
+                tree = load_json(tree_path)
+                payload["content"]["file_count"] = int(tree["file_count"])
+                payload["content"]["total_bytes"] = int(tree["total_bytes"])
+                payload["content"]["tree_manifest_sha256"] = sha256_file(tree_path)
+        report_value = str(payload.get("validation", {}).get("report_path", ""))
+        if report_value:
+            report_path = resolve_data_path(report_value, data_root)
+            if report_path.exists():
+                payload["validation"]["report_sha256"] = sha256_file(report_path)
+        write_json(path, payload)
+    for _ in range(len(manifest_paths) + 1):
+        iteration_changed = False
+        for path in manifest_paths:
+            payload = load_json(path)
+            payload_changed = False
+            for parent in payload.get("parents", []):
+                parent_path = by_id.get(str(parent.get("artifact_id", "")))
+                if parent_path is None:
+                    continue
+                digest = sha256_file(parent_path)
+                if parent.get("manifest_sha256") != digest:
+                    parent["manifest_sha256"] = digest
+                    payload_changed = True
+                    iteration_changed = True
+            if payload_changed:
+                write_json(path, payload)
+        if not iteration_changed:
+            break
 
 
 def audit_index_paths(rows: Sequence[dict[str, str]], data_root: Path) -> list[str]:
@@ -1967,7 +2359,24 @@ def _checkpoint_forward_smoke(batch: dict[str, Any], checkpoint_path: Path, devi
         kwargs["total_power_W"] = batch["total_power_W"].to(device)
     with torch.inference_mode():
         output = model(model_input, metadata, graph, **kwargs)
-    final = output["final_temperature"] if isinstance(output, dict) else output
+    if isinstance(output, dict):
+        if "final_temperature" in output:
+            final = output["final_temperature"]
+        else:
+            missing = [key for key in ("mean_rise", "centered_field") if key not in output]
+            if missing:
+                raise ValueError(
+                    f"checkpoint diagnostic output cannot reconstruct final temperature; "
+                    f"missing components={missing}, available keys={sorted(output)}"
+                )
+            centered = output["centered_field"]
+            centered = centered - centered.mean(dim=(-2, -1), keepdim=True)
+            if str(config.get("mean_head_mode", "direct_k")) == "residual_resistance":
+                final = batch["physics"].to(device) + output["mean_rise"][:, None, None] + centered
+            else:
+                final = batch["ambient_K"].to(device)[:, None, None] + output["mean_rise"][:, None, None] + centered
+    else:
+        final = output
     if final.numel() == 0 or not torch.isfinite(final).all():
         raise ValueError("checkpoint forward returned empty or non-finite output")
     return {"forward_smoke": "passed", "forward_output_shape": list(final.shape), "checkpoint_sha256": sha256_file(checkpoint_path)}

@@ -73,7 +73,12 @@
       "additionalProperties": false,
       "required": ["command", "git_commit", "git_dirty", "code_paths"],
       "properties": {
-        "command": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+        "command": {
+          "type": "array",
+          "items": {"type": "string"},
+          "minItems": 1,
+          "description": "Informational, non-resolving producer command provenance; never interpreted as an artifact dependency path."
+        },
         "git_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
         "git_dirty": {"type": "boolean"},
         "dirty_diff_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"},
@@ -211,7 +216,11 @@
       "required": ["regenerable", "reproduction_command", "estimated_cost", "must_not_delete_while_referenced"],
       "properties": {
         "regenerable": {"type": "boolean"},
-        "reproduction_command": {"type": ["array", "null"], "items": {"type": "string"}},
+        "reproduction_command": {
+          "type": ["array", "null"],
+          "items": {"type": "string"},
+          "description": "Informational, non-resolving command provenance; resolving dependencies are declared through storage and parent fields."
+        },
         "estimated_cost": {"type": "string"},
         "missing_prerequisites": {"type": "array", "items": {"type": "string"}},
         "must_not_delete_while_referenced": {"type": "boolean"}
