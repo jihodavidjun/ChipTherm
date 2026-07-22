@@ -76,6 +76,13 @@ space, retained bytes, projected bytes by artifact class, source-isolation
 bytes, peak staging, inode count, and runtime. A real launch fails closed unless
 the configured free-space, retained-size, and staging-size gates all pass.
 
+`--min-free-fraction` is the fraction of space that is free when the gate runs
+that must remain available after the build. It is not a fraction of total
+filesystem capacity. The effective reserve is the larger of that fractional
+amount and `--min-free-gb`, and it must be satisfied both after completion and
+at the conservative projected staging peak. This keeps the gate meaningful on
+a shared filesystem that was already highly utilized before ChipTherm began.
+
 Must retain: canonical sources/labels, 13-channel encodings, metadata, graphs,
 final indices, and manifests. Context 17/33-channel tensors and source-base maps
 may be regenerated. HotSpot workdirs, builder views, and retry scratch are

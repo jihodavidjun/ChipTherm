@@ -2381,9 +2381,29 @@ def estimate_full_build_resources(
     min_free_fraction: float = 0.20,
     max_retained_gb: float = 2000.0,
     max_staging_gb: float = 500.0,
+    filesystem_total_bytes: int | None = None,
+    filesystem_free_bytes: int | None = None,
 ) -> dict[str, Any]:
-    """Project Phase 4 storage from the accepted scale pilot when available."""
+    """Project Phase 4 storage from the accepted scale pilot when available.
+
+    ``min_free_fraction`` is the fraction of the space currently free at gate
+    evaluation that must remain free. It is intentionally not a fraction of
+    total filesystem capacity: a shared filesystem can already be below that
+    global threshold before ChipTherm starts. The effective reserve is the
+    larger of this fractional reserve and ``min_free_gb``.
+
+    The filesystem byte overrides are for deterministic tests only. Production
+    callers omit them and use ``shutil.disk_usage(data_root)``.
+    """
     data_root = Path(data_root).resolve()
+    if min_free_gb < 0.0:
+        raise ValueError("min_free_gb must be nonnegative")
+    if not 0.0 <= min_free_fraction <= 1.0:
+        raise ValueError("min_free_fraction must be between 0 and 1 inclusive")
+    if max_retained_gb < 0.0 or max_staging_gb < 0.0:
+        raise ValueError("max_retained_gb and max_staging_gb must be nonnegative")
+    if (filesystem_total_bytes is None) != (filesystem_free_bytes is None):
+        raise ValueError("filesystem_total_bytes and filesystem_free_bytes must be provided together")
     phase3_report_path = data_root / f"canonical/manifests/{PHASE3_STAGE}_strict_validation.json"
     phase3 = load_json(phase3_report_path) if phase3_report_path.is_file() else {}
     measured = phase3.get("storage", {}).get("bytes_by_artifact_class", {})
@@ -2440,9 +2460,21 @@ def estimate_full_build_resources(
         for name in ("canonical", "derived", "checkpoints", "evaluations", "reports")
     )
     projected_new_total = sum(projected_new.values())
-    filesystem = shutil.disk_usage(data_root)
-    required_free = max(float(min_free_gb) * 1024**3, float(min_free_fraction) * filesystem.total)
-    projected_free_after = filesystem.free - projected_new_total
+    if filesystem_total_bytes is None:
+        filesystem = shutil.disk_usage(data_root)
+        filesystem_total = int(filesystem.total)
+        filesystem_free = int(filesystem.free)
+        filesystem_capacity_source = "shutil.disk_usage"
+    else:
+        filesystem_total = int(filesystem_total_bytes)
+        filesystem_free = int(filesystem_free_bytes)
+        filesystem_capacity_source = "explicit_test_override"
+        if filesystem_total <= 0 or filesystem_free < 0 or filesystem_free > filesystem_total:
+            raise ValueError("filesystem byte overrides must satisfy 0 <= free <= total and total > 0")
+    required_absolute_margin = float(min_free_gb) * 1024**3
+    required_fractional_margin = float(min_free_fraction) * filesystem_free
+    required_free = max(required_absolute_margin, required_fractional_margin)
+    projected_free_after = filesystem_free - projected_new_total
     projected_retained = current_retained + projected_new_total
     largest_derived_stage = max(
         projected_new["encoded_13ch"],
@@ -2453,22 +2485,32 @@ def estimate_full_build_resources(
     )
     phase3_peak = int(phase3.get("storage", {}).get("staging_peak_bytes_observed", 0) or 0)
     projected_peak_staging = max(largest_derived_stage, phase3_peak)
+    projected_free_at_peak = projected_free_after - projected_peak_staging
     projected_inode_count = int(
         expected_samples * 34
         + expected_source_rows * 18
         + 10_000
     )
     checks = {
-        "free_space_margin": projected_free_after >= required_free,
+        "post_build_free_space_margin": projected_free_after >= required_free,
+        "peak_build_free_space_margin": projected_free_at_peak >= required_free,
         "retained_limit": projected_retained <= float(max_retained_gb) * 1024**3,
         "staging_limit": projected_peak_staging <= float(max_staging_gb) * 1024**3,
         "accepted_phase3_measurement_available": bool(phase3) and phase3.get("passed") is True,
     }
+    failure_codes = {
+        "post_build_free_space_margin": "projected_post_build_free_below_required_margin",
+        "peak_build_free_space_margin": "projected_peak_build_free_below_required_margin",
+        "retained_limit": "projected_retained_bytes_exceed_max_retained",
+        "staging_limit": "projected_peak_staging_bytes_exceed_max_staging",
+        "accepted_phase3_measurement_available": "accepted_phase3_measurement_unavailable_or_invalid",
+    }
+    failed_gate_conditions = [failure_codes[name] for name, passed in checks.items() if not passed]
     hard_passed = all(checks.values())
     phase3_runtime = float(phase3.get("runtime", {}).get("wall_clock_s", 0.0) or 0.0)
     projected_runtime = phase3_runtime * (new_packages / 450.0) if phase3_runtime > 0.0 else None
     return {
-        "schema_version": "benchmark_v2_full_resource_projection/1",
+        "schema_version": "benchmark_v2_full_resource_projection/2",
         "stage": FULL_STAGE,
         "measurement_source": data_root_relative(phase3_report_path, data_root) if phase3_report_path.is_file() else "conservative_fallback_constants",
         "expected_samples": expected_samples,
@@ -2478,13 +2520,17 @@ def estimate_full_build_resources(
         "expected_source_rows": expected_source_rows,
         "reusable_source_rows": reusable_source_rows,
         "new_source_runs": new_sources,
-        "filesystem_total_bytes": filesystem.total,
-        "filesystem_free_bytes": filesystem.free,
+        "filesystem_capacity_source": filesystem_capacity_source,
+        "filesystem_total_bytes": filesystem_total,
+        "filesystem_free_bytes": filesystem_free,
         "current_retained_bytes": current_retained,
         "projected_new_bytes": projected_new,
         "projected_new_total_bytes": projected_new_total,
         "projected_retained_bytes": projected_retained,
         "projected_free_after_bytes": projected_free_after,
+        "projected_free_at_peak_bytes": projected_free_at_peak,
+        "required_absolute_free_margin_bytes": int(required_absolute_margin),
+        "required_fractional_free_margin_bytes": int(required_fractional_margin),
         "required_free_after_bytes": int(required_free),
         "projected_peak_staging_bytes": projected_peak_staging,
         "projected_inode_count": projected_inode_count,
@@ -2492,10 +2538,37 @@ def estimate_full_build_resources(
         "limits": {
             "min_free_gb": min_free_gb,
             "min_free_fraction": min_free_fraction,
+            "min_free_fraction_semantics": "fraction_of_currently_free_space_retained_after_build",
+            "effective_free_margin_semantics": "max(min_free_gb, min_free_fraction * current_free_bytes)",
             "max_retained_gb": max_retained_gb,
             "max_staging_gb": max_staging_gb,
         },
+        "reuse_accounting": {
+            "package_labels": {
+                "expected": expected_samples,
+                "accepted_phase3_reusable": reusable_package_samples,
+                "completed_full_stage": completed_full_packages,
+                "new_runs": new_packages,
+            },
+            "isolated_source_responses": {
+                "expected": expected_source_rows,
+                "accepted_phase3_reusable": reusable_source_rows,
+                "new_runs": new_sources,
+            },
+        },
         "checks": checks,
+        "failed_gate_conditions": failed_gate_conditions,
+        "capacity_summary_gib": {
+            "current_free": filesystem_free / 1024**3,
+            "projected_new_retained": projected_new_total / 1024**3,
+            "projected_total_retained": projected_retained / 1024**3,
+            "projected_peak_staging": projected_peak_staging / 1024**3,
+            "projected_post_build_free": projected_free_after / 1024**3,
+            "projected_peak_build_free": projected_free_at_peak / 1024**3,
+            "required_absolute_margin": required_absolute_margin / 1024**3,
+            "required_fractional_margin": required_fractional_margin / 1024**3,
+            "required_effective_margin": required_free / 1024**3,
+        },
         "passed": hard_passed,
         "recommendation": "GO" if hard_passed else "NO-GO",
         "retention_policy": {
@@ -2626,7 +2699,12 @@ def build_pilot(options: PilotBuildOptions) -> dict[str, Any]:
             "resource_projection": resource_projection,
             "workload_design_report": workload_design_report,
             "recommendation": (
-                resource_projection["recommendation"]
+                (
+                    "GO WITH MANUAL REVIEW: storage gate passed; recheck shared-filesystem free space "
+                    "immediately before launch."
+                    if resource_projection["passed"]
+                    else "NO-GO"
+                )
                 if resource_projection is not None
                 else "GO WITH MANUAL REVIEW: run real HotSpot and derived stages before scale authorization."
             ),

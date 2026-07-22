@@ -37,6 +37,7 @@ from scripts.visualize_benchmark_v2_samples import select_audit_rows
 
 FAMILY_DIR = REPO_ROOT / "configs/benchmark_v2_50family/families"
 SELECTION_PATH = REPO_ROOT / "configs/benchmark_v2_50family/full_50x200.yaml"
+GIB = 1024**3
 
 
 class BenchmarkV2Phase4Tests(unittest.TestCase):
@@ -45,6 +46,21 @@ class BenchmarkV2Phase4Tests(unittest.TestCase):
         cls.selection = load_selection(SELECTION_PATH)
         cls.family_uids = [str(row["family_uid"]) for row in cls.selection["selected_families"]]
         cls.families = {uid: load_family(FAMILY_DIR / f"{uid}.yaml") for uid in cls.family_uids}
+
+    @staticmethod
+    def _write_accepted_phase3_report(root: Path) -> None:
+        report_path = root / f"canonical/manifests/{PHASE3_STAGE}_strict_validation.json"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(
+            json.dumps({
+                "passed": True,
+                "actual_sample_count": 500,
+                "source_isolation_target_count": 242,
+                "storage": {"bytes_by_artifact_class": {}, "staging_peak_bytes_observed": 0},
+                "runtime": {"wall_clock_s": 450.0},
+            }),
+            encoding="utf-8",
+        )
 
     def test_frozen_matrix_and_primary_split(self) -> None:
         cells = full_workload_cells()
@@ -149,24 +165,15 @@ class BenchmarkV2Phase4Tests(unittest.TestCase):
     def test_storage_gate_uses_500_package_and_source_reuse(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            report_path = root / f"canonical/manifests/{PHASE3_STAGE}_strict_validation.json"
-            report_path.parent.mkdir(parents=True)
-            report_path.write_text(
-                json.dumps({
-                    "passed": True,
-                    "actual_sample_count": 500,
-                    "source_isolation_target_count": 242,
-                    "storage": {"bytes_by_artifact_class": {}, "staging_peak_bytes_observed": 0},
-                    "runtime": {"wall_clock_s": 450.0},
-                }),
-                encoding="utf-8",
-            )
+            self._write_accepted_phase3_report(root)
             report = estimate_full_build_resources(
                 root,
                 min_free_gb=0,
                 min_free_fraction=0,
                 max_retained_gb=10_000,
                 max_staging_gb=10_000,
+                filesystem_total_bytes=4_000 * GIB,
+                filesystem_free_bytes=500 * GIB,
             )
             self.assertEqual(report["reusable_package_samples"], 500)
             self.assertEqual(report["new_package_runs"], 9500)
@@ -183,9 +190,81 @@ class BenchmarkV2Phase4Tests(unittest.TestCase):
                 min_free_fraction=0,
                 max_retained_gb=10_000,
                 max_staging_gb=10_000,
+                filesystem_total_bytes=4_000 * GIB,
+                filesystem_free_bytes=500 * GIB,
             )
             self.assertEqual(resumed["completed_full_package_samples"], 1)
             self.assertEqual(resumed["new_package_runs"], 9499)
+
+    def test_storage_gate_allows_absolute_margin_on_low_global_free_fraction(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_accepted_phase3_report(root)
+            report = estimate_full_build_resources(
+                root,
+                min_free_gb=100,
+                min_free_fraction=0.20,
+                max_retained_gb=2000,
+                max_staging_gb=500,
+                filesystem_total_bytes=3_500 * GIB,
+                filesystem_free_bytes=161 * GIB,
+            )
+            self.assertLess(report["filesystem_free_bytes"] / report["filesystem_total_bytes"], 0.05)
+            self.assertEqual(report["required_fractional_free_margin_bytes"], int(32.2 * GIB))
+            self.assertEqual(report["required_free_after_bytes"], 100 * GIB)
+            self.assertEqual(report["failed_gate_conditions"], [])
+            self.assertEqual(report["recommendation"], "GO")
+
+    def test_storage_gate_rejects_insufficient_projected_post_build_space(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_accepted_phase3_report(root)
+            report = estimate_full_build_resources(
+                root,
+                min_free_gb=100,
+                min_free_fraction=0.20,
+                max_retained_gb=2000,
+                max_staging_gb=500,
+                filesystem_total_bytes=3_500 * GIB,
+                filesystem_free_bytes=120 * GIB,
+            )
+            self.assertEqual(
+                report["failed_gate_conditions"],
+                [
+                    "projected_post_build_free_below_required_margin",
+                    "projected_peak_build_free_below_required_margin",
+                ],
+            )
+            self.assertEqual(report["recommendation"], "NO-GO")
+
+    def test_storage_gate_reports_retained_and_staging_limit_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_accepted_phase3_report(root)
+            report = estimate_full_build_resources(
+                root,
+                min_free_gb=0,
+                min_free_fraction=0,
+                max_retained_gb=20,
+                max_staging_gb=1,
+                filesystem_total_bytes=4_000 * GIB,
+                filesystem_free_bytes=500 * GIB,
+            )
+            self.assertEqual(
+                report["failed_gate_conditions"],
+                [
+                    "projected_retained_bytes_exceed_max_retained",
+                    "projected_peak_staging_bytes_exceed_max_staging",
+                ],
+            )
+            self.assertEqual(report["recommendation"], "NO-GO")
+
+    def test_storage_gate_requires_deterministic_capacity_override_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_accepted_phase3_report(root)
+            with self.assertRaisesRegex(ValueError, "must be provided together"):
+                estimate_full_build_resources(root, filesystem_total_bytes=4_000 * GIB)
 
     def test_full_visual_selection_covers_all_families(self) -> None:
         rows = [

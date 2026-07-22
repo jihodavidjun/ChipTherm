@@ -38,10 +38,34 @@ def main() -> int:
     parser.add_argument("--source-lineage", default=REPO_ROOT / "configs/benchmark_v2_50family/source_response_lineage_prototype_seed1.json", type=Path)
     parser.add_argument("--residual-checkpoint", default=None, type=Path)
     parser.add_argument("--source-device", default="cpu", choices=["cpu", "cuda", "mps", "auto"])
-    parser.add_argument("--min-free-gb", default=100.0, type=float)
-    parser.add_argument("--min-free-fraction", default=0.20, type=float)
-    parser.add_argument("--max-retained-gb", default=2000.0, type=float)
-    parser.add_argument("--max-staging-gb", default=500.0, type=float)
+    parser.add_argument(
+        "--min-free-gb",
+        default=100.0,
+        type=float,
+        help="Absolute GiB reserve that must remain after the projected build and at peak staging (default: 100).",
+    )
+    parser.add_argument(
+        "--min-free-fraction",
+        default=0.20,
+        type=float,
+        help=(
+            "Fraction of the space currently free when the gate runs that must remain free after the build; "
+            "the effective reserve is max(this amount, --min-free-gb), not a fraction of total capacity "
+            "(default: 0.20)."
+        ),
+    )
+    parser.add_argument(
+        "--max-retained-gb",
+        default=2000.0,
+        type=float,
+        help="Maximum projected total retained benchmark footprint in GiB (default: 2000).",
+    )
+    parser.add_argument(
+        "--max-staging-gb",
+        default=500.0,
+        type=float,
+        help="Maximum projected peak temporary staging footprint in GiB (default: 500).",
+    )
     parser.add_argument("--override-storage-gate", action="store_true")
     parser.add_argument("--execution-families", nargs="*", default=None, help="Schedule only these families while retaining the full immutable stage identity.")
     parser.add_argument("--start-family", default=None, help="Inclusive execution-family lower bound, e.g. f011.")
@@ -109,6 +133,23 @@ def main() -> int:
     report = build_pilot(options)
     print(f"Pilot status: {report['status']}")
     print(f"Workloads: {report['workload_count']}")
+    projection = report.get("resource_projection")
+    if projection:
+        summary = projection["capacity_summary_gib"]
+        print("Storage gate:")
+        print(f"  Current free: {summary['current_free']:.3f} GiB")
+        print(f"  Projected new retained: {summary['projected_new_retained']:.3f} GiB")
+        print(f"  Projected total retained: {summary['projected_total_retained']:.3f} GiB")
+        print(f"  Projected peak staging: {summary['projected_peak_staging']:.3f} GiB")
+        print(f"  Projected post-build free: {summary['projected_post_build_free']:.3f} GiB")
+        print(f"  Projected peak-build free: {summary['projected_peak_build_free']:.3f} GiB")
+        print(f"  Required absolute margin: {summary['required_absolute_margin']:.3f} GiB")
+        print(f"  Required fractional margin: {summary['required_fractional_margin']:.3f} GiB")
+        print(f"  Required effective margin: {summary['required_effective_margin']:.3f} GiB")
+        failures = projection.get("failed_gate_conditions", [])
+        print(f"  Failed gate conditions: {', '.join(failures) if failures else 'none'}")
+        print(f"  Storage recommendation: {projection['recommendation']}")
+    print(f"Final recommendation: {report['recommendation']}")
     print(f"Report: {data_root / 'canonical/manifests' / f'{args.stage}_validation_report.json'}")
     return 0
 
