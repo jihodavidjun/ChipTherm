@@ -310,7 +310,7 @@ class BenchmarkV2Phase2Tests(unittest.TestCase):
             self.assertEqual(before["informational_nonresolving_count"], 1)
 
             report = repair_pilot_portability(root, apply=True)
-            self.assertGreaterEqual(report["changed_file_count"], 2)
+            self.assertGreaterEqual(report["changed_file_count"], 1)
             self.assertEqual(report["after"]["violation_count"], 0)
             self.assertEqual(sha256_file(tensor_path), tensor_hash)
             self.assertTrue(durable_stage_complete(stage))

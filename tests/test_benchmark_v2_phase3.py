@@ -23,13 +23,19 @@ from chiptherm.benchmark_v2_pipeline import (  # noqa: E402
     PHASE3_STAGE,
     PilotBuildOptions,
     PilotPaths,
+    audit_portable_documents,
     build_pilot,
+    durable_stage_complete,
     generate_hotspot_samples,
     load_selection,
+    make_tree_manifest,
     phase2_immutability_snapshot,
     project_scale_metrics,
+    repair_pilot_portability,
+    sha256_file,
     stage_spec,
     validate_scale_pilot_root,
+    write_artifact_manifest,
     write_canonical_sample_source,
 )
 from chiptherm.ml.dataset import ChipThermDataset  # noqa: E402
@@ -247,6 +253,110 @@ class BenchmarkV2Phase3Tests(unittest.TestCase):
             self.assertEqual(tuple(sample["x"].shape), (33, 64, 64))
             self.assertEqual(tuple(sample["metadata_vector"].shape), (15,))
             self.assertEqual(sample["graph"]["node_features"].shape[1], 24)
+
+    def test_phase3_portability_repair_is_scoped_idempotent_and_refreshes_lineage(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "benchmark"
+            manifests = root / "canonical/manifests"
+            artifact_manifests = manifests / "artifacts"
+            isolation = root / "canonical/stages/pilot_10x50/source_isolation"
+            phase2_file = root / "canonical/workloads/accepted_phase2.txt"
+            artifact_manifests.mkdir(parents=True)
+            isolation.mkdir(parents=True)
+            phase2_file.parent.mkdir(parents=True)
+            phase2_file.write_text("immutable phase2\n", encoding="utf-8")
+            (root / ".chiptherm_data_root.json").write_text(
+                json.dumps({
+                    "schema_version": "chiptherm_data_root/1",
+                    "benchmark_id": "benchmark_v2_50family",
+                    "root_id": "fixture",
+                    "path_semantics": "relative_to_declared_data_root",
+                }),
+                encoding="utf-8",
+            )
+
+            # The real Phase 3 failure had 104 newly generated source-isolation
+            # command records after Phase 2 reuse. Model that count exactly.
+            for index in range(104):
+                command = isolation / f"f002/sample/source_{index:03d}/command.txt"
+                command.parent.mkdir(parents=True)
+                command.write_text(
+                    "/export/hdd/jjun49/hotspot/hotspot -c /export/hdd/jjun49/work/run.config\n",
+                    encoding="utf-8",
+                )
+            completion = make_tree_manifest(isolation, exclude_names={".stage_complete.json"})
+            (isolation / ".stage_complete.json").write_text(
+                json.dumps({
+                    "schema_version": "benchmark_v2_stage_completion/1",
+                    "file_count": completion["file_count"],
+                    "files": [{"path": row["path"], "sha256": row["sha256"]} for row in completion["files"]],
+                }),
+                encoding="utf-8",
+            )
+            manifest_path = artifact_manifests / "pilot_10x50_source_isolation.json"
+            write_artifact_manifest(
+                isolation,
+                manifest_path,
+                artifact_id="pilot_10x50_source_isolation",
+                artifact_class="canonical_source",
+                stage="source_isolation",
+                data_root=root,
+                parents=[],
+                checks=[{"name": "fixture", "passed": True}],
+                command=["/nethome/jjun49/chiptherm/scripts/build_source_response_dataset.py"],
+            )
+            (manifests / "pilot_10x50_runtime_dependency_lock.json").write_text(
+                json.dumps({
+                    "schema_version": "benchmark_v2_runtime_dependency_lock/1",
+                    "hotspot": {
+                        "executable_id": "/nethome/jjun49/hotspot/hotspot",
+                        "version": "binary /nethome/jjun49/hotspot/hotspot",
+                    },
+                }),
+                encoding="utf-8",
+            )
+            (manifests / "pilot_10x50_strict_validation.json").write_text(
+                json.dumps({
+                    "schema_version": "benchmark_v2_scale_pilot_strict_validation/1",
+                    "passed": False,
+                    "checks": [{
+                        "name": "portable_paths",
+                        "passed": False,
+                        "details": "previous diagnostic: /export/hdd/jjun49/work/source_000/command.txt",
+                    }],
+                    "portable_path_audit": {
+                        "violations": [{"path": "/export/hdd/jjun49/work/source_000/command.txt"}],
+                    },
+                }),
+                encoding="utf-8",
+            )
+
+            phase2_before = phase2_immutability_snapshot(root)
+            before = audit_portable_documents(root, stage=PHASE3_STAGE)
+            self.assertEqual(before["violation_count"], 104)
+            classifications = {row.get("classification") for row in before["informational_nonresolving"]}
+            self.assertIn("informational_provenance", classifications)
+            self.assertIn("validation_diagnostic", classifications)
+
+            dry_run = repair_pilot_portability(root, apply=False, stage=PHASE3_STAGE)
+            self.assertEqual(dry_run["changed_file_count"], 104)
+            self.assertEqual(phase2_before["content_sha256"], phase2_immutability_snapshot(root)["content_sha256"])
+
+            applied = repair_pilot_portability(root, apply=True, stage=PHASE3_STAGE)
+            self.assertEqual(applied["changed_file_count"], 104)
+            self.assertEqual(applied["after"]["violation_count"], 0)
+            self.assertTrue(durable_stage_complete(isolation))
+            artifact = json.loads(manifest_path.read_text(encoding="utf-8"))
+            tree_path = root / artifact["content"]["tree_manifest_path"]
+            self.assertEqual(artifact["content"]["tree_manifest_sha256"], sha256_file(tree_path))
+            self.assertEqual(phase2_before["content_sha256"], phase2_immutability_snapshot(root)["content_sha256"])
+
+            second = repair_pilot_portability(root, apply=True, stage=PHASE3_STAGE)
+            self.assertEqual(second["changed_file_count"], 0)
+            self.assertEqual(second["lineage_refreshed_file_count"], 0)
+            self.assertEqual(second["after"]["violation_count"], 0)
+            self.assertTrue(durable_stage_complete(isolation))
+            self.assertEqual(phase2_before["content_sha256"], phase2_immutability_snapshot(root)["content_sha256"])
 
 
 if __name__ == "__main__":

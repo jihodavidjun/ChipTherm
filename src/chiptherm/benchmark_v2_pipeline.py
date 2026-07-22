@@ -75,6 +75,10 @@ PATH_COLUMNS = {
 }
 PORTABLE_FORBIDDEN_PREFIXES = ("/Users/", "/nethome/", "/tmp/", "/export/hdd/")
 INFORMATIONAL_PATH_SEMANTICS = "informational_nonresolving"
+PORTABLE_DOCUMENT_EXTENSIONS = {".csv", ".json", ".jsonl", ".yaml", ".yml", ".txt", ".md"}
+PORTABILITY_CLASS_PROVENANCE = "informational_provenance"
+PORTABILITY_CLASS_DIAGNOSTIC = "validation_diagnostic"
+PORTABILITY_CLASS_STAGING = "staging_debug"
 CANONICAL_METADATA_FEATURES = (
     "package_width_mm",
     "package_height_mm",
@@ -2174,7 +2178,7 @@ def validate_pilot_root(
     family_specs = {uid: load_yaml(data_root / "canonical/families" / f"{uid}.yaml") for uid in selected}
     workload_problems = [problem for workload in workloads for problem in validate_workload(workload, family_specs[str(workload["family_uid"])])]
     checks.append(_check("workload_validation", not workload_problems, "; ".join(workload_problems[:5])))
-    portable = audit_portable_documents(data_root)
+    portable = audit_portable_documents(data_root, stage=PHASE2_STAGE)
     checks.append(_check("portable_paths", portable["violation_count"] == 0, f"violations={portable['violation_count']}"))
 
     if dry_run:
@@ -2348,7 +2352,7 @@ def validate_scale_pilot_root(
         and len({json.dumps(families[uid]["fixed_structure"]["layout"], sort_keys=True)}) == 1
         for uid in selected
     )
-    portable = audit_portable_documents(data_root)
+    portable = audit_portable_documents(data_root, stage=PHASE3_STAGE)
     checks.extend(
         [
             _check("selected_family_count", len(selected) == spec.family_count and len(set(selected)) == spec.family_count, str(selected)),
@@ -2720,68 +2724,150 @@ def _slowest_groups(rows: Sequence[dict[str, str]], key: str) -> list[dict[str, 
     return [{key: name, "count": len(values), "mean_runtime_s": float(np.mean(values)), "p95_runtime_s": float(np.quantile(values, 0.95))} for name, values in ranked[:10]]
 
 
-def audit_portable_documents(data_root: Path) -> dict[str, Any]:
-    data_root = Path(data_root).resolve()
-    violations: list[dict[str, str]] = []
-    informational: list[dict[str, str]] = []
-    roots = [data_root / "canonical", data_root / "derived"]
-    extensions = {".csv", ".json", ".jsonl", ".yaml", ".yml", ".txt", ".md"}
-    files_scanned = 0
+def _path_belongs_to_stage(path: Path, data_root: Path, stage: str) -> bool:
+    """Return whether a portable metadata document is owned by one pilot stage."""
+    relative = path.relative_to(data_root)
+    parts = relative.parts
+    if stage == PHASE3_STAGE:
+        if parts[:3] in {
+            ("canonical", "stages", PHASE3_STAGE),
+            ("derived", "stages", PHASE3_STAGE),
+            ("derived", "indices", PHASE3_STAGE),
+        }:
+            return True
+        if parts[:2] == ("canonical", "manifests"):
+            if len(parts) >= 4 and parts[2] == "artifacts":
+                return parts[3].startswith(f"{PHASE3_STAGE}_")
+            return len(parts) >= 3 and parts[2].startswith(PHASE3_STAGE)
+        if parts[:2] in {("evaluations", PHASE3_STAGE), ("reports", PHASE3_STAGE)}:
+            return True
+        return False
+    if stage == PHASE2_STAGE:
+        return not _path_belongs_to_stage(path, data_root, PHASE3_STAGE)
+    raise ValueError(f"unsupported Benchmark v2 stage {stage!r}; choices={sorted(STAGE_SPECS)}")
+
+
+def _portable_document_paths(data_root: Path, stage: str) -> list[Path]:
+    roots = [data_root / "canonical", data_root / "derived", data_root / "evaluations", data_root / "reports"]
+    paths: list[Path] = []
     for root in roots:
         if not root.exists():
             continue
-        for path in root.rglob("*"):
-            if not path.is_file() or path.suffix not in extensions:
+        paths.extend(
+            path
+            for path in root.rglob("*")
+            if path.is_file()
+            and path.suffix in PORTABLE_DOCUMENT_EXTENSIONS
+            and _path_belongs_to_stage(path, data_root, stage)
+        )
+    return sorted(set(paths))
+
+
+def _payload_schema_version(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    schema = str(payload.get("schema_version", ""))
+    if not schema and "checks" in payload and "passed" in payload:
+        return "benchmark_v2_validation_diagnostic/implicit"
+    return schema
+
+
+def _schema_path_classification(
+    *,
+    schema_version: str,
+    json_path: tuple[str, ...],
+    artifact_manifest: bool,
+) -> str | None:
+    """Classify only schema-declared non-resolving path-bearing subtrees."""
+    if not json_path:
+        return None
+    first = json_path[0]
+    key = json_path[-1]
+    if key in {"staging_path", "scratch_path", "debug_path", "workdir", "workdir_path"}:
+        return PORTABILITY_CLASS_STAGING
+    if artifact_manifest:
+        if first in {"producer", "reproducibility"}:
+            return PORTABILITY_CLASS_PROVENANCE
+        if json_path[:2] == ("validation", "checks"):
+            return PORTABILITY_CLASS_DIAGNOSTIC
+    if schema_version == "benchmark_v2_runtime_dependency_lock/1" and first == "hotspot":
+        return PORTABILITY_CLASS_PROVENANCE
+    if schema_version == "benchmark_v2_pilot_validation_report/1" and json_path[:2] == ("hotspot", "failures"):
+        return PORTABILITY_CLASS_STAGING
+    is_validation_document = (
+        "validation" in schema_version
+        or schema_version == "benchmark_v2_portability_repair/1"
+    )
+    if is_validation_document and first in {
+        "checks",
+        "portable_path_audit",
+        "loader_smoke",
+        "loader_forward",
+        "loader_all_rows",
+    }:
+        return PORTABILITY_CLASS_DIAGNOSTIC
+    if schema_version == "benchmark_v2_portability_repair/1" and first in {"before", "after"}:
+        return PORTABILITY_CLASS_DIAGNOSTIC
+    return None
+
+
+def audit_portable_documents(data_root: Path, *, stage: str = PILOT_STAGE) -> dict[str, Any]:
+    data_root = Path(data_root).resolve()
+    violations: list[dict[str, str]] = []
+    informational: list[dict[str, str]] = []
+    files_scanned = 0
+    for path in _portable_document_paths(data_root, stage):
+        files_scanned += 1
+        relative = str(path.relative_to(data_root))
+        if path.suffix == ".csv":
+            for row in read_csv(path):
+                for key, value in row.items():
+                    _classify_portable_string(
+                        str(value or ""),
+                        document=relative,
+                        field=key,
+                        resolving=key in PATH_COLUMNS,
+                        informational_class=None,
+                        violations=violations,
+                        informational_occurrences=informational,
+                    )
+            continue
+        if path.suffix in {".json", ".yaml", ".yml", ".jsonl"}:
+            try:
+                if path.suffix == ".json":
+                    payloads = [json.loads(path.read_text(encoding="utf-8"))]
+                elif path.suffix == ".jsonl":
+                    payloads = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+                else:
+                    payloads = [yaml.safe_load(path.read_text(encoding="utf-8"))]
+                for payload in payloads:
+                    _audit_portable_value(
+                        payload,
+                        document=relative,
+                        json_path=(),
+                        inherited_informational_class=None,
+                        schema_version=_payload_schema_version(payload),
+                        artifact_manifest=isinstance(payload, dict) and payload.get("schema_version") == ARTIFACT_SCHEMA_VERSION,
+                        violations=violations,
+                        informational_occurrences=informational,
+                    )
                 continue
-            files_scanned += 1
-            relative = str(path.relative_to(data_root))
-            if path.suffix == ".csv":
-                for row in read_csv(path):
-                    for key, value in row.items():
-                        _classify_portable_string(
-                            str(value or ""),
-                            document=relative,
-                            field=key,
-                            resolving=key in PATH_COLUMNS,
-                            informational=False,
-                            violations=violations,
-                            informational_occurrences=informational,
-                        )
+            except Exception as exc:
+                violations.append({"path": relative, "field": "<parse>", "reason": f"parse_error:{type(exc).__name__}"})
                 continue
-            if path.suffix in {".json", ".yaml", ".yml", ".jsonl"}:
-                try:
-                    if path.suffix == ".json":
-                        payloads = [json.loads(path.read_text(encoding="utf-8"))]
-                    elif path.suffix == ".jsonl":
-                        payloads = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
-                    else:
-                        payloads = [yaml.safe_load(path.read_text(encoding="utf-8"))]
-                    for payload in payloads:
-                        _audit_portable_value(
-                            payload,
-                            document=relative,
-                            json_path=(),
-                            inherited_informational=False,
-                            artifact_manifest=isinstance(payload, dict) and payload.get("schema_version") == ARTIFACT_SCHEMA_VERSION,
-                            violations=violations,
-                            informational_occurrences=informational,
-                        )
-                    continue
-                except Exception as exc:
-                    violations.append({"path": relative, "field": "<parse>", "reason": f"parse_error:{type(exc).__name__}"})
-                    continue
-            text = path.read_text(encoding="utf-8", errors="replace")
-            _classify_portable_string(
-                text,
-                document=relative,
-                field="<text>",
-                resolving=False,
-                informational=False,
-                violations=violations,
-                informational_occurrences=informational,
-            )
+        text = path.read_text(encoding="utf-8", errors="replace")
+        _classify_portable_string(
+            text,
+            document=relative,
+            field="<text>",
+            resolving=False,
+            informational_class=None,
+            violations=violations,
+            informational_occurrences=informational,
+        )
     return {
         "schema_version": "benchmark_v2_portability_audit/2",
+        "stage": stage,
         "files_scanned": files_scanned,
         "violation_count": len(violations),
         "violations": violations,
@@ -2795,24 +2881,29 @@ def _audit_portable_value(
     *,
     document: str,
     json_path: tuple[str, ...],
-    inherited_informational: bool,
+    inherited_informational_class: str | None,
+    schema_version: str,
     artifact_manifest: bool,
     violations: list[dict[str, str]],
     informational_occurrences: list[dict[str, str]],
 ) -> None:
     if isinstance(value, dict):
-        marked = inherited_informational or value.get("path_semantics") == INFORMATIONAL_PATH_SEMANTICS
+        marked = inherited_informational_class
+        if value.get("path_semantics") == INFORMATIONAL_PATH_SEMANTICS:
+            marked = PORTABILITY_CLASS_PROVENANCE
         for key, item in value.items():
             path = (*json_path, str(key))
-            schema_informational = artifact_manifest and (
-                path[:2] == ("producer", "command")
-                or path[:2] == ("reproducibility", "reproduction_command")
+            schema_class = _schema_path_classification(
+                schema_version=schema_version,
+                json_path=path,
+                artifact_manifest=artifact_manifest,
             )
             _audit_portable_value(
                 item,
                 document=document,
                 json_path=path,
-                inherited_informational=marked or schema_informational,
+                inherited_informational_class=marked or schema_class,
+                schema_version=schema_version,
                 artifact_manifest=artifact_manifest,
                 violations=violations,
                 informational_occurrences=informational_occurrences,
@@ -2824,7 +2915,8 @@ def _audit_portable_value(
                 item,
                 document=document,
                 json_path=(*json_path, str(index)),
-                inherited_informational=inherited_informational,
+                inherited_informational_class=inherited_informational_class,
+                schema_version=schema_version,
                 artifact_manifest=artifact_manifest,
                 violations=violations,
                 informational_occurrences=informational_occurrences,
@@ -2839,7 +2931,7 @@ def _audit_portable_value(
         document=document,
         field=".".join(json_path) or "<root>",
         resolving=resolving,
-        informational=inherited_informational,
+        informational_class=inherited_informational_class,
         violations=violations,
         informational_occurrences=informational_occurrences,
     )
@@ -2851,7 +2943,7 @@ def _classify_portable_string(
     document: str,
     field: str,
     resolving: bool,
-    informational: bool,
+    informational_class: str | None,
     violations: list[dict[str, str]],
     informational_occurrences: list[dict[str, str]],
 ) -> None:
@@ -2868,7 +2960,8 @@ def _classify_portable_string(
         "field": field,
         "reason": "absolute_resolving_path" if absolute_resolving else f"forbidden_prefix:{','.join(forbidden_ids)}",
     }
-    if informational:
+    if informational_class:
+        record["classification"] = informational_class
         informational_occurrences.append(record)
     else:
         violations.append(record)
@@ -2885,29 +2978,31 @@ def repair_pilot_portability(
     marker = load_json(root / ROOT_MARKER_NAME)
     if marker.get("benchmark_id") != BENCHMARK_ID or marker.get("path_semantics") != PATH_SEMANTICS:
         raise ValueError(f"invalid Benchmark v2 data root: {root}")
-    before = audit_portable_documents(root)
+    stage_spec(stage)
+    before = audit_portable_documents(root, stage=stage)
     changes: dict[Path, str] = {}
-    extensions = {".csv", ".json", ".jsonl", ".yaml", ".yml", ".txt", ".md"}
-    for scope in (root / "canonical", root / "derived"):
-        if not scope.exists():
+    for path in _portable_document_paths(root, stage):
+        if path.name.endswith("_portability_repair.json"):
             continue
-        for path in scope.rglob("*"):
-            if not path.is_file() or path.suffix not in extensions or path.name.endswith("_portability_repair.json"):
-                continue
-            repaired = _repair_portable_document(path, root)
-            original = path.read_text(encoding="utf-8", errors="replace")
-            if repaired != original:
-                changes[path] = repaired
+        repaired = _repair_portable_document(path, root)
+        original = path.read_text(encoding="utf-8", errors="replace")
+        if repaired != original:
+            changes[path] = repaired
     if apply:
         for path, content in changes.items():
             _atomic_write_text(path, content)
         changed_paths = set(changes)
+        lineage_paths: set[Path] = set()
         if changed_paths:
             _refresh_artifact_tree_manifests(root, changed_paths)
-            _refresh_artifact_manifests(root)
             _refresh_completion_markers(root, changed_paths)
-        after = audit_portable_documents(root)
+            lineage_paths = changed_paths - set(changes)
+            artifact_paths = _refresh_artifact_manifests(root, stage=stage)
+            changed_paths.update(artifact_paths)
+            lineage_paths.update(artifact_paths)
+        after = audit_portable_documents(root, stage=stage)
     else:
+        lineage_paths = set()
         after = before
     report = {
         "schema_version": "benchmark_v2_portability_repair/1",
@@ -2916,6 +3011,8 @@ def repair_pilot_portability(
         "mode": "apply" if apply else "dry_run",
         "changed_file_count": len(changes),
         "changed_files": [str(path.relative_to(root)) for path in sorted(changes)],
+        "lineage_refreshed_file_count": len(lineage_paths),
+        "lineage_refreshed_files": [str(path.relative_to(root)) for path in sorted(lineage_paths)],
         "before": before,
         "after": after,
         "thermal_or_array_artifacts_modified": False,
@@ -2953,47 +3050,102 @@ def _repair_portable_document(path: Path, data_root: Path) -> str:
         return stream.getvalue()
     if path.suffix == ".json":
         payload = json.loads(original_text)
-        repaired = _repair_portable_value(payload, data_root=data_root, informational=False)
+        repaired = _repair_portable_value(
+            payload,
+            data_root=data_root,
+            schema_version=_payload_schema_version(payload),
+            artifact_manifest=isinstance(payload, dict) and payload.get("schema_version") == ARTIFACT_SCHEMA_VERSION,
+            json_path=(),
+            informational_class=None,
+        )
         if repaired == payload:
             return original_text
         return json.dumps(repaired, indent=2, sort_keys=True) + "\n"
     if path.suffix == ".jsonl":
         rows = [json.loads(line) for line in original_text.splitlines() if line.strip()]
-        repaired_rows = [_repair_portable_value(row, data_root=data_root, informational=False) for row in rows]
+        repaired_rows = [
+            _repair_portable_value(
+                row,
+                data_root=data_root,
+                schema_version=_payload_schema_version(row),
+                artifact_manifest=isinstance(row, dict) and row.get("schema_version") == ARTIFACT_SCHEMA_VERSION,
+                json_path=(),
+                informational_class=None,
+            )
+            for row in rows
+        ]
         if repaired_rows == rows:
             return original_text
         return "".join(json.dumps(row, sort_keys=True) + "\n" for row in repaired_rows)
     if path.suffix in {".yaml", ".yml"}:
         payload = yaml.safe_load(original_text)
-        repaired = _repair_portable_value(payload, data_root=data_root, informational=False)
+        repaired = _repair_portable_value(
+            payload,
+            data_root=data_root,
+            schema_version=_payload_schema_version(payload),
+            artifact_manifest=isinstance(payload, dict) and payload.get("schema_version") == ARTIFACT_SCHEMA_VERSION,
+            json_path=(),
+            informational_class=None,
+        )
         if repaired == payload:
             return original_text
         return yaml.safe_dump(repaired, sort_keys=False, width=120)
     return _sanitize_nonresolving_text(original_text, data_root)
 
 
-def _repair_portable_value(value: Any, *, data_root: Path, informational: bool, key: str = "") -> Any:
+def _repair_portable_value(
+    value: Any,
+    *,
+    data_root: Path,
+    schema_version: str,
+    artifact_manifest: bool,
+    json_path: tuple[str, ...],
+    informational_class: str | None,
+) -> Any:
     if isinstance(value, dict):
-        marked = informational or value.get("path_semantics") == INFORMATIONAL_PATH_SEMANTICS
+        marked = informational_class
+        if value.get("path_semantics") == INFORMATIONAL_PATH_SEMANTICS:
+            marked = PORTABILITY_CLASS_PROVENANCE
         repaired: dict[str, Any] = {}
         for item_key, item in value.items():
-            if item_key == "source_checkpoint" and isinstance(item, str) and not marked:
+            item_path = (*json_path, str(item_key))
+            item_class = marked or _schema_path_classification(
+                schema_version=schema_version,
+                json_path=item_path,
+                artifact_manifest=artifact_manifest,
+            )
+            if item_key == "source_checkpoint" and isinstance(item, str) and not item_class:
                 repaired[item_key] = _repair_resolving_path(item, key=item_key, row=value, data_root=data_root)
             else:
                 repaired[item_key] = _repair_portable_value(
                     item,
                     data_root=data_root,
-                    informational=marked or item_key in {"command", "reproduction_command"},
-                    key=str(item_key),
+                    schema_version=schema_version,
+                    artifact_manifest=artifact_manifest,
+                    json_path=item_path,
+                    informational_class=item_class,
                 )
         return repaired
     if isinstance(value, list):
-        return [_repair_portable_value(item, data_root=data_root, informational=informational, key=key) for item in value]
+        return [
+            _repair_portable_value(
+                item,
+                data_root=data_root,
+                schema_version=schema_version,
+                artifact_manifest=artifact_manifest,
+                json_path=(*json_path, str(index)),
+                informational_class=informational_class,
+            )
+            for index, item in enumerate(value)
+        ]
     if not isinstance(value, str):
         return value
+    key = json_path[-1] if json_path else ""
     resolving = key in PATH_COLUMNS or key.endswith("_path") or key in {"path", "relative_path"}
-    if resolving and not informational:
+    if resolving and not informational_class:
         return _repair_resolving_path(value, key=key, row={}, data_root=data_root)
+    if informational_class:
+        return value
     return _sanitize_nonresolving_text(value, data_root)
 
 
@@ -3074,17 +3226,22 @@ def _refresh_artifact_tree_manifests(data_root: Path, changed_paths: set[Path]) 
         changed_paths.add(tree_path)
 
 
-def _refresh_artifact_manifests(data_root: Path) -> None:
+def _refresh_artifact_manifests(data_root: Path, *, stage: str) -> set[Path]:
     manifest_root = data_root / "canonical/manifests/artifacts"
     manifest_paths = sorted(manifest_root.glob("*.json")) if manifest_root.exists() else []
     if not manifest_paths:
-        return
+        return set()
+    target_paths = [path for path in manifest_paths if path.name.startswith(f"{stage}_")]
+    changed_paths: set[Path] = set()
     by_id: dict[str, Path] = {}
     for path in manifest_paths:
         payload = load_json(path)
         artifact_id = str(payload.get("artifact_id", ""))
         if artifact_id:
             by_id[artifact_id] = path
+    for path in target_paths:
+        payload = load_json(path)
+        original = json.dumps(payload, sort_keys=True)
         tree_value = str(payload.get("content", {}).get("tree_manifest_path", ""))
         if tree_value:
             tree_path = resolve_data_path(tree_value, data_root)
@@ -3098,10 +3255,12 @@ def _refresh_artifact_manifests(data_root: Path) -> None:
             report_path = resolve_data_path(report_value, data_root)
             if report_path.exists():
                 payload["validation"]["report_sha256"] = sha256_file(report_path)
-        write_json(path, payload)
-    for _ in range(len(manifest_paths) + 1):
+        if json.dumps(payload, sort_keys=True) != original:
+            write_json(path, payload)
+            changed_paths.add(path)
+    for _ in range(len(target_paths) + 1):
         iteration_changed = False
-        for path in manifest_paths:
+        for path in target_paths:
             payload = load_json(path)
             payload_changed = False
             for parent in payload.get("parents", []):
@@ -3115,8 +3274,10 @@ def _refresh_artifact_manifests(data_root: Path) -> None:
                     iteration_changed = True
             if payload_changed:
                 write_json(path, payload)
+                changed_paths.add(path)
         if not iteration_changed:
             break
+    return changed_paths
 
 
 def audit_index_paths(rows: Sequence[dict[str, str]], data_root: Path) -> list[str]:
@@ -3305,7 +3466,7 @@ def relocate_pilot(
         if stage == PHASE3_STAGE
         else validate_pilot_root(destination_root, residual_checkpoint=residual_checkpoint)
     )
-    portable = audit_portable_documents(destination_root)
+    portable = audit_portable_documents(destination_root, stage=stage)
     report = {
         "schema_version": "benchmark_v2_relocation_validation/1",
         "benchmark_id": BENCHMARK_ID,
