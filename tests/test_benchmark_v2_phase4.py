@@ -16,11 +16,14 @@ from chiptherm.benchmark_v2_pipeline import (
     PilotPaths,
     accepted_pilot_immutability_snapshot,
     build_isolation_inputs,
+    ensure_root_layout,
     estimate_full_build_resources,
     generate_hotspot_samples,
+    hotspot_cumulative_accounting,
     load_selection,
     pilot_hotspot_catalog,
     read_csv,
+    repair_full_postbuild_validation_metadata,
     reusable_pilot_sample,
     write_canonical_sample_source,
     write_csv,
@@ -265,6 +268,120 @@ class BenchmarkV2Phase4Tests(unittest.TestCase):
             self._write_accepted_phase3_report(root)
             with self.assertRaisesRegex(ValueError, "must be provided together"):
                 estimate_full_build_resources(root, filesystem_total_bytes=4_000 * GIB)
+
+    def test_full_postbuild_repair_fixes_paths_and_cumulative_accounting(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            ensure_root_layout(root, root / "staging")
+            reused_target = root / f"canonical/stages/{PHASE3_STAGE}/hotspot_labels/f001/a/parsed/temp_layer0.npy"
+            full_target = root / f"canonical/stages/{FULL_STAGE}/hotspot_labels/f002/b/parsed/temp_layer0.npy"
+            reused_target.parent.mkdir(parents=True)
+            full_target.parent.mkdir(parents=True)
+            np.save(reused_target, np.full((64, 64), 321.0, dtype=np.float32))
+            np.save(full_target, np.full((64, 64), 322.0, dtype=np.float32))
+            hashes_before = {
+                "reused": __import__("hashlib").sha256(reused_target.read_bytes()).hexdigest(),
+                "full": __import__("hashlib").sha256(full_target.read_bytes()).hexdigest(),
+            }
+            write_csv(
+                root / f"canonical/stages/{FULL_STAGE}/hotspot_labels/sample_index.csv",
+                [
+                    {
+                        "sample_uid": "a",
+                        "target_path": str(reused_target.relative_to(root)),
+                        "ownership_stage": PHASE3_STAGE,
+                        "reused_by_content_hash": "true",
+                    },
+                    {
+                        "sample_uid": "b",
+                        "target_path": str(full_target.relative_to(root)),
+                        "ownership_stage": FULL_STAGE,
+                        "reused_by_content_hash": "false",
+                    },
+                ],
+            )
+            report_path = root / f"canonical/manifests/{FULL_STAGE}_build_report.json"
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "benchmark_v2_pilot_validation_report/1",
+                        "stage": FULL_STAGE,
+                        "report_path": str(report_path),
+                        "hotspot": {
+                            "requested": 2,
+                            "scheduled": 1,
+                            "completed": 1,
+                            "skipped_valid": 0,
+                            "reused_phase2": 0,
+                            "reused_pilot": 1,
+                            "failed": 0,
+                            "deferred": 0,
+                            "retry_count": 0,
+                            "failures": [],
+                            "complete": True,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            absolute_x = root / f"derived/stages/{FULL_STAGE}/context_33ch/a.npy"
+            absolute_x.parent.mkdir(parents=True)
+            np.save(absolute_x, np.zeros((33, 64, 64), dtype=np.float32))
+            write_csv(
+                root / f"derived/indices/{FULL_STAGE}/all_index.csv",
+                [{"sample_uid": "a", "x_path": str(absolute_x), "y_path": str(reused_target.relative_to(root))}],
+            )
+            write_csv(
+                root / f"derived/indices/{FULL_STAGE}/failure_accounting.csv",
+                [{"stage": "hotspot_generation", "requested": 2, "completed": 1, "reused_pilot": 1}],
+            )
+
+            repaired = repair_full_postbuild_validation_metadata(root, apply=True, expected_samples=2)
+            self.assertEqual(repaired["portable_paths_after"]["violation_count"], 0)
+            self.assertEqual(
+                repaired["accounting"],
+                {
+                    "requested": 2,
+                    "reused": 1,
+                    "new_expected": 1,
+                    "succeeded": 1,
+                    "failed": 0,
+                    "deferred": 0,
+                    "retry_count": 0,
+                    "accounted": 2,
+                },
+            )
+            row = read_csv(root / f"derived/indices/{FULL_STAGE}/all_index.csv")[0]
+            self.assertFalse(Path(row["x_path"]).is_absolute())
+            failure = read_csv(root / f"derived/indices/{FULL_STAGE}/failure_accounting.csv")[0]
+            self.assertEqual(failure["status"], "fully_accounted_no_failures")
+            self.assertEqual(failure["failed"], "0")
+            self.assertEqual(failure["retry_count"], "0")
+            self.assertEqual(hashes_before["reused"], __import__("hashlib").sha256(reused_target.read_bytes()).hexdigest())
+            self.assertEqual(hashes_before["full"], __import__("hashlib").sha256(full_target.read_bytes()).hexdigest())
+
+            second = repair_full_postbuild_validation_metadata(root, apply=True, expected_samples=2)
+            self.assertEqual(second["changed_file_count"], 0, second["changed_files"])
+            self.assertEqual(second["portable_paths_after"]["violation_count"], 0)
+
+    def test_retry_accounting_counts_reused_pilot_once(self) -> None:
+        accounting = hotspot_cumulative_accounting(
+            {
+                "requested": 10_000,
+                "completed": 9_500,
+                "skipped_valid": 0,
+                "reused_phase2": 0,
+                "reused_pilot": 500,
+                "failed": 0,
+                "deferred": 0,
+                "retry_count": 0,
+            },
+            expected_samples=10_000,
+        )
+        self.assertEqual(accounting["accounted"], 10_000)
+        self.assertEqual(accounting["reused"], 500)
+        self.assertEqual(accounting["new_expected"], 9_500)
 
     def test_full_visual_selection_covers_all_families(self) -> None:
         rows = [

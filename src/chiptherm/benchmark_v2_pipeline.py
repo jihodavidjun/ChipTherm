@@ -3115,6 +3115,66 @@ def validate_pilot_root(
     return report
 
 
+def hotspot_cumulative_accounting(
+    hotspot_report: Mapping[str, Any],
+    *,
+    expected_samples: int,
+) -> dict[str, int]:
+    """Return one non-overlapping package accounting view.
+
+    ``reused_pilot`` is the total reuse count. ``reused_phase2`` and
+    ``reused_by_ownership_stage`` are subsets and must not be added again.
+    """
+    stored = hotspot_report.get("cumulative_accounting")
+    if isinstance(stored, Mapping):
+        keys = (
+            "requested",
+            "reused",
+            "new_expected",
+            "succeeded",
+            "failed",
+            "deferred",
+            "retry_count",
+            "accounted",
+        )
+        try:
+            return {key: int(stored.get(key, 0)) for key in keys}
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid cumulative HotSpot accounting: {stored}") from exc
+
+    requested = int(hotspot_report.get("requested", expected_samples))
+    reused = int(hotspot_report.get("reused_pilot", 0))
+    succeeded = int(hotspot_report.get("completed", 0)) + int(hotspot_report.get("skipped_valid", 0))
+    failed = int(hotspot_report.get("failed", 0))
+    deferred = int(hotspot_report.get("deferred", 0))
+    return {
+        "requested": requested,
+        "reused": reused,
+        "new_expected": max(0, requested - reused),
+        "succeeded": succeeded,
+        "failed": failed,
+        "deferred": deferred,
+        "retry_count": int(hotspot_report.get("retry_count", 0)),
+        "accounted": reused + succeeded + failed + deferred,
+    }
+
+
+def _hotspot_accounting_is_complete(accounting: Mapping[str, int], expected_samples: int) -> bool:
+    return (
+        int(accounting["requested"]) == expected_samples
+        and int(accounting["new_expected"]) == expected_samples - int(accounting["reused"])
+        and int(accounting["accounted"]) == expected_samples
+        and int(accounting["reused"])
+        + int(accounting["succeeded"])
+        + int(accounting["failed"])
+        + int(accounting["deferred"])
+        == expected_samples
+        and int(accounting["failed"]) == 0
+        and int(accounting["deferred"]) == 0
+        and int(accounting["retry_count"]) >= 0
+    )
+
+
 def validate_scale_pilot_root(
     data_root: str | Path,
     *,
@@ -3408,8 +3468,17 @@ def validate_scale_pilot_root(
     }
     checks.append(_check("no_silent_sample_loss", all(values == uid_sets["workloads"] for values in uid_sets.values()), str({key: len(value) for key, value in uid_sets.items()})))
     hotspot_report = build_report.get("hotspot", {})
-    accounted = sum(int(hotspot_report.get(key, 0)) for key in ("completed", "skipped_valid", "reused_phase2", "failed"))
-    checks.append(_check("retry_failure_accounting", accounted == spec.sample_count and int(hotspot_report.get("failed", 0)) == 0, f"accounted={accounted} report={hotspot_report}"))
+    hotspot_accounting = hotspot_cumulative_accounting(
+        hotspot_report,
+        expected_samples=spec.sample_count,
+    )
+    checks.append(
+        _check(
+            "retry_failure_accounting",
+            _hotspot_accounting_is_complete(hotspot_accounting, spec.sample_count),
+            str(hotspot_accounting),
+        )
+    )
 
     if stage == FULL_STAGE:
         snapshot_path = data_root / f"canonical/manifests/{FULL_STAGE}_accepted_pilot_snapshot.json"
@@ -3471,12 +3540,10 @@ def validate_scale_pilot_root(
                 _check(
                     "failure_accounting_consistency",
                     bool(failure_rows)
-                    and int(hotspot_report.get("failed", 0)) == 0
-                    and int(hotspot_report.get("completed", 0))
-                    + int(hotspot_report.get("skipped_valid", 0))
-                    + int(hotspot_report.get("reused_pilot", 0))
+                    and _hotspot_accounting_is_complete(hotspot_accounting, spec.sample_count)
+                    and int(failure_rows[0].get("accounted", hotspot_accounting["accounted"]))
                     == spec.sample_count,
-                    str(hotspot_report),
+                    str(hotspot_accounting),
                 ),
                 _check(
                     "provisional_source_checkpoint_marking",
@@ -3989,6 +4056,207 @@ def repair_pilot_portability(
     return report
 
 
+def _csv_text(rows: Sequence[Mapping[str, Any]], fieldnames: Sequence[str]) -> str:
+    import io
+
+    stream = io.StringIO(newline="")
+    writer = csv.DictWriter(stream, fieldnames=list(fieldnames), lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(rows)
+    return stream.getvalue()
+
+
+def _derive_full_cumulative_accounting(
+    data_root: Path,
+    hotspot_report: Mapping[str, Any],
+    *,
+    expected_samples: int,
+) -> dict[str, int]:
+    sample_index = data_root / f"canonical/stages/{FULL_STAGE}/hotspot_labels/sample_index.csv"
+    if not sample_index.is_file():
+        raise FileNotFoundError(f"full-stage HotSpot sample index is missing: {sample_index}")
+    rows = read_csv(sample_index)
+    uids = [str(row.get("sample_uid", "")) for row in rows]
+    if len(rows) != expected_samples or len(set(uids)) != expected_samples or any(not uid for uid in uids):
+        raise ValueError(
+            "full-stage HotSpot sample index does not contain the expected unique population: "
+            f"rows={len(rows)} unique={len(set(uids))} expected={expected_samples}"
+        )
+
+    reused = 0
+    missing_labels: list[str] = []
+    unknown_ownership: list[str] = []
+    for row in rows:
+        uid = str(row["sample_uid"])
+        target_value = str(row.get("target_path", "") or row.get("final_temperature_path", ""))
+        if not target_value or not resolve_data_path(target_value, data_root).is_file():
+            missing_labels.append(uid)
+        ownership = str(row.get("ownership_stage", ""))
+        reused_flag = str(row.get("reused_by_content_hash", "")).strip().lower() == "true"
+        if reused_flag or ownership in {PHASE2_STAGE, PHASE3_STAGE}:
+            reused += 1
+        elif ownership != FULL_STAGE:
+            unknown_ownership.append(f"{uid}:{ownership or '<blank>'}")
+    if missing_labels:
+        raise ValueError(f"cannot reconcile accounting with missing durable labels: {missing_labels[:20]}")
+    if unknown_ownership:
+        raise ValueError(f"cannot reconcile unknown HotSpot ownership stages: {unknown_ownership[:20]}")
+
+    new_expected = expected_samples - reused
+    retries = int(hotspot_report.get("retry_count", 0))
+    if retries < 0:
+        raise ValueError(f"retry_count must be nonnegative, got {retries}")
+    return {
+        "requested": expected_samples,
+        "reused": reused,
+        "new_expected": new_expected,
+        "succeeded": new_expected,
+        "failed": 0,
+        "deferred": 0,
+        "retry_count": retries,
+        "accounted": expected_samples,
+    }
+
+
+def repair_full_postbuild_validation_metadata(
+    data_root: str | Path,
+    *,
+    apply: bool = False,
+    expected_samples: int | None = None,
+) -> dict[str, Any]:
+    """Repair Phase 4 portability and cumulative accounting without touching arrays."""
+    root = Path(data_root).expanduser().resolve()
+    marker = load_json(root / ROOT_MARKER_NAME)
+    if marker.get("benchmark_id") != BENCHMARK_ID or marker.get("path_semantics") != PATH_SEMANTICS:
+        raise ValueError(f"invalid Benchmark v2 data root: {root}")
+    expected = int(expected_samples or stage_spec(FULL_STAGE).sample_count)
+    build_report_path = root / f"canonical/manifests/{FULL_STAGE}_build_report.json"
+    build_report = load_json(build_report_path)
+    hotspot = dict(build_report.get("hotspot", {}))
+    accounting = _derive_full_cumulative_accounting(
+        root,
+        hotspot,
+        expected_samples=expected,
+    )
+    if not _hotspot_accounting_is_complete(accounting, expected):
+        raise ValueError(f"derived full-stage accounting is incomplete: {accounting}")
+
+    hotspot["cumulative_accounting"] = accounting
+    hotspot["requested_package_samples"] = accounting["requested"]
+    hotspot["reused_package_samples"] = accounting["reused"]
+    hotspot["new_package_runs_expected"] = accounting["new_expected"]
+    hotspot["succeeded_package_runs"] = accounting["succeeded"]
+    hotspot["failed_package_runs"] = accounting["failed"]
+    hotspot["deferred_package_runs"] = accounting["deferred"]
+    hotspot["failed"] = 0
+    hotspot["deferred"] = 0
+    hotspot["deferred_uids"] = {}
+    hotspot["complete"] = True
+    build_report["hotspot"] = hotspot
+
+    build_report = _repair_portable_value(
+        build_report,
+        data_root=root,
+        schema_version=_payload_schema_version(build_report),
+        artifact_manifest=False,
+        json_path=(),
+        informational_class=None,
+    )
+    changes: dict[Path, str] = {
+        build_report_path: json.dumps(build_report, indent=2, sort_keys=True) + "\n",
+    }
+    failure_path = root / f"derived/indices/{FULL_STAGE}/failure_accounting.csv"
+    failure_fields = (
+        "stage",
+        "requested",
+        "reused",
+        "new_expected",
+        "succeeded",
+        "failed",
+        "deferred",
+        "retry_count",
+        "accounted",
+        "status",
+    )
+    changes[failure_path] = _csv_text(
+        [
+            {
+                "stage": "hotspot_generation",
+                **accounting,
+                "status": "fully_accounted_no_failures",
+            }
+        ],
+        failure_fields,
+    )
+
+    before = audit_portable_documents(root, stage=FULL_STAGE)
+    for path in _portable_document_paths(root, FULL_STAGE):
+        if path in changes or path.name == f"{FULL_STAGE}_postbuild_repair.json":
+            continue
+        repaired = _repair_portable_document(path, root)
+        original = path.read_text(encoding="utf-8", errors="replace")
+        if repaired != original:
+            changes[path] = repaired
+    changes = {
+        path: content
+        for path, content in changes.items()
+        if not path.exists() or path.read_text(encoding="utf-8", errors="replace") != content
+    }
+    hashes_before = {
+        str(path.relative_to(root)): sha256_file(path)
+        for path in changes
+        if path.is_file()
+    }
+
+    lineage_paths: set[Path] = set()
+    if apply:
+        for path, content in changes.items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write_text(path, content)
+        changed_paths = set(changes)
+        direct_paths = set(changed_paths)
+        if changed_paths:
+            _refresh_artifact_tree_manifests(root, changed_paths)
+            _refresh_completion_markers(root, changed_paths)
+            artifact_paths = _refresh_artifact_manifests(root, stage=FULL_STAGE)
+            changed_paths.update(artifact_paths)
+        lineage_paths = changed_paths - direct_paths
+        after = audit_portable_documents(root, stage=FULL_STAGE)
+    else:
+        after = before
+
+    report = {
+        "schema_version": "benchmark_v2_full_postbuild_repair/1",
+        "benchmark_id": BENCHMARK_ID,
+        "stage": FULL_STAGE,
+        "mode": "apply" if apply else "dry_run",
+        "accounting": accounting,
+        "changed_file_count": len(changes),
+        "changed_files": [str(path.relative_to(root)) for path in sorted(changes)],
+        "changed_file_sha256_before": hashes_before,
+        "changed_file_sha256_after": (
+            {str(path.relative_to(root)): sha256_file(path) for path in changes}
+            if apply
+            else {}
+        ),
+        "lineage_refreshed_file_count": len(lineage_paths),
+        "lineage_refreshed_files": [str(path.relative_to(root)) for path in sorted(lineage_paths)],
+        "portable_paths_before": before,
+        "portable_paths_after": after,
+        "thermal_labels_modified": False,
+        "array_or_graph_artifacts_modified": False,
+    }
+    if apply:
+        report_path = root / f"canonical/manifests/{FULL_STAGE}_postbuild_repair.json"
+        write_json(report_path, report)
+        final_audit = audit_portable_documents(root, stage=FULL_STAGE)
+        report["portable_paths_after"] = final_audit
+        write_json(report_path, report)
+        if final_audit["violation_count"]:
+            raise ValueError(f"Phase 4 repair left {final_audit['violation_count']} portability violations")
+    return report
+
+
 def _repair_portable_document(path: Path, data_root: Path) -> str:
     original_text = path.read_text(encoding="utf-8", errors="replace")
     if path.suffix == ".csv":
@@ -4009,7 +4277,7 @@ def _repair_portable_document(path: Path, data_root: Path) -> str:
         import io
 
         stream = io.StringIO(newline="")
-        writer = csv.DictWriter(stream, fieldnames=fieldnames)
+        writer = csv.DictWriter(stream, fieldnames=fieldnames, lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
         return stream.getvalue()

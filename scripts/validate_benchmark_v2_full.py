@@ -30,7 +30,10 @@ def main() -> int:
         residual_checkpoint=args.residual_checkpoint,
         require_relocation=args.require_relocation,
     )
+    checks = list(report.get("checks", []))
+    passed_checks = sum(bool(check.get("passed")) for check in checks)
     print(f"Full validation passed: {report['passed']}")
+    print(f"Checks passed: {passed_checks}/{len(checks)}")
     print(f"Recommendation: {report['recommendation']}")
     print(f"Samples: {report.get('actual_sample_count', report.get('expected_sample_count'))}")
     return 0
