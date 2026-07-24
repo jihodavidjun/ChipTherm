@@ -44,8 +44,7 @@ EXPECTED_PRIMARY_SPLIT = {
 }
 
 RESIDUAL_DATASET_SIDECARS = {
-    "feature_manifest.json": "derived/stages/full_50x200/context_33ch/feature_manifest.json",
-    "context_manifest.json": "derived/stages/full_50x200/context_33ch/context_manifest.json",
+    "feature_manifest.json": "derived/stages/full_50x200/context_33ch/feature_manifest.json", 
     "metadata_features.csv": "derived/stages/full_50x200/metadata/metadata_features.csv",
     "metadata_manifest.json": "derived/stages/full_50x200/metadata/metadata_manifest.json",
     "graph_manifest.json": "derived/stages/full_50x200/graphs/graph_manifest.json",
