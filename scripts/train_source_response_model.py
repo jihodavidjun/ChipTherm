@@ -410,7 +410,7 @@ def evaluate_model(
             group["source_abs_mean_errors"].append(float(np.mean(np.abs(source_error_i))))
     source_unit = aggregate_error(np.concatenate([e.reshape(-1) for e in source_unit_errors]), suffix="K_per_W")
     source_physical = aggregate_error(np.concatenate([e.reshape(-1) for e in source_physical_errors]), suffix="K")
-    package = package_metrics(groups)
+    package = package_metrics(groups, data_root=data_root)
     prediction_stats = {
         "pred_unit_K_per_W": describe_values(np.concatenate(pred_unit_values), warning=None),
         "pred_source_rise_K": describe_values(np.concatenate(pred_rise_values), warning=None),
@@ -427,7 +427,7 @@ def evaluate_model(
     }
 
 
-def package_metrics(groups: dict[str, dict[str, Any]]) -> dict[str, Any]:
+def package_metrics(groups: dict[str, dict[str, Any]], data_root=None) -> dict[str, Any]:
     records = []
     by_case: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for uid, group in groups.items():
