@@ -419,28 +419,6 @@ def main() -> int:
                 "global_pool_size": args.global_pool_size,
             }
         )
-    config["resume_signature"] = {
-        key: config[key]
-        for key in (
-            "train_index",
-            "val_index",
-            "batch_size",
-            "lr",
-            "physics_input_mode",
-            "physical_representation",
-            "mean_head_mode",
-            "scheduler",
-            "temp_loss_weight",
-            "hotspot_loss_weight",
-            "hotspot_top_frac",
-            "lambda_final",
-            "lambda_mean",
-            "lambda_graph",
-            "lambda_chiplet_mean",
-            "seed",
-            "model",
-        )
-    }
     if args.mean_head_mode == "residual_resistance":
         assert delta_R_stats is not None
         model_config.update(
@@ -540,6 +518,28 @@ def main() -> int:
             "plus optional hotspot_loss_weight * L1(T_pred, HotSpot on top HotSpot cells) / residual_std"
         ),
         "target": "residual = HotSpot - PhysicsBaseline",
+    }
+    config["resume_signature"] = {
+        key: config[key]
+        for key in (
+            "train_index",
+            "val_index",
+            "batch_size",
+            "lr",
+            "physics_input_mode",
+            "physical_representation",
+            "mean_head_mode",
+            "scheduler",
+            "temp_loss_weight",
+            "hotspot_loss_weight",
+            "hotspot_top_frac",
+            "lambda_final",
+            "lambda_mean",
+            "lambda_graph",
+            "lambda_chiplet_mean",
+            "seed",
+            "model",
+        )
     }
     model = build_model(model_config).to(device)
     if args.resume and args.init_checkpoint:
