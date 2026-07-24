@@ -92,6 +92,7 @@ class SourceResponseDataset(Dataset):
         *,
         power_floor_W: float = 1.0e-6,
         return_metadata: bool = True,
+        data_root: str | Path | None = None,
     ) -> None:
         self.index_csv = Path(index_csv).expanduser().resolve()
         if not self.index_csv.exists():
@@ -101,6 +102,7 @@ class SourceResponseDataset(Dataset):
             raise ValueError(f"{self.index_csv} contains no source-response rows")
         self.power_floor_W = float(power_floor_W)
         self.return_metadata = bool(return_metadata)
+        self.data_root = Path(data_root).expanduser().resolve() if data_root is not None else None
         self.channel_names = SOURCE_RESPONSE_CHANNEL_NAMES
 
     def __len__(self) -> int:
@@ -108,9 +110,9 @@ class SourceResponseDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         row = self.rows[int(index)]
-        x = np.load(resolve_path(row["original_x_path"], self.index_csv.parent)).astype(np.float32, copy=False)
-        target_rise = np.load(resolve_path(row["target_rise_path"], self.index_csv.parent)).astype(np.float32, copy=False)
-        layout = load_json(resolve_path(row["layout_path"], self.index_csv.parent))
+        x = np.load(resolve_path(row["original_x_path"], self.index_csv.parent, self.data_root)).astype(np.float32, copy=False)
+        target_rise = np.load(resolve_path(row["target_rise_path"], self.index_csv.parent, self.data_root)).astype(np.float32, copy=False)
+        layout = load_json(resolve_path(row["layout_path"], self.index_csv.parent, self.data_root))
         source_index = int(row["source_index"])
         source_power_W = float(row["source_power_W"])
         source_input = build_source_input(x, layout, source_index, source_power_W)
@@ -123,7 +125,7 @@ class SourceResponseDataset(Dataset):
             "source_power_W": torch.tensor(source_power_W, dtype=torch.float32),
             "ambient_K": torch.tensor(float(row["ambient_K"]), dtype=torch.float32),
             "full_temperature": torch.from_numpy(
-                np.load(resolve_path(full_temperature_path, self.index_csv.parent)).astype(np.float32, copy=False)
+                np.load(resolve_path(full_temperature_path, self.index_csv.parent, self.data_root)).astype(np.float32, copy=False)
             ),
         }
         if self.return_metadata:
@@ -137,7 +139,7 @@ class SourceResponseDataset(Dataset):
         return groups
 
     def resolve_row_path(self, path_value: str | None) -> Path:
-        return resolve_path(path_value, self.index_csv.parent)
+        return resolve_path(path_value, self.index_csv.parent, self.data_root)
 
 
 class SourceResponsePackageDataset(Dataset):
@@ -149,8 +151,14 @@ class SourceResponsePackageDataset(Dataset):
         *,
         power_floor_W: float = 1.0e-6,
         require_complete: bool = True,
+        data_root: str | Path | None = None,
     ) -> None:
-        self.source_dataset = SourceResponseDataset(index_csv, power_floor_W=power_floor_W, return_metadata=True)
+        self.source_dataset = SourceResponseDataset(
+            index_csv,
+            power_floor_W=power_floor_W,
+            return_metadata=True,
+            data_root=data_root,
+        )
         groups: dict[str, list[int]] = {}
         for index, row in enumerate(self.source_dataset.rows):
             groups.setdefault(row["original_sample_uid"], []).append(index)
@@ -204,12 +212,20 @@ def read_rows(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(fp))
 
 
-def resolve_path(path_value: str | None, base: Path) -> Path:
+def resolve_path(path_value: str | None, base: Path, data_root: Path | None = None) -> Path:
     if path_value is None:
         raise ValueError("path value is missing")
     path = Path(path_value).expanduser()
     if path.is_absolute():
         return path
+    if data_root is not None:
+        resolved = data_root / path
+        if not resolved.exists():
+            raise FileNotFoundError(
+                f"source-response path does not exist: logical={path_value!r}, "
+                f"data_root={data_root}, resolved={resolved}"
+            )
+        return resolved
     for candidate in (Path.cwd() / path, REPO_ROOT / path, base / path):
         if candidate.exists():
             return candidate

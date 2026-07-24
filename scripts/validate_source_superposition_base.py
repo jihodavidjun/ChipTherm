@@ -34,6 +34,7 @@ from scripts.build_full_source_superposition_base import (  # noqa: E402
     select_device,
     sha256_file,
     sidecar_path,
+    stable_json_sha256,
 )
 from scripts.evaluate_full_source_superposition_base import base_metrics, summarize_by_case, summarize_overall, write_csv  # noqa: E402
 
@@ -44,6 +45,7 @@ def main() -> int:
     parser.add_argument("--val-index", required=True, type=Path)
     parser.add_argument("--test-index", required=True, type=Path)
     parser.add_argument("--source-root", required=True, type=Path)
+    parser.add_argument("--data-root", default=None, type=Path, help="Explicit root for portable root-relative paths.")
     parser.add_argument("--checkpoint", required=True, type=Path)
     parser.add_argument("--spot-check-count", default=0, type=int)
     parser.add_argument("--source-batch-size", default=64, type=int)
@@ -66,6 +68,7 @@ def main() -> int:
 
     canonical_indices = {"train": args.train_index, "val": args.val_index, "test": args.test_index}
     source_root = args.source_root.expanduser().resolve()
+    data_root = args.data_root.expanduser().resolve() if args.data_root is not None else None
     checkpoint = args.checkpoint.expanduser().resolve()
     if not source_root.exists():
         raise SystemExit(f"missing source root: {source_root}")
@@ -83,6 +86,24 @@ def main() -> int:
     metric_records: list[dict[str, Any]] = []
     if manifest.get("source_checkpoint_sha256") != checkpoint_sha:
         errors.append("checkpoint sha256 does not match manifest")
+    checkpoint_payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    normalization_sha = stable_json_sha256(checkpoint_payload.get("normalization", {}))
+    model_config_sha = stable_json_sha256(checkpoint_payload.get("model_config", {}))
+    lineage_path = source_root / "source_checkpoint_lineage.json"
+    lineage_sha = (
+        stable_json_sha256(json.loads(lineage_path.read_text(encoding="utf-8")))
+        if lineage_path.is_file()
+        else ""
+    )
+    expected_lineage = {
+        "source_normalization_sha256": normalization_sha,
+        "source_model_config_sha256": model_config_sha,
+        "source_checkpoint_lineage_sha256": lineage_sha,
+    }
+    for key, value in expected_lineage.items():
+        if manifest.get(key) != value:
+            errors.append(f"{key} does not match selected checkpoint/source lineage")
+    report["expected_lineage"] = expected_lineage
 
     all_uids: dict[str, set[str]] = {}
     spot_candidates: list[tuple[str, dict[str, str], Path]] = []
@@ -106,6 +127,17 @@ def main() -> int:
             if canonical.get("sample_uid") != uid:
                 split_errors.append(f"row {index} sample_uid mismatch {canonical.get('sample_uid')} != {uid}")
                 continue
+            absolute_paths = [
+                f"{key}={value}"
+                for key, value in generated.items()
+                if value
+                and (key.endswith("_path") or key in {"source_dir", "source_checkpoint"})
+                and Path(value).is_absolute()
+            ]
+            if absolute_paths:
+                split_errors.append(
+                    f"row {index} contains nonportable resolving paths: {absolute_paths[:5]}"
+                )
             for field in canonical_fields:
                 if canonical.get(field, "") != generated.get(field, ""):
                     split_errors.append(f"row {index} canonical field changed: {field}")
@@ -114,13 +146,13 @@ def main() -> int:
             if not map_value:
                 split_errors.append(f"row {index} missing source_superposition_base_path")
                 continue
-            map_path = resolve_path(map_value, source_root)
+            map_path = resolve_v2_path(map_value, source_root, data_root)
             try:
                 validate_map_file(map_path)
-                validate_sidecar(map_path, generated, checkpoint_sha)
-                target = np.load(resolve_path(generated["y_path"], generated_path.parent)).astype(np.float64, copy=False)
+                validate_sidecar(map_path, generated, checkpoint_sha, expected_lineage)
+                target = np.load(resolve_v2_path(generated["y_path"], generated_path.parent, data_root)).astype(np.float64, copy=False)
                 base = np.load(map_path).astype(np.float64, copy=False)
-                metric_records.append(base_metrics(generated, split, base, target))
+                metric_records.append(base_metrics(generated, split, base, target, data_root=data_root))
                 checked_maps += 1
             except Exception as exc:
                 split_errors.append(f"row {index} map validation failed: {exc}")
@@ -158,6 +190,7 @@ def main() -> int:
             seed=args.seed,
             atol=args.atol,
             warning_atol=args.warning_atol,
+            data_root=data_root,
         )
         report["spot_check_summary"] = summarize_spot_checks(report["spot_checks"])
         for item in report["spot_checks"]:
@@ -240,7 +273,12 @@ def validate_map_file(path: Path) -> None:
         raise ValueError("non-finite values")
 
 
-def validate_sidecar(map_path: Path, row: dict[str, str], checkpoint_sha: str) -> None:
+def validate_sidecar(
+    map_path: Path,
+    row: dict[str, str],
+    checkpoint_sha: str,
+    expected_lineage: dict[str, str],
+) -> None:
     metadata_path = sidecar_path(map_path)
     if not metadata_path.exists():
         raise FileNotFoundError(metadata_path)
@@ -251,6 +289,9 @@ def validate_sidecar(map_path: Path, row: dict[str, str], checkpoint_sha: str) -
         raise ValueError("sidecar case_id mismatch")
     if metadata.get("source_checkpoint_sha256") != checkpoint_sha:
         raise ValueError("sidecar checkpoint sha mismatch")
+    for key, value in expected_lineage.items():
+        if metadata.get(key) != value or row.get(key) != value:
+            raise ValueError(f"{key} mismatch between row, sidecar, and selected lineage")
 
 
 @torch.no_grad()
@@ -264,6 +305,7 @@ def run_spot_checks(
     seed: int,
     atol: float,
     warning_atol: float,
+    data_root: Path | None,
 ) -> list[dict[str, Any]]:
     rng = random.Random(seed)
     selected = rng.sample(candidates, k=min(int(count), len(candidates)))
@@ -274,9 +316,9 @@ def run_spot_checks(
     model.eval()
     results: list[dict[str, Any]] = []
     for split, row, index_path in selected:
-        package = load_package_inputs(row, index_path)
+        package = load_package_inputs(resolve_row_paths(row, data_root), index_path)
         recomputed = infer_package_maps([package], model, stats, source_batch_size, device)[0]
-        saved = np.load(resolve_path(row["source_superposition_base_path"], index_path.parent)).astype(np.float32, copy=False)
+        saved = np.load(resolve_v2_path(row["source_superposition_base_path"], index_path.parent, data_root)).astype(np.float32, copy=False)
         abs_diff = np.abs(recomputed.astype(np.float64) - saved.astype(np.float64))
         max_abs_diff = float(np.max(abs_diff))
         mean_abs_diff = float(np.mean(abs_diff))
@@ -293,10 +335,44 @@ def run_spot_checks(
                 "warning_atol_K": float(warning_atol),
                 "warning": bool(max_abs_diff > warning_atol),
                 "ok": bool(max_abs_diff <= atol),
-                "source_superposition_base_path": repo_relative(resolve_path(row["source_superposition_base_path"], index_path.parent)),
+                "source_superposition_base_path": str(row["source_superposition_base_path"]),
             }
         )
     return results
+
+
+def resolve_v2_path(value: str, base: Path, data_root: Path | None) -> Path:
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return path
+    if data_root is not None:
+        candidate = data_root / path
+        if not candidate.exists():
+            raise FileNotFoundError(
+                f"portable path is missing: logical={value!r}, data_root={data_root}, resolved={candidate}"
+            )
+        return candidate
+    return resolve_path(value, base)
+
+
+def resolve_row_paths(row: dict[str, str], data_root: Path | None) -> dict[str, str]:
+    if data_root is None:
+        return row
+    resolved = dict(row)
+    for key in (
+        "x_path",
+        "y_path",
+        "graph_path",
+        "source_dir",
+        "layout_path",
+        "power_path",
+        "package_path",
+        "hotspot_path",
+    ):
+        value = resolved.get(key)
+        if value:
+            resolved[key] = str(resolve_v2_path(value, data_root, data_root))
+    return resolved
 
 
 def summarize_spot_checks(items: list[dict[str, Any]]) -> dict[str, Any]:

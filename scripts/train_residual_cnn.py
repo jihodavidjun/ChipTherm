@@ -173,6 +173,10 @@ def main() -> int:
         type=int,
         help="Compute train-set final-temperature MAE every N epochs. Use 1 for every epoch, 0 to disable.",
     )
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--early-stopping-patience", default=0, type=int)
+    parser.add_argument("--checkpoint-frequency", default=10, type=int)
+    parser.add_argument("--lineage-manifest", default=None, type=Path)
     args = parser.parse_args()
     if args.temp_loss_weight < 0.0:
         raise SystemExit("--temp-loss-weight must be non-negative")
@@ -415,6 +419,28 @@ def main() -> int:
                 "global_pool_size": args.global_pool_size,
             }
         )
+    config["resume_signature"] = {
+        key: config[key]
+        for key in (
+            "train_index",
+            "val_index",
+            "batch_size",
+            "lr",
+            "physics_input_mode",
+            "physical_representation",
+            "mean_head_mode",
+            "scheduler",
+            "temp_loss_weight",
+            "hotspot_loss_weight",
+            "hotspot_top_frac",
+            "lambda_final",
+            "lambda_mean",
+            "lambda_graph",
+            "lambda_chiplet_mean",
+            "seed",
+            "model",
+        )
+    }
     if args.mean_head_mode == "residual_resistance":
         assert delta_R_stats is not None
         model_config.update(
@@ -425,10 +451,11 @@ def main() -> int:
                 "delta_R_eff_target_normalization": "raw_head * train_std + train_mean; statistics fit on train split only",
             }
         )
-        (out_dir / "delta_R_eff_normalization.json").write_text(
-            json.dumps(delta_R_stats, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+        if not args.resume:
+            (out_dir / "delta_R_eff_normalization.json").write_text(
+                json.dumps(delta_R_stats, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
 
     config = {
         "schema_version": 1,
@@ -494,6 +521,10 @@ def main() -> int:
         "hotspot_top_frac": args.hotspot_top_frac,
         "hotspot_loss_scaling": "hotspot L1 loss in Kelvin over top ground-truth HotSpot cells divided by train residual_std before weighting",
         "train_mae_every": args.train_mae_every,
+        "resume": args.resume,
+        "early_stopping_patience": args.early_stopping_patience,
+        "checkpoint_frequency": args.checkpoint_frequency,
+        "lineage_manifest": str(args.lineage_manifest.resolve()) if args.lineage_manifest else None,
         "lambda_final": args.lambda_final,
         "lambda_mean": args.lambda_mean,
         "target_decomposition": is_decomposed_arch,
@@ -511,6 +542,8 @@ def main() -> int:
         "target": "residual = HotSpot - PhysicsBaseline",
     }
     model = build_model(model_config).to(device)
+    if args.resume and args.init_checkpoint:
+        raise SystemExit("--resume and --init-checkpoint are mutually exclusive")
     init_summary = load_initial_checkpoint(model, args.init_checkpoint, device) if args.init_checkpoint else None
     config["model"] = model.config() if hasattr(model, "config") else model_config
     config["model"].update(
@@ -547,8 +580,9 @@ def main() -> int:
                 "global_pool_size": args.global_pool_size,
             }
         )
-    (out_dir / "config.json").write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    save_normalization_stats(stats, out_dir / "normalization.json")
+    if not args.resume:
+        (out_dir / "config.json").write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        save_normalization_stats(stats, out_dir / "normalization.json")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     scheduler = make_scheduler(args.scheduler, optimizer, args.epochs)
@@ -580,11 +614,39 @@ def main() -> int:
     print(f"Trainable parameters: {count_parameters(model)}")
 
     log_path = out_dir / "train_log.csv"
-    init_train_log(log_path)
+    if not args.resume:
+        init_train_log(log_path)
     best_val_mae = float("inf")
     best_metrics: dict[str, Any] | None = None
+    epochs_without_improvement = 0
+    start_epoch = 1
+    training_lineage = (
+        json.loads(args.lineage_manifest.read_text(encoding="utf-8"))
+        if args.lineage_manifest
+        else None
+    )
+    if args.resume:
+        last_path = checkpoints_dir / "last.pt"
+        if not last_path.is_file():
+            raise SystemExit(f"--resume requested but checkpoint is missing: {last_path}")
+        resumed = torch.load(last_path, map_location=device, weights_only=False)
+        if resumed.get("model_config") != config["model"]:
+            raise SystemExit("resume checkpoint model configuration differs from requested model")
+        if resumed.get("normalization") != stats.to_dict():
+            raise SystemExit("resume checkpoint normalization differs from current train-only statistics")
+        if training_lineage is not None and resumed.get("training_lineage") != training_lineage:
+            raise SystemExit("resume checkpoint lineage differs from requested lineage")
+        if resumed.get("training_config", {}).get("resume_signature") != config["resume_signature"]:
+            raise SystemExit("resume checkpoint training recipe differs from requested training")
+        model.load_state_dict(resumed["model_state_dict"])
+        optimizer.load_state_dict(resumed["optimizer_state_dict"])
+        if scheduler is not None and resumed.get("scheduler_state_dict") is not None:
+            scheduler.load_state_dict(resumed["scheduler_state_dict"])
+        start_epoch = int(resumed["epoch"]) + 1
+        best_val_mae = float(resumed.get("best_val_mae_K", float("inf")))
+        epochs_without_improvement = int(resumed.get("epochs_without_improvement", 0))
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         epoch_start = time.perf_counter()
         train_losses = train_one_epoch(
             model,
@@ -652,14 +714,58 @@ def main() -> int:
         is_best = val_final_mae < best_val_mae
         if is_best:
             best_val_mae = val_final_mae
+            epochs_without_improvement = 0
             best_metrics = {
                 "epoch": epoch,
                 "metrics": val_metrics,
                 "metrics_by_case": val_by_case,
             }
-            save_checkpoint(checkpoints_dir / "best.pt", model, optimizer, epoch, config, stats, val_metrics, best=True)
+            save_checkpoint(
+                checkpoints_dir / "best.pt",
+                model,
+                optimizer,
+                scheduler,
+                epoch,
+                config,
+                stats,
+                val_metrics,
+                best=True,
+                best_val_mae=best_val_mae,
+                epochs_without_improvement=epochs_without_improvement,
+                training_lineage=training_lineage,
+            )
+        else:
+            epochs_without_improvement += 1
 
-        save_checkpoint(checkpoints_dir / "last.pt", model, optimizer, epoch, config, stats, val_metrics, best=is_best)
+        save_checkpoint(
+            checkpoints_dir / "last.pt",
+            model,
+            optimizer,
+            scheduler,
+            epoch,
+            config,
+            stats,
+            val_metrics,
+            best=is_best,
+            best_val_mae=best_val_mae,
+            epochs_without_improvement=epochs_without_improvement,
+            training_lineage=training_lineage,
+        )
+        if args.checkpoint_frequency > 0 and epoch % args.checkpoint_frequency == 0:
+            save_checkpoint(
+                checkpoints_dir / f"epoch_{epoch:04d}.pt",
+                model,
+                optimizer,
+                scheduler,
+                epoch,
+                config,
+                stats,
+                val_metrics,
+                best=is_best,
+                best_val_mae=best_val_mae,
+                epochs_without_improvement=epochs_without_improvement,
+                training_lineage=training_lineage,
+            )
         append_train_log(
             log_path,
             epoch,
@@ -682,6 +788,9 @@ def main() -> int:
             f"{format_graph_epoch_summary(val_metrics, val_by_case)} "
             f"{'best' if is_best else ''}"
         )
+        if args.early_stopping_patience > 0 and epochs_without_improvement >= args.early_stopping_patience:
+            print(f"Early stopping after {epochs_without_improvement} epochs without validation improvement")
+            break
 
     print("Residual CNN training complete")
     print(f"Best validation final-temperature MAE: {best_val_mae:.3f} K")
@@ -1743,12 +1852,16 @@ def save_checkpoint(
     path: Path,
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
+    scheduler: Any,
     epoch: int,
     config: dict[str, Any],
     stats: NormalizationStats,
     metrics: dict[str, Any],
     *,
     best: bool,
+    best_val_mae: float,
+    epochs_without_improvement: int,
+    training_lineage: dict[str, Any] | None,
 ) -> None:
     torch.save(
         {
@@ -1757,10 +1870,14 @@ def save_checkpoint(
             "best": best,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
             "model_config": config.get("model", model.config()),
             "training_config": config,
             "normalization": stats.to_dict(),
             "metrics": metrics,
+            "best_val_mae_K": best_val_mae,
+            "epochs_without_improvement": epochs_without_improvement,
+            "training_lineage": training_lineage,
         },
         path,
     )

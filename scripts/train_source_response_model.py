@@ -48,6 +48,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Train ChipTherm source-response operator.")
     parser.add_argument("--train-index", required=True, type=Path)
     parser.add_argument("--val-index", required=True, type=Path)
+    parser.add_argument("--data-root", default=None, type=Path, help="Explicit root for portable root-relative index paths.")
     parser.add_argument("--out-dir", required=True, type=Path)
     parser.add_argument("--epochs", default=100, type=int)
     parser.add_argument("--batch-size", default=64, type=int)
@@ -64,6 +65,11 @@ def main() -> int:
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
     parser.add_argument("--num-workers", default=0, type=int)
     parser.add_argument("--seed", default=1, type=int)
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--lineage-manifest", default=None, type=Path)
+    parser.add_argument("--early-stopping-patience", default=0, type=int)
+    parser.add_argument("--checkpoint-frequency", default=10, type=int)
+    parser.add_argument("--scheduler", default="none", choices=["none", "plateau", "cosine"])
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -72,13 +78,28 @@ def main() -> int:
     checkpoints_dir = out_dir / "checkpoints"
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
 
-    train_dataset = SourceResponseDataset(args.train_index, power_floor_W=args.power_floor_W)
-    val_dataset = SourceResponseDataset(args.val_index, power_floor_W=args.power_floor_W)
-    train_package_dataset = SourceResponsePackageDataset(args.train_index, power_floor_W=args.power_floor_W, require_complete=True)
+    train_dataset = SourceResponseDataset(
+        args.train_index,
+        power_floor_W=args.power_floor_W,
+        data_root=args.data_root,
+    )
+    val_dataset = SourceResponseDataset(
+        args.val_index,
+        power_floor_W=args.power_floor_W,
+        data_root=args.data_root,
+    )
+    train_package_dataset = SourceResponsePackageDataset(
+        args.train_index,
+        power_floor_W=args.power_floor_W,
+        require_complete=True,
+        data_root=args.data_root,
+    )
     stats = compute_source_response_normalization(train_dataset, batch_size=args.batch_size, num_workers=args.num_workers)
-    save_source_response_normalization(stats, out_dir / "source_response_normalization.json")
+    if not args.resume:
+        save_source_response_normalization(stats, out_dir / "source_response_normalization.json")
     power_diagnostics = source_power_diagnostics(train_dataset, val_dataset, args.low_power_warning_W)
-    (out_dir / "source_power_diagnostics.json").write_text(json.dumps(power_diagnostics, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if not args.resume:
+        (out_dir / "source_power_diagnostics.json").write_text(json.dumps(power_diagnostics, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     model_config = {
         "architecture": "source_response_operator_v1",
@@ -101,9 +122,32 @@ def main() -> int:
             "lambda_source_mean": args.lambda_source_mean,
         },
     }
+    resume_signature = {
+        key: json_safe(vars(args))[key]
+        for key in (
+            "train_index",
+            "val_index",
+            "data_root",
+            "batch_size",
+            "packages_per_batch",
+            "lr",
+            "base_channels",
+            "depth",
+            "power_floor_W",
+            "lambda_source",
+            "lambda_package",
+            "package_loss_warmup_epochs",
+            "lambda_source_mean",
+            "seed",
+            "scheduler",
+            "lineage_manifest",
+        )
+    }
     model = build_source_response_model(model_config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    scheduler = make_scheduler(args.scheduler, optimizer, args.epochs)
     criterion = nn.SmoothL1Loss()
+    lineage = load_json(args.lineage_manifest) if args.lineage_manifest else None
 
     train_loader = make_package_loader(train_package_dataset, args.packages_per_batch, True, args.num_workers, device)
     val_loader = make_loader(val_dataset, args.batch_size, False, args.num_workers, device)
@@ -116,13 +160,38 @@ def main() -> int:
         "loss": "lambda_source*SmoothL1(normalized source K/W) + active_lambda_package*SmoothL1(package K) + optional source mean loss; best checkpoint selected by validation package full-grid MAE",
         "parameter_count": count_parameters(model),
         "args": json_safe(vars(args)),
+        "resume_signature": resume_signature,
     }
-    (out_dir / "config.json").write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    init_log(out_dir / "train_log.csv")
+    if not args.resume:
+        (out_dir / "config.json").write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if not args.resume:
+        init_log(out_dir / "train_log.csv")
 
     best_val_package_mae = float("inf")
     best_payload: dict[str, Any] | None = None
-    for epoch in range(1, args.epochs + 1):
+    start_epoch = 1
+    epochs_without_improvement = 0
+    last_checkpoint = checkpoints_dir / "last.pt"
+    if args.resume:
+        if not last_checkpoint.is_file():
+            raise SystemExit(f"--resume requested but checkpoint is missing: {last_checkpoint}")
+        resumed = torch.load(last_checkpoint, map_location=device, weights_only=False)
+        if resumed.get("model_config") != model_config:
+            raise SystemExit("resume checkpoint model configuration differs from requested training")
+        if resumed.get("normalization") != stats.to_dict():
+            raise SystemExit("resume checkpoint normalization differs from current train-only statistics")
+        if lineage is not None and resumed.get("training_lineage") != lineage:
+            raise SystemExit("resume checkpoint lineage differs from requested lineage")
+        if resumed.get("resume_signature") != resume_signature:
+            raise SystemExit("resume checkpoint training recipe differs from requested training")
+        model.load_state_dict(resumed["model_state_dict"])
+        optimizer.load_state_dict(resumed["optimizer_state_dict"])
+        if scheduler is not None and resumed.get("scheduler_state_dict") is not None:
+            scheduler.load_state_dict(resumed["scheduler_state_dict"])
+        start_epoch = int(resumed["epoch"]) + 1
+        best_val_package_mae = float(resumed.get("best_val_package_mae", float("inf")))
+        epochs_without_improvement = int(resumed.get("epochs_without_improvement", 0))
+    for epoch in range(start_epoch, args.epochs + 1):
         start = time.perf_counter()
         active_package_weight = package_loss_weight(args.lambda_package, args.package_loss_warmup_epochs, epoch)
         train_metrics = train_one_epoch(
@@ -136,7 +205,7 @@ def main() -> int:
             lambda_package=active_package_weight,
             lambda_source_mean=args.lambda_source_mean,
         )
-        val_metrics = evaluate_model(model, val_loader, stats, device)
+        val_metrics = evaluate_model(model, val_loader, stats, device, data_root=args.data_root)
         write_records_csv(out_dir / "package_bias_diagnostics.csv", val_metrics["package_bias_records"])
         (out_dir / "package_bias_summary.json").write_text(
             json.dumps(val_metrics["package_bias_summary"], indent=2, sort_keys=True) + "\n",
@@ -148,8 +217,27 @@ def main() -> int:
         is_best = package_mae < best_val_package_mae
         if is_best:
             best_val_package_mae = float(package_mae)
-        payload = checkpoint_payload(model, model_config, stats, epoch, val_metrics, args)
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+        step_scheduler(args.scheduler, scheduler, float(package_mae))
+        payload = checkpoint_payload(
+            model,
+            model_config,
+            stats,
+            epoch,
+            val_metrics,
+            args,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            best_val_package_mae=best_val_package_mae,
+            epochs_without_improvement=epochs_without_improvement,
+            training_lineage=lineage,
+            resume_signature=resume_signature,
+        )
         torch.save(payload, checkpoints_dir / "last.pt")
+        if args.checkpoint_frequency > 0 and epoch % args.checkpoint_frequency == 0:
+            torch.save(payload, checkpoints_dir / f"epoch_{epoch:04d}.pt")
         if is_best:
             torch.save(payload, checkpoints_dir / "best.pt")
             best_payload = payload
@@ -167,6 +255,9 @@ def main() -> int:
             f"neg_frac={val_metrics['prediction_stats']['negative_unit_response_fraction']:.4f} "
             f"val_package_mae={package_mae:.4f} best={best_val_package_mae:.4f}"
         )
+        if args.early_stopping_patience > 0 and epochs_without_improvement >= args.early_stopping_patience:
+            print(f"Early stopping after {epochs_without_improvement} epochs without validation improvement")
+            break
     if best_payload is not None:
         (out_dir / "val_metrics.json").write_text(json.dumps(best_payload["val_metrics"], indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(f"Best validation package reconstructed MAE: {best_val_package_mae:.4f} K")
@@ -257,7 +348,14 @@ def package_loss_weight(lambda_package: float, warmup_epochs: int, epoch: int) -
 
 
 @torch.no_grad()
-def evaluate_model(model: nn.Module, loader: DataLoader, stats: Any, device: torch.device) -> dict[str, Any]:
+def evaluate_model(
+    model: nn.Module,
+    loader: DataLoader,
+    stats: Any,
+    device: torch.device,
+    *,
+    data_root: Path | None = None,
+) -> dict[str, Any]:
     model.eval()
     source_unit_errors: list[np.ndarray] = []
     source_physical_errors: list[np.ndarray] = []
@@ -342,7 +440,14 @@ def package_metrics(groups: dict[str, dict[str, Any]]) -> dict[str, Any]:
         summed_source_error = group["pred_sum"] - group["target_sum"]
         source_signed = np.asarray(group["source_signed_mean_errors"], dtype=np.float64)
         source_abs = np.asarray(group["source_abs_mean_errors"], dtype=np.float64)
-        layout = load_json((REPO_ROOT / group["layout_path"]).resolve() if not Path(group["layout_path"]).is_absolute() else Path(group["layout_path"]))
+        layout_path = Path(group["layout_path"])
+        if not layout_path.is_absolute():
+            layout_path = (
+                Path(data_root).expanduser().resolve() / layout_path
+                if data_root is not None
+                else REPO_ROOT / layout_path
+            )
+        layout = load_json(layout_path)
         chip = chiplet_metrics(pred_temp, full, layout, full.shape)
         record = {
             "original_sample_uid": uid,
@@ -448,17 +553,56 @@ def mean_optional(values: Any) -> float | None:
     return float(np.mean(numeric)) if numeric else None
 
 
-def checkpoint_payload(model: nn.Module, model_config: dict[str, Any], stats: Any, epoch: int, val_metrics: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+def checkpoint_payload(
+    model: nn.Module,
+    model_config: dict[str, Any],
+    stats: Any,
+    epoch: int,
+    val_metrics: dict[str, Any],
+    args: argparse.Namespace,
+    *,
+    optimizer: torch.optim.Optimizer,
+    scheduler: Any,
+    best_val_package_mae: float,
+    epochs_without_improvement: int,
+    training_lineage: dict[str, Any] | None,
+    resume_signature: dict[str, Any],
+) -> dict[str, Any]:
     return {
         "schema_version": 1,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "epoch": epoch,
         "model_config": model_config,
         "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
         "normalization": stats.to_dict(),
         "val_metrics": val_metrics,
         "args": vars(args),
+        "best_val_package_mae": best_val_package_mae,
+        "epochs_without_improvement": epochs_without_improvement,
+        "training_lineage": training_lineage,
+        "resume_signature": resume_signature,
     }
+
+
+def make_scheduler(name: str, optimizer: torch.optim.Optimizer, epochs: int) -> Any:
+    if name == "none":
+        return None
+    if name == "plateau":
+        return torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=8)
+    if name == "cosine":
+        return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs))
+    raise ValueError(name)
+
+
+def step_scheduler(name: str, scheduler: Any, metric: float) -> None:
+    if scheduler is None:
+        return
+    if name == "plateau":
+        scheduler.step(metric)
+    else:
+        scheduler.step()
 
 
 def source_power_diagnostics(train_dataset: SourceResponseDataset, val_dataset: SourceResponseDataset, warning: float) -> dict[str, Any]:

@@ -27,6 +27,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Evaluate full canonical source-superposition base-map quality.")
     parser.add_argument("--source-root", required=True, type=Path)
     parser.add_argument("--out-dir", required=True, type=Path)
+    parser.add_argument("--data-root", default=None, type=Path, help="Explicit root for portable root-relative paths.")
     parser.add_argument("--summary-only", action="store_true", help="Regenerate summary/report from existing by-sample CSV if present.")
     args = parser.parse_args()
 
@@ -44,9 +45,9 @@ def main() -> int:
         for split in SPLITS:
             index_path = source_root / f"{split}_index.csv"
             for row in read_rows(index_path):
-                target = np.load(resolve_path(row["y_path"], index_path.parent)).astype(np.float64)
-                base = np.load(resolve_path(row["source_superposition_base_path"], index_path.parent)).astype(np.float64)
-                records.append(base_metrics(row, split, base, target))
+                target = np.load(resolve_path(row["y_path"], index_path.parent, args.data_root)).astype(np.float64)
+                base = np.load(resolve_path(row["source_superposition_base_path"], index_path.parent, args.data_root)).astype(np.float64)
+                records.append(base_metrics(row, split, base, target, data_root=args.data_root))
         write_csv(sample_csv, records)
 
     by_case = summarize_by_case(records)
@@ -67,7 +68,14 @@ def main() -> int:
     return 0
 
 
-def base_metrics(row: dict[str, str], split: str, pred: np.ndarray, target: np.ndarray) -> dict[str, Any]:
+def base_metrics(
+    row: dict[str, str],
+    split: str,
+    pred: np.ndarray,
+    target: np.ndarray,
+    *,
+    data_root: Path | None = None,
+) -> dict[str, Any]:
     metrics = field_metrics(pred, target)
     ambient = ambient_for_row(row)
     delta_pred = pred - ambient
@@ -75,10 +83,27 @@ def base_metrics(row: dict[str, str], split: str, pred: np.ndarray, target: np.n
     centered_pred = delta_pred - np.mean(delta_pred)
     centered_true = delta_true - np.mean(delta_true)
     centered_error = centered_pred - centered_true
+    spectrum = np.fft.rfft2(pred - target)
+    energy = np.abs(spectrum) ** 2
+    low_rows = max(1, target.shape[0] // 8)
+    low_cols = max(1, spectrum.shape[1] // 8)
+    low_frequency_fraction = float(
+        np.sum(energy[:low_rows, :low_cols]) / max(float(np.sum(energy)), 1.0e-12)
+    )
+    error = pred - target
+    gradient_error = 0.5 * (
+        float(np.mean(np.abs(np.diff(error, axis=0))))
+        + float(np.mean(np.abs(np.diff(error, axis=1))))
+    )
+    target_gradient = np.zeros_like(target, dtype=np.float64)
+    target_gradient[:-1] += np.abs(np.diff(target, axis=0))
+    target_gradient[:, :-1] += np.abs(np.diff(target, axis=1))
+    gradient_threshold = float(np.quantile(target_gradient, 0.90))
+    high_gradient = target_gradient >= gradient_threshold
     hotspot_pred = np.unravel_index(int(np.argmax(pred)), pred.shape)
     hotspot_true = np.unravel_index(int(np.argmax(target)), target.shape)
     chip = {}
-    layout_path = source_layout_path(row)
+    layout_path = source_layout_path(row, data_root=data_root)
     if layout_path.exists():
         chip = chiplet_metrics(pred, target, load_json(layout_path), target.shape)
     return {
@@ -92,6 +117,9 @@ def base_metrics(row: dict[str, str], split: str, pred: np.ndarray, target: np.n
         "mean_rise_abs_error_K": abs(float(np.mean(delta_pred) - np.mean(delta_true))),
         "centered_field_mae_K": float(np.mean(np.abs(centered_error))),
         "centered_field_rmse_K": float(np.sqrt(np.mean(centered_error * centered_error))),
+        "low_frequency_error_energy_fraction": low_frequency_fraction,
+        "gradient_error_abs_mean_K_per_cell": gradient_error,
+        "high_gradient_region_mae_K": float(np.mean(np.abs(error)[high_gradient])),
         "chiplet_mean_temperature_mae_K": chip.get("chiplet_mean_temperature_mae_K"),
         "chiplet_peak_temperature_mae_K": chip.get("chiplet_peak_temperature_mae_K"),
         "inter_chiplet_delta_T_mae_K": chip.get("inter_chiplet_delta_T_mae_K"),
@@ -135,6 +163,9 @@ def summarize_records(records: list[dict[str, Any]]) -> dict[str, Any]:
         "inter_chiplet_delta_T_mae_K",
         "hotspot_temp_error_K",
         "hotspot_location_error_cells",
+        "low_frequency_error_energy_fraction",
+        "gradient_error_abs_mean_K_per_cell",
+        "high_gradient_region_mae_K",
     ]
     output: dict[str, Any] = {"num_samples": len(records)}
     for key in keys:
@@ -143,10 +174,10 @@ def summarize_records(records: list[dict[str, Any]]) -> dict[str, Any]:
     return output
 
 
-def source_layout_path(row: dict[str, str]) -> Path:
+def source_layout_path(row: dict[str, str], *, data_root: Path | None = None) -> Path:
     for key in ("source_layout_path", "layout_path"):
         if row.get(key):
-            return resolve_path(row[key])
+            return resolve_path(row[key], data_root=data_root)
     case_id = row["case_id"]
     original = row.get("original_sample_uid") or row["sample_uid"]
     sample_name = original[len(case_id) + 1 :] if original.startswith(f"{case_id}_") else original
@@ -182,10 +213,22 @@ def write_csv(path: Path, records: list[dict[str, Any]]) -> None:
             writer.writerow(record)
 
 
-def resolve_path(path_value: str | Path, base: Path | None = None) -> Path:
+def resolve_path(
+    path_value: str | Path,
+    base: Path | None = None,
+    data_root: Path | None = None,
+) -> Path:
     path = Path(path_value).expanduser()
     if path.is_absolute():
         return path
+    if data_root is not None:
+        candidate = Path(data_root).expanduser().resolve() / path
+        if not candidate.exists():
+            raise FileNotFoundError(
+                f"base-quality path is missing: logical={path_value!s}, "
+                f"data_root={data_root}, resolved={candidate}"
+            )
+        return candidate
     candidates = [Path.cwd() / path, REPO_ROOT / path]
     if base is not None:
         candidates.append(base / path)

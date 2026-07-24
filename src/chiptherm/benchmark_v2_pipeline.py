@@ -1931,6 +1931,16 @@ def add_source_lineage_columns(
     artifact_status: str = "source_checkpoint_dependent",
 ) -> None:
     lineage_hash = sha256_json(lineage)
+    source_normalization_hash = ""
+    source_model_config_hash = ""
+    try:
+        import torch
+
+        checkpoint_payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        source_normalization_hash = sha256_json(checkpoint_payload.get("normalization", {}))
+        source_model_config_hash = sha256_json(checkpoint_payload.get("model_config", {}))
+    except Exception as exc:
+        raise ValueError(f"cannot load source checkpoint lineage payload: {checkpoint}: {exc}") from exc
     for csv_path in stage_root.glob("*.csv"):
         rows = read_csv(csv_path)
         if not rows or "sample_uid" not in rows[0]:
@@ -1938,6 +1948,8 @@ def add_source_lineage_columns(
         for row in rows:
             row["source_checkpoint"] = data_root_relative(checkpoint, data_root)
             row["source_checkpoint_lineage_sha256"] = lineage_hash
+            row["source_normalization_sha256"] = source_normalization_hash
+            row["source_model_config_sha256"] = source_model_config_hash
             row["source_checkpoint_training_family_set_sha256"] = sha256_json(sorted(lineage["training_family_uids"]))
             row["source_superposition_status"] = artifact_status
         write_csv(csv_path, rows)
@@ -1950,6 +1962,8 @@ def add_source_lineage_columns(
         payload = load_json(sidecar)
         payload["source_checkpoint"] = data_root_relative(checkpoint, data_root)
         payload["source_checkpoint_lineage_sha256"] = lineage_hash
+        payload["source_normalization_sha256"] = source_normalization_hash
+        payload["source_model_config_sha256"] = source_model_config_hash
         payload["source_checkpoint_training_family_uids"] = sorted(str(value) for value in lineage["training_family_uids"])
         payload["source_checkpoint_training_family_set_sha256"] = sha256_json(sorted(lineage["training_family_uids"]))
         payload["artifact_status"] = artifact_status
@@ -1960,6 +1974,8 @@ def add_source_lineage_columns(
         payload["source_checkpoint"] = data_root_relative(checkpoint, data_root)
         payload["source_checkpoint_sha256"] = sha256_file(checkpoint)
         payload["source_checkpoint_lineage_sha256"] = lineage_hash
+        payload["source_normalization_sha256"] = source_normalization_hash
+        payload["source_model_config_sha256"] = source_model_config_hash
         payload["artifact_status"] = artifact_status
         write_json(manifest_path, payload)
     write_json(stage_root / "source_checkpoint_lineage.json", lineage)

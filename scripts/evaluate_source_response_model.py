@@ -38,6 +38,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Evaluate a ChipTherm source-response model.")
     parser.add_argument("--checkpoint", required=True, type=Path)
     parser.add_argument("--source-index", required=True, type=Path)
+    parser.add_argument("--data-root", default=None, type=Path, help="Explicit root for portable root-relative index paths.")
     parser.add_argument("--out-dir", required=True, type=Path)
     parser.add_argument("--batch-size", default=64, type=int)
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
@@ -56,7 +57,11 @@ def main() -> int:
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 
-    dataset = SourceResponseDataset(args.source_index, power_floor_W=float(checkpoint["model_config"].get("power_floor_W", stats.power_floor_W)))
+    dataset = SourceResponseDataset(
+        args.source_index,
+        power_floor_W=float(checkpoint["model_config"].get("power_floor_W", stats.power_floor_W)),
+        data_root=args.data_root,
+    )
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=device.type == "cuda", collate_fn=source_response_collate)
     results = evaluate(
         model,
@@ -66,6 +71,7 @@ def main() -> int:
         save_predictions=args.save_predictions,
         out_dir=out_dir,
         clamp_unit_response_min=args.clamp_unit_response_min,
+        data_root=args.data_root,
     )
     payload = {
         "schema_version": 1,
@@ -84,7 +90,9 @@ def main() -> int:
     }
     (out_dir / "metrics.json").write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     write_csv(out_dir / "source_metrics.csv", results["source_records"])
+    write_csv(out_dir / "package_metrics.csv", results["package_records"])
     write_csv(out_dir / "metrics_by_case.csv", results["case_records"])
+    write_csv(out_dir / "metrics_by_source_type.csv", results["source_type_records"])
     write_csv(out_dir / "package_bias_diagnostics.csv", results["package_bias_records"])
     (out_dir / "package_bias_summary.json").write_text(
         json.dumps(results["package_bias_summary"], indent=2, sort_keys=True) + "\n",
@@ -119,6 +127,7 @@ def evaluate(
     save_predictions: bool,
     out_dir: Path,
     clamp_unit_response_min: float | None,
+    data_root: Path | None,
 ) -> dict[str, Any]:
     source_records: list[dict[str, Any]] = []
     groups: dict[str, dict[str, Any]] = {}
@@ -130,6 +139,9 @@ def evaluate(
     negative_count_used = 0
     prediction_count = 0
     start = time.perf_counter()
+    source_prediction_dir = out_dir / "source_predictions"
+    if save_predictions:
+        source_prediction_dir.mkdir(parents=True, exist_ok=True)
     for batch in loader:
         x = normalize_source_input(batch["x"].to(device), stats)
         power = batch["source_power_W"].to(device)
@@ -154,9 +166,12 @@ def evaluate(
         pred_np = pred_rise.detach().cpu().numpy()
         target_np = target_rise.detach().cpu().numpy()
         full_np = batch["full_temperature"].detach().cpu().numpy()
+        occupancy_np = batch["x"][:, 0].detach().cpu().numpy() > 0.5
         ambient_np = batch["ambient_K"].detach().cpu().numpy()
         for i, meta in enumerate(batch["metadata"]):
             source_metrics = field_metrics(pred_np[i], target_np[i])
+            pred_source_peak = np.unravel_index(int(np.argmax(pred_np[i])), pred_np[i].shape)
+            target_source_peak = np.unravel_index(int(np.argmax(target_np[i])), target_np[i].shape)
             source_records.append(
                 {
                     "source_response_uid": meta["source_response_uid"],
@@ -164,13 +179,43 @@ def evaluate(
                     "case_id": meta["case_id"],
                     "source_index": meta["source_index"],
                     "source_name": meta["source_name"],
+                    "source_type": meta.get("source_type") or meta.get("source_chiplet_type", ""),
                     "source_power_W": meta["source_power_W"],
                     "physical_mae_K": source_metrics["mae_K"],
                     "physical_rmse_K": source_metrics["rmse_K"],
                     "unit_mae_K_per_W": float(np.abs(unit_error[i]).mean()),
                     "unit_rmse_K_per_W": float(np.sqrt(np.mean(unit_error[i] * unit_error[i]))),
+                    "mean_temperature_rise_abs_error_K": float(
+                        abs(np.mean(pred_np[i]) - np.mean(target_np[i]))
+                    ),
+                    "peak_temperature_rise_abs_error_K": float(
+                        abs(np.max(pred_np[i]) - np.max(target_np[i]))
+                    ),
+                    "hotspot_location_error_cells": float(
+                        np.hypot(
+                            pred_source_peak[0] - target_source_peak[0],
+                            pred_source_peak[1] - target_source_peak[1],
+                        )
+                    ),
+                    "layout_path": meta["layout_path"],
+                    **region_error_metrics(pred_np[i] - target_np[i], occupancy_np[i]),
                 }
             )
+            if save_predictions:
+                source_uid = str(meta["source_response_uid"])
+                pred_path = source_prediction_dir / f"{source_uid}_pred_rise.npy"
+                target_path = source_prediction_dir / f"{source_uid}_target_rise.npy"
+                residual_path = source_prediction_dir / f"{source_uid}_signed_residual.npy"
+                np.save(pred_path, pred_np[i].astype(np.float32))
+                np.save(target_path, target_np[i].astype(np.float32))
+                np.save(residual_path, (pred_np[i] - target_np[i]).astype(np.float32))
+                source_records[-1].update(
+                    {
+                        "prediction_rise_path": str(pred_path),
+                        "target_rise_saved_path": str(target_path),
+                        "signed_residual_path": str(residual_path),
+                    }
+                )
             uid = str(meta["original_sample_uid"])
             group = groups.setdefault(
                 uid,
@@ -180,6 +225,7 @@ def evaluate(
                     "pred_sum": np.zeros_like(pred_np[i], dtype=np.float64),
                     "target_sum": np.zeros_like(target_np[i], dtype=np.float64),
                     "full_temperature": full_np[i].astype(np.float64),
+                    "occupancy": occupancy_np[i],
                     "layout_path": meta["layout_path"],
                     "num_chiplets": int(float(meta["num_chiplets"])),
                     "num_sources": 0,
@@ -196,8 +242,14 @@ def evaluate(
             group["source_signed_mean_errors"].append(float(np.mean(source_error_i)))
             group["source_abs_mean_errors"].append(float(np.mean(np.abs(source_error_i))))
     elapsed = time.perf_counter() - start
-    packages = package_records(groups, save_predictions=save_predictions, out_dir=out_dir)
+    packages = package_records(
+        groups,
+        save_predictions=save_predictions,
+        out_dir=out_dir,
+        data_root=data_root,
+    )
     case_records = case_summary(packages)
+    source_type_records = source_type_summary(source_records)
     source_unit = np.concatenate([e.reshape(-1) for e in source_unit_errors])
     source_physical = np.concatenate([e.reshape(-1) for e in source_physical_errors])
     package_summary = summarize_package_records(packages, prefix="")
@@ -219,7 +271,9 @@ def evaluate(
         "package_reconstruction": package_summary,
         "oracle_reconstruction": oracle_summary,
         "source_records": source_records,
+        "package_records": packages,
         "case_records": case_records,
+        "source_type_records": source_type_records,
         "package_bias_records": packages,
         "package_bias_summary": package_bias_summary(packages),
         "prediction_stats": prediction_stats,
@@ -245,7 +299,13 @@ def describe_values(values: np.ndarray) -> dict[str, float]:
     }
 
 
-def package_records(groups: dict[str, dict[str, Any]], *, save_predictions: bool, out_dir: Path) -> list[dict[str, Any]]:
+def package_records(
+    groups: dict[str, dict[str, Any]],
+    *,
+    save_predictions: bool,
+    out_dir: Path,
+    data_root: Path | None = None,
+) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     pred_dir = out_dir / "predictions"
     if save_predictions:
@@ -265,7 +325,13 @@ def package_records(groups: dict[str, dict[str, Any]], *, save_predictions: bool
         pred_hotspot = np.unravel_index(int(np.argmax(pred_temp)), pred_temp.shape)
         target_hotspot = np.unravel_index(int(np.argmax(full)), full.shape)
         layout_path = Path(group["layout_path"])
-        layout = load_json(layout_path if layout_path.is_absolute() else REPO_ROOT / layout_path)
+        if not layout_path.is_absolute():
+            layout_path = (
+                Path(data_root).expanduser().resolve() / layout_path
+                if data_root is not None
+                else REPO_ROOT / layout_path
+            )
+        layout = load_json(layout_path)
         chip = chiplet_metrics(pred_temp, full, layout, full.shape)
         record = {
             "original_sample_uid": uid,
@@ -286,13 +352,19 @@ def package_records(groups: dict[str, dict[str, Any]], *, save_predictions: bool
             "chiplet_mean_temperature_mae_K": chip["chiplet_mean_temperature_mae_K"],
             "chiplet_peak_temperature_mae_K": chip["chiplet_peak_temperature_mae_K"],
             "inter_chiplet_delta_T_mae_K": chip["inter_chiplet_delta_T_mae_K"],
+            "mean_temperature_abs_error_K": float(abs(np.mean(pred_temp) - np.mean(full))),
+            "peak_temperature_abs_error_K": float(abs(np.max(pred_temp) - np.max(full))),
+            **region_error_metrics(package_error, group["occupancy"]),
             "oracle_mae_K": oracle["mae_K"],
             "oracle_rmse_K": oracle["rmse_K"],
             "num_sources": group["num_sources"],
+            "layout_path": str(group["layout_path"]),
         }
         records.append(record)
         if save_predictions:
             np.save(pred_dir / f"{uid}_temperature_pred.npy", pred_temp.astype(np.float32))
+            np.save(pred_dir / f"{uid}_temperature_target.npy", full.astype(np.float32))
+            np.save(pred_dir / f"{uid}_signed_residual.npy", package_error.astype(np.float32))
     return records
 
 
@@ -304,7 +376,7 @@ def summarize_package_records(records: list[dict[str, Any]], *, prefix: str) -> 
     rmses = np.asarray([r[rmse_key] for r in records], dtype=np.float64)
     global_pixel_rmse = float(np.sqrt(np.mean(rmses * rmses)))
     mean_sample_rmse = float(np.mean(rmses))
-    return {
+    result = {
         "num_packages": len(records),
         "mae_K": float(np.mean([r[key] for r in records])),
         "global_pixel_rmse_K": global_pixel_rmse,
@@ -312,6 +384,19 @@ def summarize_package_records(records: list[dict[str, Any]], *, prefix: str) -> 
         "rmse_K": global_pixel_rmse,
         "mean_signed_error_K": float(np.mean([r[f"{prefix}mean_signed_error_K"] for r in records])) if f"{prefix}mean_signed_error_K" in records[0] else None,
     }
+    if not prefix:
+        for key in (
+            "mean_temperature_abs_error_K",
+            "peak_temperature_abs_error_K",
+            "hotspot_location_error_cells",
+            "occupied_region_mae_K",
+            "boundary_region_mae_K",
+            "chiplet_mean_temperature_mae_K",
+            "chiplet_peak_temperature_mae_K",
+            "inter_chiplet_delta_T_mae_K",
+        ):
+            result[key] = mean_optional(record.get(key) for record in records)
+    return result
 
 
 def case_summary(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -329,12 +414,47 @@ def case_summary(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "mean_sample_rmse_K": float(np.mean([item["rmse_K"] for item in items])),
                 "rmse_K": float(np.sqrt(np.mean(np.asarray([item["rmse_K"] for item in items], dtype=np.float64) ** 2))),
                 "oracle_mae_K": float(np.mean([item["oracle_mae_K"] for item in items])),
+                "mean_temperature_abs_error_K": float(np.mean([item["mean_temperature_abs_error_K"] for item in items])),
+                "peak_temperature_abs_error_K": float(np.mean([item["peak_temperature_abs_error_K"] for item in items])),
+                "hotspot_location_error_cells": float(np.mean([item["hotspot_location_error_cells"] for item in items])),
+                "occupied_region_mae_K": mean_optional(item["occupied_region_mae_K"] for item in items),
+                "boundary_region_mae_K": mean_optional(item["boundary_region_mae_K"] for item in items),
                 "chiplet_mean_temperature_mae_K": mean_optional(item["chiplet_mean_temperature_mae_K"] for item in items),
                 "chiplet_peak_temperature_mae_K": mean_optional(item["chiplet_peak_temperature_mae_K"] for item in items),
                 "inter_chiplet_delta_T_mae_K": mean_optional(item["inter_chiplet_delta_T_mae_K"] for item in items),
             }
         )
     return rows
+
+
+def source_type_summary(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for record in records:
+        grouped[str(record.get("source_type") or "unknown")].append(record)
+    return [
+        {
+            "source_type": source_type,
+            "num_sources": len(items),
+            "physical_mae_K": float(np.mean([float(item["physical_mae_K"]) for item in items])),
+            "physical_rmse_K": float(
+                np.sqrt(np.mean([float(item["physical_rmse_K"]) ** 2 for item in items]))
+            ),
+            "unit_mae_K_per_W": float(np.mean([float(item["unit_mae_K_per_W"]) for item in items])),
+        }
+        for source_type, items in sorted(grouped.items())
+    ]
+
+
+def region_error_metrics(error: np.ndarray, occupancy: np.ndarray) -> dict[str, float | None]:
+    absolute = np.abs(np.asarray(error, dtype=np.float64))
+    occupied = np.asarray(occupancy, dtype=bool)
+    boundary = np.zeros_like(occupied, dtype=bool)
+    boundary[[0, -1], :] = True
+    boundary[:, [0, -1]] = True
+    return {
+        "occupied_region_mae_K": float(np.mean(absolute[occupied])) if np.any(occupied) else None,
+        "boundary_region_mae_K": float(np.mean(absolute[boundary])),
+    }
 
 
 def mean_optional(values: Any) -> float | None:

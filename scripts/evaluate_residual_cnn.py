@@ -149,6 +149,8 @@ def main() -> int:
         pin_memory=device.type == "cuda",
         collate_fn=chiptherm_collate if graph_enabled else None,
     )
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
 
     metrics, by_case, runtime_s, hotspot_runtime_s, physics_runtime_s, gate_runtime_s = evaluate(
         model,
@@ -169,6 +171,10 @@ def main() -> int:
         disabled_fusion_scales=disabled_fusion_scales,
     )
     cnn_runtime_per_sample = runtime_s / max(metrics["num_samples"], 1)
+    throughput_samples_per_s = metrics["num_samples"] / max(runtime_s, 1.0e-12)
+    peak_gpu_memory_bytes = (
+        int(torch.cuda.max_memory_allocated(device)) if device.type == "cuda" else None
+    )
     gate_runtime_per_sample = gate_runtime_s / max(metrics["num_samples"], 1) if gate_runtime_s > 0.0 else None
     cnn_side_speedup = hotspot_runtime_s / cnn_runtime_per_sample if hotspot_runtime_s and cnn_runtime_per_sample else None
     end_to_end_runtime_per_sample = None
@@ -241,11 +247,15 @@ def main() -> int:
         "num_samples": metrics["num_samples"],
         "inference_runtime_total_s": runtime_s,
         "inference_runtime_per_sample_s": cnn_runtime_per_sample,
+        "throughput_samples_per_s": throughput_samples_per_s,
+        "peak_gpu_memory_bytes": peak_gpu_memory_bytes,
         "hotspot_runtime_reference_s": hotspot_runtime_s,
         "estimated_speedup_vs_hotspot": cnn_side_speedup,
         "runtime": {
             "hotspot_runtime_reference_s": hotspot_runtime_s,
             "cnn_runtime_per_sample_s": cnn_runtime_per_sample,
+            "throughput_samples_per_s": throughput_samples_per_s,
+            "peak_gpu_memory_bytes": peak_gpu_memory_bytes,
             "physics_runtime_per_sample_s": physics_runtime_s,
             "gating_overhead_per_sample_s": gate_runtime_per_sample,
             "end_to_end_runtime_per_sample_s": end_to_end_runtime_per_sample,
@@ -464,6 +474,7 @@ def evaluate(
     graph_rows: list[dict[str, Any]] = []
     chiplet_rows: list[dict[str, Any]] = []
     gate_rows: list[dict[str, Any]] = []
+    sample_rows: list[dict[str, Any]] = []
     has_coarse_prediction = False
     by_case: dict[str, dict[str, MetricAccumulator]] = defaultdict(
         lambda: {
@@ -613,6 +624,19 @@ def evaluate(
         worse_than_physics_count += int((final_sample_mae > physics_sample_mae).sum().item())
         case_ids = metadata_values(batch["metadata"], "case_id", batch_size)
         sample_uids = metadata_values(batch["metadata"], "sample_uid", batch_size)
+        append_sample_metric_rows(
+            sample_rows,
+            sample_uids,
+            case_ids,
+            pred_temperature,
+            temperature,
+            physics,
+            x,
+            centered_pred if decomposed else None,
+            centered_target if decomposed else None,
+            outputs.get("mean_rise") if decomposed else None,
+            mean_target if decomposed else None,
+        )
         hotspot_runtimes.extend(
             value
             for value in optional_float_values(metadata_values(batch["metadata"], "hotspot_runtime_s", batch_size))
@@ -766,6 +790,7 @@ def evaluate(
         metrics["physics_gate"] = gate_summary
         write_gate_values(out_dir / "gate_values.csv", gate_rows)
         write_gate_summary(out_dir / "gate_summary.json", gate_rows, gate_summary)
+    write_sample_metrics(out_dir / "metrics_by_sample.csv", sample_rows)
     case_payload = {
         case_id: {
             name: accumulator.compute()
@@ -779,6 +804,117 @@ def evaluate(
     hotspot_runtime_s = float(sum(hotspot_runtimes) / len(hotspot_runtimes)) if hotspot_runtimes else None
     physics_runtime_s = float(sum(physics_runtimes) / len(physics_runtimes)) if physics_runtimes else None
     return metrics, case_payload, inference_runtime_s, hotspot_runtime_s, physics_runtime_s, gate_runtime_s
+
+
+def append_sample_metric_rows(
+    rows: list[dict[str, Any]],
+    sample_uids: list[Any],
+    case_ids: list[Any],
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    physics: torch.Tensor,
+    x: torch.Tensor,
+    centered_prediction: torch.Tensor | None,
+    centered_target: torch.Tensor | None,
+    mean_prediction: torch.Tensor | None,
+    mean_target: torch.Tensor | None,
+) -> None:
+    pred = prediction.detach().float()
+    truth = target.detach().float()
+    baseline = physics.detach().float()
+    errors = pred - truth
+    for index, sample_uid in enumerate(sample_uids):
+        error = errors[index]
+        target_i = truth[index]
+        pred_i = pred[index]
+        true_peak_flat = int(torch.argmax(target_i).item())
+        pred_peak_flat = int(torch.argmax(pred_i).item())
+        width = int(target_i.shape[-1])
+        true_peak = (true_peak_flat // width, true_peak_flat % width)
+        pred_peak = (pred_peak_flat // width, pred_peak_flat % width)
+        item: dict[str, Any] = {
+            "sample_uid": str(sample_uid),
+            "family_uid": str(case_ids[index]),
+            "case_id": str(case_ids[index]),
+            "mae_K": float(error.abs().mean().item()),
+            "rmse_K": float(torch.sqrt(torch.mean(error * error)).item()),
+            "mean_signed_error_K": float(error.mean().item()),
+            "max_abs_error_K": float(error.abs().max().item()),
+            "mean_temperature_abs_error_K": float(abs(pred_i.mean().item() - target_i.mean().item())),
+            "peak_temperature_abs_error_K": float(abs(pred_i.max().item() - target_i.max().item())),
+            "hotspot_location_error_cells": float(
+                ((pred_peak[0] - true_peak[0]) ** 2 + (pred_peak[1] - true_peak[1]) ** 2) ** 0.5
+            ),
+            "physics_baseline_mae_K": float((baseline[index] - target_i).abs().mean().item()),
+        }
+        occupancy = (
+            x[index, 1].detach() > 0.5
+            if x.shape[1] > 1
+            else torch.ones_like(error, dtype=torch.bool)
+        )
+        boundary = torch.zeros_like(occupancy, dtype=torch.bool)
+        boundary[[0, -1], :] = True
+        boundary[:, [0, -1]] = True
+        top_count = max(1, int(round(0.01 * target_i.numel())))
+        hotspot_indices = torch.topk(target_i.reshape(-1), k=top_count).indices
+        item["occupied_region_mae_K"] = (
+            float(error.abs()[occupancy].mean().item()) if torch.any(occupancy) else None
+        )
+        item["boundary_region_mae_K"] = float(error.abs()[boundary].mean().item())
+        item["hotspot_top1pct_mae_K"] = float(
+            error.abs().reshape(-1).index_select(0, hotspot_indices).mean().item()
+        )
+        dy = error[1:, :] - error[:-1, :]
+        dx = error[:, 1:] - error[:, :-1]
+        item["gradient_error_abs_mean_K_per_cell"] = float(
+            0.5 * (dy.abs().mean().item() + dx.abs().mean().item())
+        )
+        target_gradient = torch.zeros_like(target_i)
+        target_gradient[:-1, :] += (target_i[1:, :] - target_i[:-1, :]).abs()
+        target_gradient[:, :-1] += (target_i[:, 1:] - target_i[:, :-1]).abs()
+        gradient_threshold = torch.quantile(target_gradient.reshape(-1), 0.90)
+        item["high_gradient_region_mae_K"] = float(
+            error.abs()[target_gradient >= gradient_threshold].mean().item()
+        )
+        spectrum = torch.fft.rfft2(error)
+        energy = spectrum.real.square() + spectrum.imag.square()
+        low_rows = max(1, error.shape[-2] // 8)
+        low_cols = max(1, spectrum.shape[-1] // 8)
+        item["low_frequency_error_energy_fraction"] = float(
+            energy[:low_rows, :low_cols].sum().item()
+            / max(energy.sum().item(), 1.0e-12)
+        )
+        if centered_prediction is not None and centered_target is not None:
+            centered_error = (
+                centered_prediction[index].detach().float()
+                - centered_target[index].detach().float()
+            )
+            item["centered_field_mae_K"] = float(centered_error.abs().mean().item())
+            item["centered_field_rmse_K"] = float(
+                torch.sqrt(torch.mean(centered_error * centered_error)).item()
+            )
+        if mean_prediction is not None and mean_target is not None:
+            item["mean_head_abs_error_K"] = float(
+                abs(
+                    mean_prediction[index].detach().float().item()
+                    - mean_target[index].detach().float().item()
+                )
+            )
+        rows.append(item)
+
+
+def write_sample_metrics(path: Path, rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    fields: list[str] = []
+    for row in rows:
+        for key in row:
+            if key not in fields:
+                fields.append(key)
+    with path.open("w", encoding="utf-8", newline="") as fp:
+        writer = csv.DictWriter(fp, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def decomposed_targets(
@@ -1097,12 +1233,23 @@ def append_graph_rows(
         graph_item = graph_cpu[index]
         cnn_mae = float(cnn_error.abs().mean().item())
         fused_mae = float(fused_error.abs().mean().item())
+        cnn_rmse = float(torch.sqrt(torch.mean(cnn_error * cnn_error)).item())
+        fused_rmse = float(torch.sqrt(torch.mean(fused_error * fused_error)).item())
+        target_peak = float(temp_cpu[index].max().item())
         rows.append(
             {
                 "sample_uid": str(sample_uids[index]),
                 "case_id": str(case_ids[index]),
                 "cnn_only_mae_K": cnn_mae,
                 "fused_mae_K": fused_mae,
+                "cnn_only_rmse_K": cnn_rmse,
+                "fused_rmse_K": fused_rmse,
+                "cnn_only_peak_temperature_abs_error_K": float(
+                    abs(cnn_cpu[index].max().item() - target_peak)
+                ),
+                "fused_peak_temperature_abs_error_K": float(
+                    abs(fused_cpu[index].max().item() - target_peak)
+                ),
                 "mae_improvement_K": cnn_mae - fused_mae,
                 "graph_correction_abs_mean_K": float(graph_item.abs().mean().item()),
                 "graph_correction_abs_max_K": float(graph_item.abs().max().item()),
