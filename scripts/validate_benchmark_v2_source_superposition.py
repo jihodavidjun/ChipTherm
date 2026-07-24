@@ -68,7 +68,11 @@ def main() -> int:
     if args.dry_run:
         return 0
     subprocess.run(command, cwd=REPO_ROOT, check=True)
-    loader_report = loader_full_audit(source_root / "combined_encoded_index.csv")
+    metadata_root = args.data_root.expanduser().resolve() / "derived/stages/full_50x200/metadata"
+    loader_report = loader_full_audit(
+        source_root / "combined_encoded_index.csv",
+        metadata_root=metadata_root,
+    )
     validation_path = source_root / "validation_report.json"
     validation_payload = json.loads(validation_path.read_text(encoding="utf-8"))
     validation_payload["selected_version_loader_all"] = loader_report

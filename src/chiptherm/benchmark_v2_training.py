@@ -43,6 +43,14 @@ EXPECTED_PRIMARY_SPLIT = {
     "test": ("f008", "f016", "f027", "f033", "f044"),
 }
 
+RESIDUAL_DATASET_SIDECARS = {
+    "feature_manifest.json": "derived/stages/full_50x200/context_33ch/feature_manifest.json",
+    "context_manifest.json": "derived/stages/full_50x200/context_33ch/context_manifest.json",
+    "metadata_features.csv": "derived/stages/full_50x200/metadata/metadata_features.csv",
+    "metadata_manifest.json": "derived/stages/full_50x200/metadata/metadata_manifest.json",
+    "graph_manifest.json": "derived/stages/full_50x200/graphs/graph_manifest.json",
+}
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -177,6 +185,7 @@ def prepare_residual_scaling_indices(
         ]
     )
     output = version_root / f"scaling/train_{family_count}"
+    install_residual_dataset_sidecars(root, output)
     counts: dict[str, int] = {}
     for split in ("train", "val", "test"):
         source = version_root / "sample_split" / f"{split}_index.csv"
@@ -831,6 +840,27 @@ def assert_preflight_immutability(
     return actual
 
 
+def install_residual_dataset_sidecars(
+    data_root: str | Path,
+    destination: str | Path,
+) -> dict[str, str]:
+    """Install canonical Benchmark v2 loader sidecars beside residual split views."""
+    root = benchmark_root(data_root)
+    output = Path(destination).expanduser().resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    installed: dict[str, str] = {}
+    for name, logical_source in RESIDUAL_DATASET_SIDECARS.items():
+        source = root / logical_source
+        if not source.is_file():
+            raise FileNotFoundError(f"canonical residual loader sidecar is missing: {source}")
+        target = output / name
+        temporary = target.with_name(f".{target.name}.tmp")
+        shutil.copy2(source, temporary)
+        temporary.replace(target)
+        installed[name] = logical_source
+    return installed
+
+
 def prepare_source_version_residual_indices(
     data_root: str | Path,
     *,
@@ -849,6 +879,7 @@ def prepare_source_version_residual_indices(
         raise ValueError("source-superposition version has not passed strict validation")
     version = source_root.name
     output = root / f"derived/indices/{FULL_STAGE}/source_superposition/{version}"
+    sidecars = install_residual_dataset_sidecars(root, output)
     canonical = root / f"derived/indices/{FULL_STAGE}"
     output_paths: dict[str, str] = {}
     for protocol in ("sample_split", "family_split"):
@@ -887,6 +918,7 @@ def prepare_source_version_residual_indices(
         "source_manifest_sha256": sha256_file(source_root / "manifest.json"),
         "source_validation_sha256": sha256_file(source_root / "validation_report.json"),
         "source_checkpoint_sha256": manifest.get("source_checkpoint_sha256"),
+        "loader_sidecars": sidecars,
         "indices": output_paths,
         "counts": {
             name: len(read_csv(root / path)) for name, path in output_paths.items()

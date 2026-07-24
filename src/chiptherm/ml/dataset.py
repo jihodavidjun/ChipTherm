@@ -217,6 +217,7 @@ class ChipThermDataset(Dataset):
         transform: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         target: TargetName = "residual",
         return_metadata: bool = True,
+        metadata_root: str | Path | None = None,
         graph_root: str | Path | None = None,
         return_graph: bool = True,
         physical_representation: PhysicalRepresentation = "dimensional",
@@ -225,6 +226,7 @@ class ChipThermDataset(Dataset):
         self.transform = transform
         self.target = target
         self.return_metadata = return_metadata
+        self.metadata_root = Path(metadata_root).expanduser().resolve() if metadata_root is not None else None
         self.graph_root = Path(graph_root).expanduser().resolve() if graph_root is not None else None
         self.return_graph = bool(return_graph)
         self.physical_representation = str(physical_representation)
@@ -346,8 +348,13 @@ class ChipThermDataset(Dataset):
         return rows
 
     def _load_metadata_features(self) -> tuple[list[str], dict[str, dict[str, float]]]:
-        table_path = self._find_sidecar("metadata_features.csv")
-        manifest_path = self._find_sidecar("metadata_manifest.json")
+        table_path = self._find_metadata_sidecar("metadata_features.csv")
+        manifest_path = self._find_metadata_sidecar("metadata_manifest.json")
+        if (table_path is None) != (manifest_path is None):
+            raise ValueError(
+                "metadata sidecars are incomplete: both metadata_features.csv "
+                "and metadata_manifest.json are required"
+            )
         if table_path is None or manifest_path is None:
             return [], {}
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -361,6 +368,16 @@ class ChipThermDataset(Dataset):
             for row in reader:
                 rows[row["sample_uid"]] = {name: float(row[name]) for name in active_features}
         return active_features, rows
+
+    def _find_metadata_sidecar(self, name: str) -> Path | None:
+        if self.metadata_root is not None:
+            candidate = self.metadata_root / name
+            if not candidate.exists():
+                raise FileNotFoundError(
+                    f"explicit metadata root {self.metadata_root} does not contain {name}"
+                )
+            return candidate
+        return self._find_sidecar(name)
 
     def _find_sidecar(self, name: str) -> Path | None:
         candidates = [self.index_csv.parent / name, self.index_csv.parent.parent / name]

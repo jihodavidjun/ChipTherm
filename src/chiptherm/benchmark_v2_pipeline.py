@@ -4605,13 +4605,23 @@ def loader_smoke(index_path: Path, *, residual_checkpoint: str | Path | None = N
         return {"passed": False, "details": f"{type(exc).__name__}: {exc}"}
 
 
-def loader_full_audit(index_path: Path) -> dict[str, Any]:
+def loader_full_audit(
+    index_path: Path,
+    *,
+    metadata_root: str | Path | None = None,
+) -> dict[str, Any]:
     """Load and finite-check every row without retaining package arrays in memory."""
     try:
         import torch
         from .ml.dataset import ChipThermDataset
 
-        dataset = ChipThermDataset(index_path, target="residual", return_metadata=True, return_graph=True)
+        dataset = ChipThermDataset(
+            index_path,
+            target="residual",
+            return_metadata=True,
+            metadata_root=metadata_root,
+            return_graph=True,
+        )
         failures: list[str] = []
         for index in range(len(dataset)):
             sample = dataset[index]
@@ -4620,6 +4630,10 @@ def loader_full_audit(index_path: Path) -> dict[str, Any]:
                 value = sample.get(key)
                 if value is None or not torch.isfinite(value).all():
                     failures.append(f"{uid}: {key} is missing or non-finite")
+                elif key == "metadata_vector" and tuple(value.shape) != (15,):
+                    failures.append(
+                        f"{uid}: metadata_vector has shape {tuple(value.shape)}, expected (15,)"
+                    )
             graph = sample.get("graph", {})
             for key in ("node_features", "edge_features", "chiplet_rects", "package_size"):
                 value = graph.get(key)

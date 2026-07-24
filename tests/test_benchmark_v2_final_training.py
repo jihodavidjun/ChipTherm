@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,21 +12,27 @@ import torch
 import yaml
 from torch.utils.data import DataLoader
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SRC_ROOT = REPO_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
 from chiptherm.benchmark_v2_training import (
     EXPECTED_PRIMARY_SPLIT,
     approve_source_checkpoint,
     assert_source_training_contract,
     deterministic_scaling_subsets,
     gnn_promotion_decision,
+    install_residual_dataset_sidecars,
     prepare_final_training_indices,
 )
+from chiptherm.benchmark_v2_pipeline import CANONICAL_METADATA_FEATURES, loader_full_audit
+from chiptherm.ml.dataset import ChipThermDataset, chiptherm_collate
+from chiptherm.ml.graph_models import EDGE_FEATURE_NAMES, NODE_FEATURE_NAMES
 from chiptherm.ml.source_response_dataset import (
     SourceResponseDataset,
     source_response_collate,
 )
-
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class BenchmarkV2FinalTrainingTests(unittest.TestCase):
@@ -205,6 +212,109 @@ class BenchmarkV2FinalTrainingTests(unittest.TestCase):
             approval = json.loads((root / "approval.json").read_text(encoding="utf-8"))
             self.assertEqual(approval["approval_status"], "REJECTED")
             self.assertFalse(approval["checks"]["lineage_no_oracle_leakage"])
+
+    def test_versioned_source_loader_uses_canonical_finite_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_root_marker(root)
+            uid = "f001_w001_low_balanced"
+            arrays = root / "arrays"
+            graphs = root / "derived/stages/full_50x200/graphs"
+            metadata = root / "derived/stages/full_50x200/metadata"
+            context = root / "derived/stages/full_50x200/context_33ch"
+            source_version = root / "derived/source_superposition_final_train40_source_v1"
+            training_view = root / "derived/indices/full_50x200/source_superposition/final_train40_source_v1"
+            for path in (arrays, graphs, metadata, context, source_version, training_view):
+                path.mkdir(parents=True, exist_ok=True)
+
+            np.save(arrays / "x.npy", np.zeros((33, 64, 64), dtype=np.float32))
+            np.save(arrays / "y.npy", np.full((64, 64), 320.0, dtype=np.float32))
+            np.save(arrays / "base.npy", np.full((64, 64), 319.0, dtype=np.float32))
+            np.savez(
+                graphs / "graph.npz",
+                node_features=np.zeros((2, 24), dtype=np.float32),
+                edge_index=np.asarray([[0, 1], [1, 0]], dtype=np.int64),
+                edge_features=np.zeros((2, 15), dtype=np.float32),
+                chiplet_rects=np.ones((2, 4), dtype=np.float32),
+                package_size=np.asarray([10.0, 10.0], dtype=np.float32),
+            )
+            row = {
+                "sample_uid": uid,
+                "original_sample_uid": uid,
+                "family_uid": "f001",
+                "case_id": "f001",
+                "dataset_source": "benchmark_v2_50family",
+                "split": "train",
+                "x_path": "arrays/x.npy",
+                "y_path": "arrays/y.npy",
+                "prediction_path": "",
+                "residual_path": "",
+                "source_superposition_base_path": "arrays/base.npy",
+                "source_base_mode": "source_superposition_v1",
+                "graph_path": "derived/stages/full_50x200/graphs/graph.npz",
+                "num_chiplets": "2",
+                "total_power_W": "10",
+            }
+            source_index = source_version / "combined_encoded_index.csv"
+            self._write_csv(source_index, [row])
+            metadata_row = {
+                "sample_uid": uid,
+                "case_id": "f001",
+                "split": "train",
+                **{name: "1.0" for name in CANONICAL_METADATA_FEATURES},
+            }
+            self._write_csv(metadata / "metadata_features.csv", [metadata_row])
+            (metadata / "metadata_manifest.json").write_text(
+                json.dumps({"active_features": list(CANONICAL_METADATA_FEATURES)}),
+                encoding="utf-8",
+            )
+            channel_names = [f"channel_{index}" for index in range(33)]
+            (context / "feature_manifest.json").write_text(
+                json.dumps({"channel_names": channel_names}),
+                encoding="utf-8",
+            )
+            (context / "context_manifest.json").write_text(
+                json.dumps({"channel_names": channel_names}),
+                encoding="utf-8",
+            )
+            (graphs / "graph_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "node_feature_names": list(NODE_FEATURE_NAMES),
+                        "edge_feature_names": list(EDGE_FEATURE_NAMES),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            audit = loader_full_audit(source_index, metadata_root=metadata)
+            self.assertTrue(audit["passed"], audit)
+            self.assertEqual(audit["samples"], 1)
+
+            install_residual_dataset_sidecars(root, training_view)
+            training_index = training_view / "train_index.csv"
+            self._write_csv(training_index, [row])
+            dataset = ChipThermDataset(
+                training_index,
+                target="residual",
+                return_metadata=True,
+                return_graph=True,
+            )
+            sample = dataset[0]
+            self.assertIn("metadata_vector", sample)
+            self.assertEqual(tuple(sample["metadata_vector"].shape), (15,))
+            self.assertTrue(torch.isfinite(sample["metadata_vector"]).all())
+            batch = next(
+                iter(
+                    DataLoader(
+                        dataset,
+                        batch_size=1,
+                        collate_fn=chiptherm_collate,
+                    )
+                )
+            )
+            self.assertEqual(tuple(batch["metadata_vector"].shape), (1, 15))
+            self.assertTrue(torch.isfinite(batch["metadata_vector"]).all())
 
     @staticmethod
     def _write_root_marker(root: Path) -> None:

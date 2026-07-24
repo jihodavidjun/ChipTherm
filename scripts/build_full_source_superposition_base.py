@@ -69,6 +69,11 @@ def main() -> int:
     out_root = args.out_root.expanduser().resolve()
     checkpoint = args.checkpoint.expanduser().resolve()
     split_indices = prepare_split_indices(args, out_root)
+    support_root = (
+        args.index.expanduser().resolve().parent
+        if args.index is not None
+        else args.train_index.expanduser().resolve().parent
+    )
     audit = audit_canonical_inputs(split_indices, checkpoint)
     print_audit(audit)
     if args.max_storage_gb is not None:
@@ -143,7 +148,7 @@ def main() -> int:
         write_index(out_root / f"{split}_index.csv", rows, generated)
         manifest["splits"][split] = split_summary
 
-    copy_support_files(split_indices["train"].parent, out_root)
+    copy_support_files(support_root, out_root)
     write_combined(out_root)
     manifest["generated_row_counts"] = {split: int(manifest["splits"][split]["rows"]) for split in SPLITS}
     manifest["total_packages"] = int(sum(manifest["generated_row_counts"].values()))
