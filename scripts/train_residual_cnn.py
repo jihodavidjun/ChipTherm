@@ -15,6 +15,7 @@ from typing import Any
 import numpy as np
 import torch
 from torch import nn
+from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
 
@@ -41,6 +42,152 @@ from chiptherm.ml.normalization import (
     save_normalization_stats,
     unnormalize_residual,
 )
+
+
+COARSE_SPATIAL_LOSS_DEFAULTS = {
+    "coarse_spatial_loss_enabled": False,
+    "coarse_spatial_loss_weight": 0.0,
+    "coarse_spatial_loss_size": 8,
+    "coarse_spatial_loss_type": "l1",
+}
+SUPPORTED_COARSE_SPATIAL_LOSS_SIZES = (8, 16)
+
+
+def validate_coarse_spatial_loss_config(
+    *,
+    enabled: bool,
+    weight: float,
+    size: int,
+    loss_type: str,
+) -> None:
+    if weight < 0.0:
+        raise ValueError("coarse_spatial_loss_weight must be non-negative")
+    if size not in SUPPORTED_COARSE_SPATIAL_LOSS_SIZES:
+        raise ValueError(
+            "coarse_spatial_loss_size must be one of "
+            f"{SUPPORTED_COARSE_SPATIAL_LOSS_SIZES}, got {size}"
+        )
+    if loss_type != "l1":
+        raise ValueError(f"coarse_spatial_loss_type must be 'l1', got {loss_type!r}")
+
+
+def coarse_spatial_components(
+    pred_centered: torch.Tensor,
+    true_centered: torch.Tensor,
+    *,
+    size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    validate_coarse_spatial_loss_config(enabled=True, weight=0.0, size=size, loss_type="l1")
+    if pred_centered.shape != true_centered.shape:
+        raise ValueError(
+            "predicted and target centered fields must have identical shapes, "
+            f"got {tuple(pred_centered.shape)} and {tuple(true_centered.shape)}"
+        )
+    if pred_centered.ndim == 3:
+        pred_4d = pred_centered.unsqueeze(1)
+        true_4d = true_centered.unsqueeze(1)
+    elif pred_centered.ndim == 4 and pred_centered.shape[1] == 1:
+        pred_4d = pred_centered
+        true_4d = true_centered
+    else:
+        raise ValueError(
+            "centered fields must have shape [B,H,W] or [B,1,H,W], "
+            f"got {tuple(pred_centered.shape)}"
+        )
+    if pred_4d.shape[-2] < size or pred_4d.shape[-1] < size:
+        raise ValueError(
+            f"coarse spatial size {size} exceeds input shape {tuple(pred_4d.shape[-2:])}"
+        )
+    pred_coarse = F.adaptive_avg_pool2d(pred_4d, output_size=(size, size))
+    true_coarse = F.adaptive_avg_pool2d(true_4d, output_size=(size, size))
+    pred_coarse = pred_coarse - pred_coarse.mean(dim=(-2, -1), keepdim=True)
+    true_coarse = true_coarse - true_coarse.mean(dim=(-2, -1), keepdim=True)
+    return pred_coarse, true_coarse
+
+
+def compute_decomposed_training_losses(
+    *,
+    pred_temperature: torch.Tensor,
+    true_temperature: torch.Tensor,
+    pred_mean: torch.Tensor,
+    true_mean: torch.Tensor,
+    pred_centered: torch.Tensor,
+    true_centered: torch.Tensor,
+    lambda_final: float,
+    lambda_mean: float,
+    coarse_spatial_loss_enabled: bool = False,
+    coarse_spatial_loss_weight: float = 0.0,
+    coarse_spatial_loss_size: int = 8,
+    coarse_spatial_loss_type: str = "l1",
+) -> dict[str, torch.Tensor]:
+    validate_coarse_spatial_loss_config(
+        enabled=coarse_spatial_loss_enabled,
+        weight=coarse_spatial_loss_weight,
+        size=coarse_spatial_loss_size,
+        loss_type=coarse_spatial_loss_type,
+    )
+    final_map_loss = F.l1_loss(pred_temperature, true_temperature)
+    mean_loss = F.l1_loss(pred_mean, true_mean)
+    centered_spatial_loss = F.l1_loss(pred_centered, true_centered)
+    existing_total_loss = float(lambda_final) * final_map_loss + float(lambda_mean) * mean_loss
+    coarse_spatial_loss = existing_total_loss.new_zeros(())
+    if coarse_spatial_loss_enabled:
+        pred_coarse, true_coarse = coarse_spatial_components(
+            pred_centered,
+            true_centered,
+            size=coarse_spatial_loss_size,
+        )
+        coarse_spatial_loss = F.l1_loss(pred_coarse, true_coarse)
+    weighted_coarse_spatial_loss = float(coarse_spatial_loss_weight) * coarse_spatial_loss
+    total_loss = (
+        existing_total_loss + weighted_coarse_spatial_loss
+        if coarse_spatial_loss_enabled and coarse_spatial_loss_weight > 0.0
+        else existing_total_loss
+    )
+    return {
+        "total_loss": total_loss,
+        "final_map_loss_K": final_map_loss,
+        "mean_loss_K": mean_loss,
+        "centered_spatial_loss_K": centered_spatial_loss,
+        "coarse_spatial_loss_K": coarse_spatial_loss,
+        "weighted_coarse_spatial_loss": weighted_coarse_spatial_loss,
+    }
+
+
+def build_resume_signature(config: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: config[key]
+        for key in (
+            "train_index",
+            "val_index",
+            "batch_size",
+            "lr",
+            "physics_input_mode",
+            "physical_representation",
+            "mean_head_mode",
+            "scheduler",
+            "temp_loss_weight",
+            "hotspot_loss_weight",
+            "hotspot_top_frac",
+            "lambda_final",
+            "lambda_mean",
+            "coarse_spatial_loss_enabled",
+            "coarse_spatial_loss_weight",
+            "coarse_spatial_loss_size",
+            "coarse_spatial_loss_type",
+            "lambda_graph",
+            "lambda_chiplet_mean",
+            "seed",
+            "model",
+        )
+    }
+
+
+def normalize_resume_signature(signature: dict[str, Any] | None) -> dict[str, Any]:
+    normalized = dict(signature or {})
+    for key, value in COARSE_SPATIAL_LOSS_DEFAULTS.items():
+        normalized.setdefault(key, value)
+    return normalized
 
 
 def physics_input_channel_count(mode: str) -> int:
@@ -160,6 +307,15 @@ def main() -> int:
     parser.add_argument("--init-checkpoint", default=None, type=Path, help="Optional checkpoint used to initialize matching model or CNN-submodule weights.")
     parser.add_argument("--lambda-final", default=1.0, type=float)
     parser.add_argument("--lambda-mean", default=0.1, type=float)
+    parser.add_argument(
+        "--coarse-spatial-loss-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Add training-only coarse supervision to the existing centered spatial prediction.",
+    )
+    parser.add_argument("--coarse-spatial-loss-weight", default=0.0, type=float)
+    parser.add_argument("--coarse-spatial-loss-size", default=8, type=int)
+    parser.add_argument("--coarse-spatial-loss-type", default="l1", choices=["l1"])
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
     parser.add_argument("--num-workers", default=0, type=int)
     parser.add_argument("--seed", default=0, type=int)
@@ -214,6 +370,15 @@ def main() -> int:
         raise SystemExit("--pairwise-basis-halo-decay-mm must be positive")
     if args.pairwise_basis_edge_chunk_size <= 0:
         raise SystemExit("--pairwise-basis-edge-chunk-size must be positive")
+    try:
+        validate_coarse_spatial_loss_config(
+            enabled=args.coarse_spatial_loss_enabled,
+            weight=args.coarse_spatial_loss_weight,
+            size=args.coarse_spatial_loss_size,
+            loss_type=args.coarse_spatial_loss_type,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     is_global_arch = args.model_architecture in {
         "miniunet_refine_conditioned_decomposed_global",
         "miniunet_refine_conditioned_decomposed_global_graph",
@@ -264,6 +429,8 @@ def main() -> int:
         args.mean_head_mode = "residual_resistance"
     if args.mean_head_mode == "residual_resistance" and not is_decomposed_arch:
         raise SystemExit("--mean-head-mode residual_resistance requires a decomposed architecture")
+    if args.coarse_spatial_loss_enabled and not is_decomposed_arch:
+        raise SystemExit("--coarse-spatial-loss-enabled requires a decomposed architecture")
 
     set_seed(args.seed)
     device = select_device(args.device)
@@ -505,6 +672,10 @@ def main() -> int:
         "lineage_manifest": str(args.lineage_manifest.resolve()) if args.lineage_manifest else None,
         "lambda_final": args.lambda_final,
         "lambda_mean": args.lambda_mean,
+        "coarse_spatial_loss_enabled": args.coarse_spatial_loss_enabled,
+        "coarse_spatial_loss_weight": args.coarse_spatial_loss_weight,
+        "coarse_spatial_loss_size": args.coarse_spatial_loss_size,
+        "coarse_spatial_loss_type": args.coarse_spatial_loss_type,
         "target_decomposition": is_decomposed_arch,
         "metadata_conditioning": is_conditioned_arch,
         "graph_enabled": is_graph_arch,
@@ -519,28 +690,7 @@ def main() -> int:
         ),
         "target": "residual = HotSpot - PhysicsBaseline",
     }
-    config["resume_signature"] = {
-        key: config[key]
-        for key in (
-            "train_index",
-            "val_index",
-            "batch_size",
-            "lr",
-            "physics_input_mode",
-            "physical_representation",
-            "mean_head_mode",
-            "scheduler",
-            "temp_loss_weight",
-            "hotspot_loss_weight",
-            "hotspot_top_frac",
-            "lambda_final",
-            "lambda_mean",
-            "lambda_graph",
-            "lambda_chiplet_mean",
-            "seed",
-            "model",
-        )
-    }
+    config["resume_signature"] = build_resume_signature(config)
     model = build_model(model_config).to(device)
     if args.resume and args.init_checkpoint:
         raise SystemExit("--resume and --init-checkpoint are mutually exclusive")
@@ -616,10 +766,14 @@ def main() -> int:
     log_path = out_dir / "train_log.csv"
     if not args.resume:
         init_train_log(log_path)
+    else:
+        ensure_train_log_schema(log_path)
     best_val_mae = float("inf")
     best_metrics: dict[str, Any] | None = None
     epochs_without_improvement = 0
     start_epoch = 1
+    last_completed_epoch = 0
+    last_train_losses: dict[str, float] | None = None
     training_lineage = (
         json.loads(args.lineage_manifest.read_text(encoding="utf-8"))
         if args.lineage_manifest
@@ -636,13 +790,17 @@ def main() -> int:
             raise SystemExit("resume checkpoint normalization differs from current train-only statistics")
         if training_lineage is not None and resumed.get("training_lineage") != training_lineage:
             raise SystemExit("resume checkpoint lineage differs from requested lineage")
-        if resumed.get("training_config", {}).get("resume_signature") != config["resume_signature"]:
+        resumed_signature = normalize_resume_signature(
+            resumed.get("training_config", {}).get("resume_signature")
+        )
+        if resumed_signature != normalize_resume_signature(config["resume_signature"]):
             raise SystemExit("resume checkpoint training recipe differs from requested training")
         model.load_state_dict(resumed["model_state_dict"])
         optimizer.load_state_dict(resumed["optimizer_state_dict"])
         if scheduler is not None and resumed.get("scheduler_state_dict") is not None:
             scheduler.load_state_dict(resumed["scheduler_state_dict"])
         start_epoch = int(resumed["epoch"]) + 1
+        last_completed_epoch = int(resumed["epoch"])
         best_val_mae = float(resumed.get("best_val_mae_K", float("inf")))
         epochs_without_improvement = int(resumed.get("epochs_without_improvement", 0))
 
@@ -663,6 +821,10 @@ def main() -> int:
             conditioned=is_conditioned_arch,
             lambda_final=args.lambda_final,
             lambda_mean=args.lambda_mean,
+            coarse_spatial_loss_enabled=args.coarse_spatial_loss_enabled,
+            coarse_spatial_loss_weight=args.coarse_spatial_loss_weight,
+            coarse_spatial_loss_size=args.coarse_spatial_loss_size,
+            coarse_spatial_loss_type=args.coarse_spatial_loss_type,
             physics_input_mode=args.physics_input,
             physics_gate_regularization=args.physics_gate_regularization,
             physics_gate_init=args.physics_gate_init,
@@ -672,6 +834,8 @@ def main() -> int:
             lambda_chiplet_mean=args.lambda_chiplet_mean,
             mean_head_mode=args.mean_head_mode,
         )
+        last_train_losses = train_losses
+        last_completed_epoch = epoch
         val_metrics, val_by_case = evaluate_model(
             model,
             val_loader,
@@ -777,11 +941,14 @@ def main() -> int:
             current_lr,
             args.physical_representation,
         )
+        write_training_history_json(log_path, out_dir / "training_history.json")
         write_metrics(out_dir / "val_metrics.json", best_metrics or {"epoch": epoch, "metrics": val_metrics, "metrics_by_case": val_by_case})
         write_case_metrics(out_dir / "val_metrics_by_case.csv", (best_metrics or {"metrics_by_case": val_by_case})["metrics_by_case"])
 
         print(
             f"epoch {epoch:03d} train_loss={train_losses['total_loss']:.6f} lr={current_lr:.3e} "
+            f"coarse={train_losses['coarse_spatial_loss_K']:.6f}K "
+            f"weighted_coarse={train_losses['weighted_coarse_spatial_loss']:.6f} "
             f"train_final_mae={format_optional_mae(train_final_mae_K)} "
             f"val_mae={val_final_mae:.3f}K val_rmse={val_metrics['final_temperature']['rmse_K']:.3f}K "
             f"gate={format_gate_summary(val_metrics.get('physics_gate'))} "
@@ -792,6 +959,20 @@ def main() -> int:
             print(f"Early stopping after {epochs_without_improvement} epochs without validation improvement")
             break
 
+    write_metrics(
+        out_dir / "training_summary.json",
+        {
+            "best_validation_final_temperature_mae_K": best_val_mae,
+            "last_completed_epoch": last_completed_epoch,
+            "final_training_losses": last_train_losses,
+            "coarse_spatial_loss": {
+                "enabled": args.coarse_spatial_loss_enabled,
+                "weight": args.coarse_spatial_loss_weight,
+                "size": args.coarse_spatial_loss_size,
+                "type": args.coarse_spatial_loss_type,
+            },
+        },
+    )
     print("Residual CNN training complete")
     print(f"Best validation final-temperature MAE: {best_val_mae:.3f} K")
     print(f"Output: {out_dir}")
@@ -978,6 +1159,10 @@ def train_one_epoch(
     conditioned: bool,
     lambda_final: float,
     lambda_mean: float,
+    coarse_spatial_loss_enabled: bool,
+    coarse_spatial_loss_weight: float,
+    coarse_spatial_loss_size: int,
+    coarse_spatial_loss_type: str,
     physics_input_mode: str,
     physics_gate_regularization: float,
     physics_gate_init: float,
@@ -992,6 +1177,11 @@ def train_one_epoch(
     residual_loss_total = 0.0
     temp_loss_scaled_total = 0.0
     temp_loss_K_total = 0.0
+    final_map_loss_total = 0.0
+    mean_loss_total = 0.0
+    centered_spatial_loss_total = 0.0
+    coarse_spatial_loss_total = 0.0
+    weighted_coarse_spatial_loss_total = 0.0
     hotspot_loss_scaled_total = 0.0
     hotspot_loss_K_total = 0.0
     gate_regularization_total = 0.0
@@ -1044,14 +1234,31 @@ def train_one_epoch(
             pred_temperature = reconstruct_decomposed_temperature(outputs, ambient, physics, mean_head_mode=mean_head_mode)
             targets = decomposed_targets(temperature, ambient, physics, total_power, mean_head_mode=mean_head_mode)
             mean_target = targets["mean_correction_K"]
-            final_loss = temp_criterion(pred_temperature, temperature)
-            mean_loss = temp_criterion(outputs["mean_rise"], mean_target)
+            decomposed_losses = compute_decomposed_training_losses(
+                pred_temperature=pred_temperature,
+                true_temperature=temperature,
+                pred_mean=outputs["mean_rise"],
+                true_mean=mean_target,
+                pred_centered=outputs["centered_field"],
+                true_centered=targets["centered_field_K"],
+                lambda_final=lambda_final,
+                lambda_mean=lambda_mean,
+                coarse_spatial_loss_enabled=coarse_spatial_loss_enabled,
+                coarse_spatial_loss_weight=coarse_spatial_loss_weight,
+                coarse_spatial_loss_size=coarse_spatial_loss_size,
+                coarse_spatial_loss_type=coarse_spatial_loss_type,
+            )
+            final_loss = decomposed_losses["final_map_loss_K"]
+            mean_loss = decomposed_losses["mean_loss_K"]
+            centered_spatial_loss = decomposed_losses["centered_spatial_loss_K"]
+            coarse_spatial_loss = decomposed_losses["coarse_spatial_loss_K"]
+            weighted_coarse_spatial_loss = decomposed_losses["weighted_coarse_spatial_loss"]
             residual_loss = final_loss
             temp_loss_K = final_loss
             temp_loss_scaled = mean_loss
             hotspot_loss_K = pred_temperature.new_tensor(0.0)
             hotspot_loss_scaled = pred_temperature.new_tensor(0.0)
-            loss = float(lambda_final) * final_loss + float(lambda_mean) * mean_loss
+            loss = decomposed_losses["total_loss"]
             if lambda_chiplet_mean > 0.0:
                 if graph_batch is None:
                     raise ValueError("--lambda-chiplet-mean requires graph-enabled training data")
@@ -1108,6 +1315,11 @@ def train_one_epoch(
                 + float(temp_loss_weight) * temp_loss_scaled
                 + float(hotspot_loss_weight) * hotspot_loss_scaled
             )
+            final_loss = residual_loss
+            mean_loss = pred.new_tensor(0.0)
+            centered_spatial_loss = pred.new_tensor(0.0)
+            coarse_spatial_loss = pred.new_tensor(0.0)
+            weighted_coarse_spatial_loss = pred.new_tensor(0.0)
         loss.backward()
         optimizer.step()
 
@@ -1115,6 +1327,11 @@ def train_one_epoch(
         residual_loss_total += float(residual_loss.item()) * batch_size
         temp_loss_scaled_total += float(temp_loss_scaled.item()) * batch_size
         temp_loss_K_total += float(temp_loss_K.item()) * batch_size
+        final_map_loss_total += float(final_loss.item()) * batch_size
+        mean_loss_total += float(mean_loss.item()) * batch_size
+        centered_spatial_loss_total += float(centered_spatial_loss.item()) * batch_size
+        coarse_spatial_loss_total += float(coarse_spatial_loss.item()) * batch_size
+        weighted_coarse_spatial_loss_total += float(weighted_coarse_spatial_loss.item()) * batch_size
         hotspot_loss_scaled_total += float(hotspot_loss_scaled.item()) * batch_size
         hotspot_loss_K_total += float(hotspot_loss_K.item()) * batch_size
         total_samples += batch_size
@@ -1124,6 +1341,11 @@ def train_one_epoch(
         "residual_loss": residual_loss_total / denominator,
         "temp_loss_scaled": temp_loss_scaled_total / denominator,
         "temp_loss_K": temp_loss_K_total / denominator,
+        "final_map_loss_K": final_map_loss_total / denominator,
+        "mean_loss_K": mean_loss_total / denominator,
+        "centered_spatial_loss_K": centered_spatial_loss_total / denominator,
+        "coarse_spatial_loss_K": coarse_spatial_loss_total / denominator,
+        "weighted_coarse_spatial_loss": weighted_coarse_spatial_loss_total / denominator,
         "hotspot_loss_scaled": hotspot_loss_scaled_total / denominator,
         "hotspot_loss_K": hotspot_loss_K_total / denominator,
         "gate_regularization": gate_regularization_total / denominator,
@@ -1915,15 +2137,17 @@ def load_initial_checkpoint(model: nn.Module, checkpoint_path: Path, device: tor
     }
 
 
-def init_train_log(path: Path) -> None:
-    with path.open("w", encoding="utf-8", newline="") as fp:
-        writer = csv.writer(fp)
-        writer.writerow(
-            [
+def train_log_columns() -> list[str]:
+    return [
                 "epoch",
                 "physical_representation",
                 "lr",
                 "train_loss",
+                "train_final_map_loss_K",
+                "train_mean_loss_K",
+                "train_centered_spatial_loss_K",
+                "train_coarse_spatial_loss_K",
+                "train_weighted_coarse_spatial_loss",
                 "train_residual_loss",
                 "train_temp_loss_scaled",
                 "train_temp_loss_K",
@@ -1988,7 +2212,34 @@ def init_train_log(path: Path) -> None:
                 "epoch_runtime_s",
                 "is_best",
             ]
-        )
+
+
+def init_train_log(path: Path) -> None:
+    with path.open("w", encoding="utf-8", newline="") as fp:
+        csv.writer(fp).writerow(train_log_columns())
+
+
+def ensure_train_log_schema(path: Path) -> None:
+    if not path.is_file():
+        init_train_log(path)
+        return
+    with path.open("r", encoding="utf-8", newline="") as fp:
+        reader = csv.DictReader(fp)
+        fieldnames = list(reader.fieldnames or [])
+        rows = list(reader)
+    expected = train_log_columns()
+    if fieldnames == expected:
+        return
+    unknown = sorted(set(fieldnames) - set(expected))
+    if unknown:
+        raise ValueError(f"cannot migrate training log with unknown columns: {unknown}")
+    temporary = path.with_suffix(path.suffix + ".schema_upgrade.tmp")
+    with temporary.open("w", encoding="utf-8", newline="") as fp:
+        writer = csv.DictWriter(fp, fieldnames=expected)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: row.get(key, "") for key in expected})
+    temporary.replace(path)
 
 
 def append_train_log(
@@ -2010,6 +2261,11 @@ def append_train_log(
                 physical_representation,
                 current_lr,
                 train_losses["total_loss"],
+                train_losses["final_map_loss_K"],
+                train_losses["mean_loss_K"],
+                train_losses["centered_spatial_loss_K"],
+                train_losses["coarse_spatial_loss_K"],
+                train_losses["weighted_coarse_spatial_loss"],
                 train_losses["residual_loss"],
                 train_losses["temp_loss_scaled"],
                 train_losses["temp_loss_K"],
@@ -2075,6 +2331,15 @@ def append_train_log(
                 int(is_best),
             ]
         )
+
+
+def write_training_history_json(csv_path: Path, json_path: Path) -> None:
+    with csv_path.open("r", encoding="utf-8", newline="") as fp:
+        rows = list(csv.DictReader(fp))
+    json_path.write_text(
+        json.dumps({"schema_version": 1, "epochs": rows}, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
 
 def make_scheduler(

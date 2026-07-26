@@ -28,6 +28,15 @@ from chiptherm.benchmark_v2_training import (
 )
 
 
+def resolve_coarse_spatial_loss_config(config: dict[str, object]) -> dict[str, object]:
+    return {
+        "enabled": bool(config.get("coarse_spatial_loss_enabled", False)),
+        "weight": float(config.get("coarse_spatial_loss_weight", 0.0)),
+        "size": int(config.get("coarse_spatial_loss_size", 8)),
+        "type": str(config.get("coarse_spatial_loss_type", "l1")),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Train the final Benchmark v2 package residual CNN.")
     parser.add_argument("--data-root", default=os.environ.get("CHIPTHERM_V2_DATA_ROOT"), type=Path)
@@ -70,6 +79,7 @@ def main() -> int:
                 f"final residual optimization must use the 6400/800 train-family split, got {counts}"
             )
     config = yaml.safe_load(args.config.read_text(encoding="utf-8"))
+    coarse_config = resolve_coarse_spatial_loss_config(config)
     out_dir = args.out_dir.expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     lineage_path = out_dir / "training_lineage.json"
@@ -117,6 +127,9 @@ def main() -> int:
         "--channel-routing-mode", "dimensional_baseline",
         "--lambda-final", str(config["lambda_final"]),
         "--lambda-mean", str(config["lambda_mean"]),
+        "--coarse-spatial-loss-weight", str(coarse_config["weight"]),
+        "--coarse-spatial-loss-size", str(coarse_config["size"]),
+        "--coarse-spatial-loss-type", str(coarse_config["type"]),
         "--global-hidden-channels", str(config["global_hidden_channels"]),
         "--global-pool-size", str(config["global_pool_size"]),
         "--scheduler", str(config["scheduler"]),
@@ -127,6 +140,8 @@ def main() -> int:
         "--num-workers", str(args.workers),
         "--seed", str(args.seed),
     ]
+    if coarse_config["enabled"]:
+        command.append("--coarse-spatial-loss-enabled")
     if args.resume:
         command.append("--resume")
     print(" ".join(command))
