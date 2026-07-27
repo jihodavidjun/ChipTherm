@@ -47,6 +47,98 @@ class NormalizationStats:
         return data
 
 
+@dataclass(frozen=True)
+class DirectTemperatureTargetStats:
+    mode: str
+    mean_K: float
+    std_K: float
+    min_K: float
+    max_K: float
+    num_samples: int
+    num_grid_cells: int
+    fit_scope: str = "train split only"
+    target_name: str = "absolute_temperature_K"
+
+    def __post_init__(self) -> None:
+        if self.mode not in {"none", "train_standard"}:
+            raise ValueError(f"unsupported direct-temperature normalization mode: {self.mode}")
+        if self.std_K <= 0.0:
+            raise ValueError("direct-temperature target std_K must be positive")
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> "DirectTemperatureTargetStats":
+        data = dict(payload or {})
+        return cls(
+            mode=str(data.get("mode", "none")),
+            mean_K=float(data.get("mean_K", 0.0)),
+            std_K=float(data.get("std_K", 1.0)),
+            min_K=float(data.get("min_K", 0.0)),
+            max_K=float(data.get("max_K", 0.0)),
+            num_samples=int(data.get("num_samples", 0)),
+            num_grid_cells=int(data.get("num_grid_cells", 0)),
+            fit_scope=str(data.get("fit_scope", "train split only")),
+            target_name=str(data.get("target_name", "absolute_temperature_K")),
+        )
+
+
+def compute_direct_temperature_target_stats(
+    dataset: Dataset[Any],
+    *,
+    mode: str,
+    batch_size: int = 16,
+    num_workers: int = 0,
+) -> DirectTemperatureTargetStats:
+    if mode not in {"none", "train_standard"}:
+        raise ValueError(f"unsupported direct-temperature normalization mode: {mode}")
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    moments = RunningMoments()
+    minimum = float("inf")
+    maximum = -float("inf")
+    num_samples = 0
+    for batch in loader:
+        temperature = batch["temperature"].float()
+        if not torch.isfinite(temperature).all():
+            raise ValueError("direct-temperature normalization encountered a non-finite training target")
+        moments.update(temperature)
+        minimum = min(minimum, float(temperature.min().item()))
+        maximum = max(maximum, float(temperature.max().item()))
+        num_samples += int(temperature.shape[0])
+    if moments.count == 0:
+        raise ValueError("cannot fit direct-temperature normalization on an empty training split")
+    return DirectTemperatureTargetStats(
+        mode=mode,
+        mean_K=moments.mean,
+        std_K=max(moments.std, EPSILON),
+        min_K=minimum,
+        max_K=maximum,
+        num_samples=num_samples,
+        num_grid_cells=moments.count,
+    )
+
+
+def normalize_direct_temperature(
+    temperature_K: torch.Tensor,
+    stats: DirectTemperatureTargetStats,
+) -> torch.Tensor:
+    value = temperature_K.float()
+    if stats.mode == "none":
+        return value
+    return normalize_tensor(value, stats.mean_K, stats.std_K)
+
+
+def unnormalize_direct_temperature(
+    prediction: torch.Tensor,
+    stats: DirectTemperatureTargetStats,
+) -> torch.Tensor:
+    value = prediction.float()
+    if stats.mode == "none":
+        return value
+    return value * float(stats.std_K) + float(stats.mean_K)
+
+
 def compute_normalization_stats(
     dataset: Dataset[Any],
     *,

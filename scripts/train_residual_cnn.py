@@ -34,12 +34,16 @@ from chiptherm.ml.graph_models import (
 )
 from chiptherm.ml.models import build_model, count_parameters
 from chiptherm.ml.normalization import (
+    DirectTemperatureTargetStats,
     NormalizationStats,
     build_metadata_input,
     build_model_input,
+    compute_direct_temperature_target_stats,
     compute_normalization_stats,
+    normalize_direct_temperature,
     normalize_residual,
     save_normalization_stats,
+    unnormalize_direct_temperature,
     unnormalize_residual,
 )
 
@@ -155,8 +159,15 @@ def compute_decomposed_training_losses(
 
 
 def build_resume_signature(config: dict[str, Any]) -> dict[str, Any]:
+    optional_defaults = {
+        "prediction_mode": resolve_prediction_mode(
+            "auto",
+            str((config.get("model") or {}).get("architecture", "miniunet")),
+        ),
+        "direct_target_normalization_mode": "none",
+    }
     return {
-        key: config[key]
+        key: config.get(key, optional_defaults[key]) if key in optional_defaults else config[key]
         for key in (
             "train_index",
             "val_index",
@@ -164,6 +175,8 @@ def build_resume_signature(config: dict[str, Any]) -> dict[str, Any]:
             "lr",
             "physics_input_mode",
             "physical_representation",
+            "prediction_mode",
+            "direct_target_normalization_mode",
             "mean_head_mode",
             "scheduler",
             "temp_loss_weight",
@@ -187,6 +200,9 @@ def normalize_resume_signature(signature: dict[str, Any] | None) -> dict[str, An
     normalized = dict(signature or {})
     for key, value in COARSE_SPATIAL_LOSS_DEFAULTS.items():
         normalized.setdefault(key, value)
+    architecture = str((normalized.get("model") or {}).get("architecture", "miniunet"))
+    normalized.setdefault("prediction_mode", resolve_prediction_mode("auto", architecture))
+    normalized.setdefault("direct_target_normalization_mode", "none")
     return normalized
 
 
@@ -198,6 +214,43 @@ def physics_input_channel_count(mode: str) -> int:
     if mode == "none":
         return 0
     raise ValueError(f"unsupported physics input mode: {mode}")
+
+
+DIRECT_ARCHITECTURE = "miniunet_refine_conditioned_direct_temperature_feature_fusion"
+
+
+def resolve_prediction_mode(requested: str, architecture: str) -> str:
+    if requested != "auto":
+        return requested
+    if architecture == DIRECT_ARCHITECTURE:
+        return "direct_temperature"
+    if "decomposed" in architecture:
+        return "residual_decomposed"
+    return "residual"
+
+
+def validate_prediction_mode(
+    prediction_mode: str,
+    architecture: str,
+    physics_input_mode: str,
+) -> None:
+    if prediction_mode in {"direct_temperature", "direct_temperature_source_conditioned"}:
+        if architecture != DIRECT_ARCHITECTURE:
+            raise ValueError(
+                f"prediction_mode={prediction_mode} requires architecture={DIRECT_ARCHITECTURE}"
+            )
+        required_physics = (
+            "none" if prediction_mode == "direct_temperature" else "source_superposition_v1"
+        )
+        if physics_input_mode != required_physics:
+            raise ValueError(
+                f"prediction_mode={prediction_mode} requires physics_input_mode={required_physics}"
+            )
+        return
+    if architecture == DIRECT_ARCHITECTURE:
+        raise ValueError(f"architecture={DIRECT_ARCHITECTURE} requires a direct prediction mode")
+    if prediction_mode not in {"residual", "residual_decomposed"}:
+        raise ValueError(f"unsupported prediction_mode: {prediction_mode}")
 
 
 def main() -> int:
@@ -222,6 +275,7 @@ def main() -> int:
             "miniunet_refine_conditioned_decomposed_global",
             "miniunet_refine_conditioned_decomposed_feature_fusion",
             "miniunet_refine_conditioned_decomposed_feature_fusion_resistance_mean",
+            "miniunet_refine_conditioned_direct_temperature_feature_fusion",
             "miniunet_refine_conditioned_decomposed_graph",
             "miniunet_refine_conditioned_decomposed_global_graph",
             "miniunet_refine_conditioned_decomposed_feature_fusion_graph",
@@ -234,6 +288,24 @@ def main() -> int:
     parser.add_argument("--metadata-conditioning", action="store_true")
     parser.add_argument("--metadata-hidden-dim", default=64, type=int)
     parser.add_argument("--metadata-embedding-dim", default=64, type=int)
+    parser.add_argument(
+        "--prediction-mode",
+        default="auto",
+        choices=[
+            "auto",
+            "residual",
+            "residual_decomposed",
+            "direct_temperature",
+            "direct_temperature_source_conditioned",
+        ],
+        help="Checkpoint-visible output semantics. auto preserves legacy architecture behavior.",
+    )
+    parser.add_argument(
+        "--direct-target-normalization",
+        default="none",
+        choices=["none", "train_standard"],
+        help="Training-only absolute-temperature target representation for direct-temperature models.",
+    )
     parser.add_argument(
         "--mean-head-mode",
         default="direct_k",
@@ -386,8 +458,10 @@ def main() -> int:
     is_feature_fusion_arch = args.model_architecture in {
         "miniunet_refine_conditioned_decomposed_feature_fusion",
         "miniunet_refine_conditioned_decomposed_feature_fusion_resistance_mean",
+        DIRECT_ARCHITECTURE,
         "miniunet_refine_conditioned_decomposed_feature_fusion_graph",
     }
+    is_direct_arch = args.model_architecture == DIRECT_ARCHITECTURE
     is_generic_graph_arch = args.model_architecture in {
         "miniunet_refine_conditioned_decomposed_graph",
         "miniunet_refine_conditioned_decomposed_global_graph",
@@ -402,6 +476,7 @@ def main() -> int:
         "miniunet_refine_conditioned_decomposed_global",
         "miniunet_refine_conditioned_decomposed_feature_fusion",
         "miniunet_refine_conditioned_decomposed_feature_fusion_resistance_mean",
+        DIRECT_ARCHITECTURE,
         "miniunet_refine_conditioned_decomposed_graph",
         "miniunet_refine_conditioned_decomposed_global_graph",
         "miniunet_refine_conditioned_decomposed_feature_fusion_graph",
@@ -427,27 +502,35 @@ def main() -> int:
     if args.model_architecture == "miniunet_refine_conditioned_decomposed_feature_fusion_resistance_mean":
         args.model_architecture = "miniunet_refine_conditioned_decomposed_feature_fusion"
         args.mean_head_mode = "residual_resistance"
+    prediction_mode = resolve_prediction_mode(args.prediction_mode, args.model_architecture)
+    try:
+        validate_prediction_mode(prediction_mode, args.model_architecture, args.physics_input)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     if args.mean_head_mode == "residual_resistance" and not is_decomposed_arch:
         raise SystemExit("--mean-head-mode residual_resistance requires a decomposed architecture")
     if args.coarse_spatial_loss_enabled and not is_decomposed_arch:
         raise SystemExit("--coarse-spatial-loss-enabled requires a decomposed architecture")
+    if is_direct_arch and args.coarse_spatial_loss_enabled:
+        raise SystemExit("direct-temperature baseline does not support coarse spatial loss")
 
     set_seed(args.seed)
     device = select_device(args.device)
     out_dir = args.out_dir.resolve()
     checkpoints_dir = out_dir / "checkpoints"
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
+    dataset_target = "temperature" if is_direct_arch else "residual"
 
     train_dataset = ChipThermDataset(
         args.train_index,
-        target="residual",
+        target=dataset_target,
         return_metadata=True,
         return_graph=is_graph_arch,
         physical_representation=args.physical_representation,
     )
     val_dataset = ChipThermDataset(
         args.val_index,
-        target="residual",
+        target=dataset_target,
         return_metadata=True,
         return_graph=is_graph_arch,
         physical_representation=args.physical_representation,
@@ -461,7 +544,7 @@ def main() -> int:
     stats_dataset = (
         ChipThermDataset(
             args.train_index,
-            target="residual",
+            target=dataset_target,
             return_metadata=True,
             return_graph=False,
             physical_representation=args.physical_representation,
@@ -472,6 +555,16 @@ def main() -> int:
     stats = compute_normalization_stats(stats_dataset, batch_size=args.batch_size, num_workers=args.num_workers)
     graph_stats = compute_graph_normalization_stats(train_dataset) if is_graph_arch else None
     delta_R_stats = compute_delta_R_eff_target_stats(train_eval_loader) if args.mean_head_mode == "residual_resistance" else None
+    direct_target_stats = (
+        compute_direct_temperature_target_stats(
+            stats_dataset,
+            mode=args.direct_target_normalization,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+        )
+        if is_direct_arch
+        else None
+    )
     metadata_dim = len(stats.metadata_feature_names)
     if is_conditioned_arch and metadata_dim <= 0:
         raise SystemExit("metadata-conditioned architecture requires metadata_features.csv/metadata_manifest.json")
@@ -495,6 +588,7 @@ def main() -> int:
         "input_channels": model_input_channels,
         "dataset_input_channels": dataset_input_channels,
         "physics_input_mode": args.physics_input,
+        "prediction_mode": prediction_mode,
         "physical_representation": args.physical_representation,
         "channel_routing_mode": args.channel_routing_mode,
         "dimensionless_v1_transforms": DIMENSIONLESS_V1_TRANSFORMS if args.physical_representation == "dimensionless_v1" else {},
@@ -507,6 +601,12 @@ def main() -> int:
         "physics_gate_hidden_dim": args.physics_gate_hidden_dim,
         "physics_gate_init": args.physics_gate_init,
         "mean_head_mode": args.mean_head_mode,
+        "target_name": "absolute_temperature_K" if is_direct_arch else "residual",
+        "target_normalization_mode": (
+            direct_target_stats.mode if direct_target_stats is not None else "not_applicable"
+        ),
+        "target_mean_K": direct_target_stats.mean_K if direct_target_stats is not None else 0.0,
+        "target_std_K": direct_target_stats.std_K if direct_target_stats is not None else 1.0,
         "output_channels": 1,
         "base_channels": args.base_channels,
         "depth": args.depth,
@@ -615,6 +715,11 @@ def main() -> int:
         "depth": args.depth,
         "model_architecture": args.model_architecture,
         "physics_input_mode": args.physics_input,
+        "prediction_mode": prediction_mode,
+        "direct_target_normalization_mode": args.direct_target_normalization,
+        "direct_temperature_target_normalization": (
+            direct_target_stats.to_dict() if direct_target_stats is not None else None
+        ),
         "physical_representation": args.physical_representation,
         "dimensionless_v1_transforms": DIMENSIONLESS_V1_TRANSFORMS if args.physical_representation == "dimensionless_v1" else {},
         "dimensionless_v2_transforms": DIMENSIONLESS_V2_TRANSFORMS if args.physical_representation == "dimensionless_v2" else {},
@@ -685,10 +790,18 @@ def main() -> int:
         "pairwise_basis_enabled": is_pairwise_basis_arch,
         "model": model_config,
         "loss": (
-            "SmoothL1Loss on normalized residual plus optional temp_loss_weight * L1(T_pred, HotSpot) / residual_std "
-            "plus optional hotspot_loss_weight * L1(T_pred, HotSpot on top HotSpot cells) / residual_std"
+            "L1Loss between direct model output and absolute-temperature target representation"
+            if is_direct_arch
+            else (
+                "SmoothL1Loss on normalized residual plus optional temp_loss_weight * L1(T_pred, HotSpot) / residual_std "
+                "plus optional hotspot_loss_weight * L1(T_pred, HotSpot on top HotSpot cells) / residual_std"
+            )
         ),
-        "target": "residual = HotSpot - PhysicsBaseline",
+        "target": (
+            "absolute_temperature_K = HotSpot target map"
+            if is_direct_arch
+            else "residual = HotSpot - PhysicsBaseline"
+        ),
     }
     config["resume_signature"] = build_resume_signature(config)
     model = build_model(model_config).to(device)
@@ -699,6 +812,7 @@ def main() -> int:
     config["model"].update(
         {
             "physics_input_mode": args.physics_input,
+            "prediction_mode": prediction_mode,
             "physical_representation": args.physical_representation,
             "channel_routing_mode": args.channel_routing_mode,
             "dimensionless_v1_transforms": DIMENSIONLESS_V1_TRANSFORMS if args.physical_representation == "dimensionless_v1" else {},
@@ -733,6 +847,11 @@ def main() -> int:
     if not args.resume:
         (out_dir / "config.json").write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         save_normalization_stats(stats, out_dir / "normalization.json")
+        if direct_target_stats is not None:
+            (out_dir / "direct_temperature_normalization.json").write_text(
+                json.dumps(direct_target_stats.to_dict(), indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     scheduler = make_scheduler(args.scheduler, optimizer, args.epochs)
@@ -740,6 +859,7 @@ def main() -> int:
     temp_criterion = nn.L1Loss()
 
     print(f"Model architecture: {args.model_architecture}")
+    print(f"Prediction mode: {prediction_mode}")
     print(f"Physics input mode: {args.physics_input}")
     print(f"Physical representation: {args.physical_representation}")
     print(f"Channel routing mode: {args.channel_routing_mode}")
@@ -749,6 +869,13 @@ def main() -> int:
             "Delta R_eff train target mean/std/min/max: "
             f"{delta_R_stats['mean_K_per_W']:.6f} / {delta_R_stats['std_K_per_W']:.6f} / "
             f"{delta_R_stats['min_K_per_W']:.6f} / {delta_R_stats['max_K_per_W']:.6f} K/W"
+        )
+    if direct_target_stats is not None:
+        print(
+            "Direct target normalization mode/mean/std/min/max: "
+            f"{direct_target_stats.mode} / {direct_target_stats.mean_K:.6f} / "
+            f"{direct_target_stats.std_K:.6f} / {direct_target_stats.min_K:.6f} / "
+            f"{direct_target_stats.max_K:.6f} K"
         )
     print(f"Model input channels: {model_input_channels}")
     if args.model_architecture == "miniunet_refine":
@@ -833,6 +960,8 @@ def main() -> int:
             lambda_graph=args.lambda_graph,
             lambda_chiplet_mean=args.lambda_chiplet_mean,
             mean_head_mode=args.mean_head_mode,
+            prediction_mode=prediction_mode,
+            direct_target_stats=direct_target_stats,
         )
         last_train_losses = train_losses
         last_completed_epoch = epoch
@@ -851,6 +980,8 @@ def main() -> int:
             graph_stats=graph_stats,
             lambda_chiplet_mean=args.lambda_chiplet_mean,
             mean_head_mode=args.mean_head_mode,
+            prediction_mode=prediction_mode,
+            direct_target_stats=direct_target_stats,
         )
         train_final_mae_K: float | None = None
         if should_compute_train_mae(epoch, args.epochs, args.train_mae_every):
@@ -869,6 +1000,8 @@ def main() -> int:
                 graph_stats=graph_stats,
                 lambda_chiplet_mean=args.lambda_chiplet_mean,
                 mean_head_mode=args.mean_head_mode,
+                prediction_mode=prediction_mode,
+                direct_target_stats=direct_target_stats,
             )
             train_final_mae_K = float(train_metrics["final_temperature"]["mae_K"])
         epoch_runtime_s = time.perf_counter() - epoch_start
@@ -945,8 +1078,14 @@ def main() -> int:
         write_metrics(out_dir / "val_metrics.json", best_metrics or {"epoch": epoch, "metrics": val_metrics, "metrics_by_case": val_by_case})
         write_case_metrics(out_dir / "val_metrics_by_case.csv", (best_metrics or {"metrics_by_case": val_by_case})["metrics_by_case"])
 
+        direct_loss_log = (
+            f"direct_map={train_losses['direct_map_loss']:.6f} "
+            if is_direct_arch
+            else ""
+        )
         print(
             f"epoch {epoch:03d} train_loss={train_losses['total_loss']:.6f} lr={current_lr:.3e} "
+            f"{direct_loss_log}"
             f"coarse={train_losses['coarse_spatial_loss_K']:.6f}K "
             f"weighted_coarse={train_losses['weighted_coarse_spatial_loss']:.6f} "
             f"train_final_mae={format_optional_mae(train_final_mae_K)} "
@@ -1171,6 +1310,8 @@ def train_one_epoch(
     lambda_graph: float = 0.0,
     lambda_chiplet_mean: float = 0.0,
     mean_head_mode: str = "direct_k",
+    prediction_mode: str = "residual",
+    direct_target_stats: DirectTemperatureTargetStats | None = None,
 ) -> dict[str, float]:
     model.train()
     total_loss = 0.0
@@ -1221,7 +1362,43 @@ def train_one_epoch(
         batch_size = int(x.shape[0])
 
         optimizer.zero_grad(set_to_none=True)
-        if decomposed:
+        if prediction_mode in {"direct_temperature", "direct_temperature_source_conditioned"}:
+            if direct_target_stats is None:
+                raise ValueError("direct-temperature training requires train-fitted target statistics")
+            pred_direct = call_model(
+                model,
+                model_input,
+                metadata_input,
+                graph_batch,
+                conditioned=conditioned,
+                graph_enabled=False,
+            )
+            if not torch.is_tensor(pred_direct) or pred_direct.ndim != 4 or pred_direct.shape[1] != 1:
+                raise ValueError(
+                    "direct-temperature model must return [B,1,H,W], "
+                    f"got {type(pred_direct).__name__} {getattr(pred_direct, 'shape', None)}"
+                )
+            target_direct = normalize_direct_temperature(
+                temperature,
+                direct_target_stats,
+            ).unsqueeze(1)
+            direct_map_loss = F.l1_loss(pred_direct, target_direct)
+            pred_temperature = unnormalize_direct_temperature(
+                pred_direct.squeeze(1),
+                direct_target_stats,
+            )
+            final_loss = F.l1_loss(pred_temperature, temperature)
+            residual_loss = direct_map_loss
+            temp_loss_K = final_loss
+            temp_loss_scaled = direct_map_loss
+            hotspot_loss_K = pred_direct.new_zeros(())
+            hotspot_loss_scaled = pred_direct.new_zeros(())
+            mean_loss = pred_direct.new_zeros(())
+            centered_spatial_loss = pred_direct.new_zeros(())
+            coarse_spatial_loss = pred_direct.new_zeros(())
+            weighted_coarse_spatial_loss = pred_direct.new_zeros(())
+            loss = direct_map_loss
+        elif decomposed:
             outputs = call_model(
                 model,
                 model_input,
@@ -1338,6 +1515,9 @@ def train_one_epoch(
     denominator = max(total_samples, 1)
     return {
         "total_loss": total_loss / denominator,
+        "direct_map_loss": residual_loss_total / denominator
+        if prediction_mode in {"direct_temperature", "direct_temperature_source_conditioned"}
+        else 0.0,
         "residual_loss": residual_loss_total / denominator,
         "temp_loss_scaled": temp_loss_scaled_total / denominator,
         "temp_loss_K": temp_loss_K_total / denominator,
@@ -1426,6 +1606,8 @@ def evaluate_model(
     graph_stats: Any | None = None,
     lambda_chiplet_mean: float = 0.0,
     mean_head_mode: str = "direct_k",
+    prediction_mode: str = "residual",
+    direct_target_stats: DirectTemperatureTargetStats | None = None,
 ) -> tuple[dict[str, Any], dict[str, dict[str, float]]]:
     model.eval()
     residual_acc = MetricAccumulator()
@@ -1496,7 +1678,30 @@ def evaluate_model(
             physics_input_mode=physics_input_mode,
             physics_v1=physics_v1,
         )
-        if decomposed:
+        if prediction_mode in {"direct_temperature", "direct_temperature_source_conditioned"}:
+            if direct_target_stats is None:
+                raise ValueError("direct-temperature evaluation requires train-fitted target statistics")
+            pred_direct = call_model(
+                model,
+                model_input,
+                metadata_input,
+                graph_batch,
+                conditioned=conditioned,
+                graph_enabled=False,
+            )
+            if not torch.is_tensor(pred_direct) or pred_direct.ndim != 4 or pred_direct.shape[1] != 1:
+                raise ValueError("direct-temperature model must return [B,1,H,W]")
+            target_direct = normalize_direct_temperature(
+                temperature,
+                direct_target_stats,
+            ).unsqueeze(1)
+            loss = F.l1_loss(pred_direct, target_direct)
+            pred_temperature = unnormalize_direct_temperature(
+                pred_direct.squeeze(1),
+                direct_target_stats,
+            )
+            pred_residual = pred_temperature - physics
+        elif decomposed:
             outputs = call_model(
                 model,
                 model_input,
@@ -1596,6 +1801,12 @@ def evaluate_model(
 
     metrics = {
         "normalized_residual_loss": total_loss / max(total_samples, 1),
+        "direct_map_loss": (
+            total_loss / max(total_samples, 1)
+            if prediction_mode in {"direct_temperature", "direct_temperature_source_conditioned"}
+            else None
+        ),
+        "prediction_mode": prediction_mode,
         "residual": residual_acc.compute(),
         "final_temperature": final_acc.compute(),
         "worse_than_physics_baseline_fraction": worse_than_physics_count / max(total_samples, 1),
@@ -2143,6 +2354,7 @@ def train_log_columns() -> list[str]:
                 "physical_representation",
                 "lr",
                 "train_loss",
+                "train_direct_map_loss",
                 "train_final_map_loss_K",
                 "train_mean_loss_K",
                 "train_centered_spatial_loss_K",
@@ -2170,6 +2382,7 @@ def train_log_columns() -> list[str]:
                 "train_pairwise_basis_weighted_coeff_abs_mean",
                 "train_final_temperature_mae_K",
                 "val_loss",
+                "val_direct_map_loss",
                 "val_residual_mae_K",
                 "val_residual_rmse_K",
                 "val_final_mae_K",
@@ -2261,6 +2474,7 @@ def append_train_log(
                 physical_representation,
                 current_lr,
                 train_losses["total_loss"],
+                train_losses.get("direct_map_loss", ""),
                 train_losses["final_map_loss_K"],
                 train_losses["mean_loss_K"],
                 train_losses["centered_spatial_loss_K"],
@@ -2288,6 +2502,7 @@ def append_train_log(
                 train_losses.get("pairwise_basis_weighted_coeff_abs_mean", ""),
                 "" if train_final_mae_K is None else train_final_mae_K,
                 val_metrics["normalized_residual_loss"],
+                val_metrics.get("direct_map_loss", ""),
                 val_metrics["residual"]["mae_K"],
                 val_metrics["residual"]["rmse_K"],
                 val_metrics["final_temperature"]["mae_K"],

@@ -25,7 +25,17 @@ if str(SRC_ROOT) not in sys.path:
 from chiptherm.ml.dataset import ChipThermDataset, DIMENSIONLESS_V1_TRANSFORMS, DIMENSIONLESS_V2_TRANSFORMS, chiptherm_collate
 from chiptherm.ml.graph_models import chiplet_metric_values, move_graph_to_device, normalize_graph_batch
 from chiptherm.ml.models import build_model, count_parameters
-from chiptherm.ml.normalization import NormalizationStats, build_metadata_input, build_model_input, unnormalize_residual
+from chiptherm.ml.normalization import (
+    DirectTemperatureTargetStats,
+    NormalizationStats,
+    build_metadata_input,
+    build_model_input,
+    unnormalize_direct_temperature,
+    unnormalize_residual,
+)
+
+
+DIRECT_ARCHITECTURE = "miniunet_refine_conditioned_direct_temperature_feature_fusion"
 
 
 def physics_input_channel_count(mode: str) -> int:
@@ -36,6 +46,64 @@ def physics_input_channel_count(mode: str) -> int:
     if mode == "none":
         return 0
     raise ValueError(f"unsupported physics input mode: {mode}")
+
+
+def checkpoint_prediction_mode(checkpoint: dict[str, Any], architecture: str) -> str:
+    model_config = checkpoint.get("model_config", {})
+    training_config = checkpoint.get("training_config", {})
+    explicit = model_config.get("prediction_mode") or training_config.get("prediction_mode")
+    if explicit:
+        return str(explicit)
+    if architecture == DIRECT_ARCHITECTURE:
+        raise ValueError("direct-temperature checkpoint is missing explicit prediction_mode")
+    return "residual_decomposed" if "decomposed" in architecture else "residual"
+
+
+def direct_target_stats_from_checkpoint(
+    checkpoint: dict[str, Any],
+    prediction_mode: str,
+) -> DirectTemperatureTargetStats | None:
+    if prediction_mode not in {"direct_temperature", "direct_temperature_source_conditioned"}:
+        return None
+    model_config = checkpoint.get("model_config", {})
+    training_config = checkpoint.get("training_config", {})
+    payload = training_config.get("direct_temperature_target_normalization")
+    if payload is None:
+        payload = {
+            "mode": model_config.get("target_normalization_mode"),
+            "mean_K": model_config.get("target_mean_K"),
+            "std_K": model_config.get("target_std_K"),
+            "min_K": model_config.get("target_min_K", 0.0),
+            "max_K": model_config.get("target_max_K", 0.0),
+            "num_samples": model_config.get("target_normalization_num_samples", 0),
+            "num_grid_cells": model_config.get("target_normalization_num_grid_cells", 0),
+        }
+    if payload.get("mode") in {None, ""}:
+        raise ValueError("direct-temperature checkpoint is missing target normalization metadata")
+    return DirectTemperatureTargetStats.from_dict(payload)
+
+
+def validate_checkpoint_prediction_mode(
+    prediction_mode: str,
+    architecture: str,
+    physics_input_mode: str,
+) -> None:
+    direct = prediction_mode in {"direct_temperature", "direct_temperature_source_conditioned"}
+    if direct != (architecture == DIRECT_ARCHITECTURE):
+        raise ValueError(
+            "checkpoint prediction mode and architecture are incompatible: "
+            f"prediction_mode={prediction_mode}, architecture={architecture}"
+        )
+    if prediction_mode == "direct_temperature" and physics_input_mode != "none":
+        raise ValueError("direct_temperature checkpoint must use physics_input_mode=none")
+    if (
+        prediction_mode == "direct_temperature_source_conditioned"
+        and physics_input_mode != "source_superposition_v1"
+    ):
+        raise ValueError(
+            "direct_temperature_source_conditioned checkpoint must use "
+            "physics_input_mode=source_superposition_v1"
+        )
 
 
 def main() -> int:
@@ -98,6 +166,7 @@ def main() -> int:
     }
     conditioned = architecture in {
         "miniunet_refine_conditioned",
+        DIRECT_ARCHITECTURE,
         "miniunet_refine_conditioned_decomposed",
         "miniunet_refine_conditioned_decomposed_global",
         "miniunet_refine_conditioned_decomposed_feature_fusion",
@@ -110,6 +179,9 @@ def main() -> int:
     }
     graph_stats = checkpoint["model_config"].get("graph_normalization")
     physics_input_mode = str(checkpoint["model_config"].get("physics_input_mode", "v1"))
+    prediction_mode = checkpoint_prediction_mode(checkpoint, architecture)
+    direct_target_stats = direct_target_stats_from_checkpoint(checkpoint, prediction_mode)
+    validate_checkpoint_prediction_mode(prediction_mode, architecture, physics_input_mode)
     mean_head_mode = str(checkpoint["model_config"].get("mean_head_mode", "direct_k"))
     physical_representation_value = checkpoint["model_config"].get("physical_representation", "dimensional")
     physical_representation = "dimensional" if physical_representation_value in {None, "", "None"} else str(physical_representation_value)
@@ -128,7 +200,9 @@ def main() -> int:
 
     dataset = ChipThermDataset(
         args.index,
-        target="residual",
+        target="temperature"
+        if prediction_mode in {"direct_temperature", "direct_temperature_source_conditioned"}
+        else "residual",
         return_metadata=True,
         return_graph=graph_enabled,
         physical_representation=physical_representation,
@@ -169,6 +243,8 @@ def main() -> int:
         graph_correction_scale=args.graph_correction_scale,
         global_correction_scale=args.global_correction_scale,
         disabled_fusion_scales=disabled_fusion_scales,
+        prediction_mode=prediction_mode,
+        direct_target_stats=direct_target_stats,
     )
     cnn_runtime_per_sample = runtime_s / max(metrics["num_samples"], 1)
     throughput_samples_per_s = metrics["num_samples"] / max(runtime_s, 1.0e-12)
@@ -238,6 +314,10 @@ def main() -> int:
         "model": {
             "config": checkpoint["model_config"],
             "physics_input_mode": physics_input_mode,
+            "prediction_mode": prediction_mode,
+            "direct_temperature_target_normalization": (
+                direct_target_stats.to_dict() if direct_target_stats is not None else None
+            ),
             "mean_head_mode": mean_head_mode,
             "physical_representation": physical_representation,
             "dimensionless_v1_transforms": DIMENSIONLESS_V1_TRANSFORMS if physical_representation == "dimensionless_v1" else {},
@@ -266,6 +346,7 @@ def main() -> int:
         "physics_baseline": metrics["physics_baseline"],
         "cnn_final_temperature": metrics["cnn_final_temperature"],
         "cnn_residual": metrics["cnn_residual"],
+        "region_mae": metrics.get("region_mae"),
         "coarse_final_temperature": metrics.get("coarse_final_temperature"),
         "mean_rise": metrics.get("mean_rise"),
         "delta_R_eff": metrics.get("delta_R_eff"),
@@ -315,9 +396,10 @@ def main() -> int:
     (out_dir / "metrics.json").write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     write_case_metrics(out_dir / "metrics_by_case.csv", by_case)
 
-    print("Residual CNN evaluation complete")
+    print("ChipTherm CNN evaluation complete")
     print(f"Samples: {metrics['num_samples']}")
     print(f"Physics input mode: {physics_input_mode}")
+    print(f"Prediction mode: {prediction_mode}")
     print(f"Mean head mode: {mean_head_mode}")
     print(f"Physical representation: {physical_representation}")
     print(f"CNN-side inference runtime/sample: {cnn_runtime_per_sample:.6f} s")
@@ -436,6 +518,8 @@ def evaluate(
     global_correction_scale: float = 1.0,
     disabled_fusion_scales: tuple[str, ...] = (),
     mean_head_mode: str = "direct_k",
+    prediction_mode: str = "residual",
+    direct_target_stats: DirectTemperatureTargetStats | None = None,
 ) -> tuple[dict[str, Any], dict[str, dict[str, dict[str, float]]], float, float | None, float | None, float]:
     residual_acc = MetricAccumulator()
     final_acc = MetricAccumulator()
@@ -525,7 +609,19 @@ def evaluate(
         )
         coarse_norm = None
         alpha = None
-        if decomposed:
+        if prediction_mode in {"direct_temperature", "direct_temperature_source_conditioned"}:
+            if direct_target_stats is None:
+                raise ValueError("direct-temperature evaluation requires checkpoint target statistics")
+            pred_direct = model(model_input, metadata_input) if conditioned else model(model_input)
+            if not torch.is_tensor(pred_direct) or pred_direct.ndim != 4 or pred_direct.shape[1] != 1:
+                raise ValueError("direct-temperature model must return [B,1,H,W]")
+            pred_temperature = unnormalize_direct_temperature(
+                pred_direct.squeeze(1),
+                direct_target_stats,
+            )
+            pred_residual = pred_temperature - physics
+            coarse_temperature = None
+        elif decomposed:
             outputs = call_model(
                 model,
                 model_input,
@@ -607,7 +703,10 @@ def evaluate(
             pred_norm = model(model_input, metadata_input) if conditioned else model(model_input)
             pred_residual = unnormalize_residual(pred_norm.squeeze(1), stats)
             pred_temperature = physics + pred_residual
-        if not decomposed:
+        if not decomposed and prediction_mode not in {
+            "direct_temperature",
+            "direct_temperature_source_conditioned",
+        }:
             if coarse_norm is not None:
                 coarse_residual = unnormalize_residual(coarse_norm.squeeze(1), stats)
                 coarse_temperature = physics + coarse_residual
@@ -711,9 +810,20 @@ def evaluate(
 
     metrics = {
         "num_samples": num_samples,
+        "prediction_mode": prediction_mode,
         "cnn_residual": residual_acc.compute(),
         "cnn_final_temperature": final_acc.compute(),
         "physics_baseline": physics_acc.compute(),
+        "region_mae": {
+            key: mean_float(row.get(key) for row in sample_rows)
+            for key in (
+                "occupied_region_mae_K",
+                "unoccupied_region_mae_K",
+                "boundary_region_mae_K",
+                "non_boundary_region_mae_K",
+                "hotspot_top1pct_mae_K",
+            )
+        },
     }
     physics_v1_summary = physics_v1_acc.compute()
     if physics_v1_summary:
@@ -727,6 +837,8 @@ def evaluate(
             metrics["delta_R_eff"] = rename_scalar_metric_units(delta_summary, "K_per_W")
         metrics["centered_field"] = centered_acc.compute()
         metrics["mean_bias_removed"] = mean_bias_removed_acc.compute()
+        metrics["worse_than_physics_baseline_fraction"] = worse_than_physics_count / max(num_samples, 1)
+    else:
         metrics["worse_than_physics_baseline_fraction"] = worse_than_physics_count / max(num_samples, 1)
     chiplet_mean_summary = chiplet_mean_acc.compute()
     if chiplet_mean_summary:
@@ -860,7 +972,15 @@ def append_sample_metric_rows(
         item["occupied_region_mae_K"] = (
             float(error.abs()[occupancy].mean().item()) if torch.any(occupancy) else None
         )
+        unoccupied = ~occupancy
+        item["unoccupied_region_mae_K"] = (
+            float(error.abs()[unoccupied].mean().item()) if torch.any(unoccupied) else None
+        )
         item["boundary_region_mae_K"] = float(error.abs()[boundary].mean().item())
+        interior = ~boundary
+        item["non_boundary_region_mae_K"] = (
+            float(error.abs()[interior].mean().item()) if torch.any(interior) else None
+        )
         item["hotspot_top1pct_mae_K"] = float(
             error.abs().reshape(-1).index_select(0, hotspot_indices).mean().item()
         )

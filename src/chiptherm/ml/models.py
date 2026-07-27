@@ -926,6 +926,182 @@ class FeatureFusionFiLMMiniUNet(nn.Module):
         }
 
 
+class DirectTemperatureMiniUNetWithFeatureFusion(nn.Module):
+    """Metadata-conditioned feature-fusion CNN that predicts one absolute-temperature map."""
+
+    def __init__(
+        self,
+        input_channels: int = 33,
+        output_channels: int = 1,
+        base_channels: int = 32,
+        depth: int = 3,
+        refine_channels: int = 32,
+        refine_blocks: int = 4,
+        refinement_channel_indices: tuple[int, ...] | list[int] = (),
+        refinement_channel_names: tuple[str, ...] | list[str] = (),
+        metadata_dim: int = 0,
+        metadata_hidden_dim: int = 64,
+        metadata_embedding_dim: int = 64,
+        physics_input_mode: str = "none",
+        global_branch_channel_indices: tuple[int, ...] | list[int] = (),
+        global_branch_channel_names: tuple[str, ...] | list[str] = (),
+        global_hidden_channels: int = 32,
+        global_pool_size: int = 8,
+        global_context_blocks: int = 3,
+        prediction_mode: str = "direct_temperature",
+        target_normalization_mode: str = "none",
+        target_mean_K: float = 0.0,
+        target_std_K: float = 1.0,
+    ) -> None:
+        super().__init__()
+        if prediction_mode not in {"direct_temperature", "direct_temperature_source_conditioned"}:
+            raise ValueError(f"unsupported direct prediction_mode: {prediction_mode}")
+        if prediction_mode == "direct_temperature" and physics_input_mode != "none":
+            raise ValueError("direct_temperature requires physics_input_mode=none")
+        if prediction_mode == "direct_temperature_source_conditioned" and physics_input_mode != "source_superposition_v1":
+            raise ValueError(
+                "direct_temperature_source_conditioned requires physics_input_mode=source_superposition_v1"
+            )
+        if target_normalization_mode not in {"none", "train_standard"}:
+            raise ValueError(f"unsupported target_normalization_mode: {target_normalization_mode}")
+        if target_std_K <= 0.0:
+            raise ValueError("target_std_K must be positive")
+        indices = tuple(int(index) for index in refinement_channel_indices)
+        if not indices:
+            raise ValueError("DirectTemperatureMiniUNetWithFeatureFusion requires refinement_channel_indices")
+        self.architecture = "miniunet_refine_conditioned_direct_temperature_feature_fusion"
+        self.input_channels = int(input_channels)
+        self.output_channels = int(output_channels)
+        self.base_channels = int(base_channels)
+        self.depth = int(depth)
+        self.refine_channels = int(refine_channels)
+        self.refine_blocks = int(refine_blocks)
+        self.refinement_channel_indices = indices
+        self.refinement_channel_names = tuple(str(name) for name in refinement_channel_names)
+        self.metadata_dim = int(metadata_dim)
+        self.metadata_hidden_dim = int(metadata_hidden_dim)
+        self.metadata_embedding_dim = int(metadata_embedding_dim)
+        self.physics_input_mode = str(physics_input_mode)
+        self.prediction_mode = str(prediction_mode)
+        self.target_normalization_mode = str(target_normalization_mode)
+        self.target_mean_K = float(target_mean_K)
+        self.target_std_K = float(target_std_K)
+        self.global_hidden_channels = int(global_hidden_channels)
+        self.global_pool_size = int(global_pool_size)
+        self.global_context_blocks = int(global_context_blocks)
+        self.metadata_encoder = MetadataEncoder(metadata_dim, metadata_hidden_dim, metadata_embedding_dim)
+        self.coarse_model = FeatureFusionFiLMMiniUNet(
+            input_channels=input_channels,
+            output_channels=output_channels,
+            base_channels=base_channels,
+            depth=depth,
+            metadata_embedding_dim=metadata_embedding_dim,
+            global_branch_channel_indices=global_branch_channel_indices,
+            global_branch_channel_names=global_branch_channel_names,
+            global_hidden_channels=global_hidden_channels,
+            global_pool_size=global_pool_size,
+            global_context_blocks=global_context_blocks,
+        )
+        self.refinement_model = ConditionedFullResolutionRefinementCNN(
+            len(indices) + output_channels,
+            refine_channels=refine_channels,
+            refine_blocks=refine_blocks,
+            metadata_embedding_dim=metadata_embedding_dim,
+        )
+
+    def forward_components(
+        self,
+        x: torch.Tensor,
+        metadata: torch.Tensor | None = None,
+        *,
+        return_diagnostics: bool = False,
+        disabled_fusion_scales: tuple[str, ...] | list[str] = (),
+    ) -> dict[str, torch.Tensor]:
+        if metadata is None:
+            raise ValueError("direct-temperature feature-fusion model requires metadata tensor")
+        embedding = self.metadata_encoder(metadata)
+        coarse_result = self.coarse_model(
+            x,
+            embedding,
+            disabled_fusion_scales=disabled_fusion_scales,
+            return_features=return_diagnostics,
+        )
+        if return_diagnostics:
+            coarse, global_features = coarse_result
+        else:
+            coarse = coarse_result
+            global_features = {}
+        selected = x[:, list(self.refinement_channel_indices), :, :]
+        detail = self.refinement_model(torch.cat([selected, coarse], dim=1), embedding)
+        direct = coarse + detail
+        output = {
+            "direct_temperature_output": direct,
+            "coarse_temperature_output": coarse,
+            "detail_temperature_output": detail,
+        }
+        if return_diagnostics:
+            disabled = {str(scale) for scale in disabled_fusion_scales}
+            for scale in ("16", "32", "64"):
+                output[f"global_fusion_enabled_{scale}"] = direct.new_full(
+                    (direct.shape[0],),
+                    0.0 if "all" in disabled or scale in disabled else 1.0,
+                )
+                output[f"global_feature_{scale}_abs_mean"] = global_features[scale].abs().mean(
+                    dim=(1, 2, 3)
+                )
+        return output
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        metadata: torch.Tensor | None = None,
+        *,
+        return_diagnostics: bool = False,
+        disabled_fusion_scales: tuple[str, ...] | list[str] = (),
+    ) -> torch.Tensor | dict[str, torch.Tensor]:
+        output = self.forward_components(
+            x,
+            metadata,
+            return_diagnostics=return_diagnostics,
+            disabled_fusion_scales=disabled_fusion_scales,
+        )
+        return output if return_diagnostics else output["direct_temperature_output"]
+
+    def config(self) -> dict[str, object]:
+        coarse_config = self.coarse_model.config()
+        return {
+            "architecture": self.architecture,
+            "input_channels": self.input_channels,
+            "output_channels": self.output_channels,
+            "base_channels": self.base_channels,
+            "depth": self.depth,
+            "refine_channels": self.refine_channels,
+            "refine_blocks": self.refine_blocks,
+            "refinement_channel_indices": list(self.refinement_channel_indices),
+            "refinement_channel_names": list(self.refinement_channel_names),
+            "metadata_dim": self.metadata_dim,
+            "metadata_hidden_dim": self.metadata_hidden_dim,
+            "metadata_embedding_dim": self.metadata_embedding_dim,
+            "conditioned": True,
+            "physics_input_mode": self.physics_input_mode,
+            "prediction_mode": self.prediction_mode,
+            "target_name": "absolute_temperature_K",
+            "target_normalization_mode": self.target_normalization_mode,
+            "target_mean_K": self.target_mean_K,
+            "target_std_K": self.target_std_K,
+            "feature_fusion_enabled": True,
+            "metadata_parameters": count_parameters(self.metadata_encoder),
+            "coarse_parameters": count_parameters(self.coarse_model),
+            "refinement_parameters": count_parameters(self.refinement_model),
+            "feature_fusion_parameter_count": count_parameters(self.coarse_model.global_encoder)
+            + count_parameters(self.coarse_model.fuse16)
+            + count_parameters(self.coarse_model.fuse32)
+            + count_parameters(self.coarse_model.fuse64),
+            "total_parameters": count_parameters(self),
+            **coarse_config,
+        }
+
+
 def low_frequency_energy_fraction(field: torch.Tensor, pool_size: int = 8) -> torch.Tensor:
     """Cheap per-sample low-frequency energy proxy from pooled/re-expanded fields."""
 
@@ -2350,6 +2526,44 @@ def build_model(config: dict[str, object]) -> nn.Module:
             global_hidden_channels=int(config.get("global_hidden_channels", config.get("global_branch_hidden_channels", 32))),
             global_blocks=int(config.get("global_blocks", config.get("global_branch_blocks", 3))),
             global_pool_size=int(config.get("global_pool_size", config.get("global_branch_pool_size", 8))),
+        )
+    if architecture == "miniunet_refine_conditioned_direct_temperature_feature_fusion":
+        return DirectTemperatureMiniUNetWithFeatureFusion(
+            input_channels=int(config.get("input_channels", 33)),
+            output_channels=int(config.get("output_channels", 1)),
+            base_channels=int(config.get("base_channels", 32)),
+            depth=int(config.get("depth", 3)),
+            refine_channels=int(config.get("refine_channels", 32)),
+            refine_blocks=int(config.get("refine_blocks", 4)),
+            refinement_channel_indices=tuple(
+                int(index) for index in config.get("refinement_channel_indices", ())
+            ),
+            refinement_channel_names=tuple(
+                str(name) for name in config.get("refinement_channel_names", ())
+            ),
+            metadata_dim=int(config.get("metadata_dim", 0)),
+            metadata_hidden_dim=int(config.get("metadata_hidden_dim", 64)),
+            metadata_embedding_dim=int(config.get("metadata_embedding_dim", 64)),
+            physics_input_mode=str(config.get("physics_input_mode", "none")),
+            global_branch_channel_indices=tuple(
+                int(index) for index in config.get("global_branch_channel_indices", ())
+            ),
+            global_branch_channel_names=tuple(
+                str(name) for name in config.get("global_branch_channel_names", ())
+            ),
+            global_hidden_channels=int(
+                config.get("global_hidden_channels", config.get("global_branch_hidden_channels", 32))
+            ),
+            global_pool_size=int(
+                config.get("global_pool_size", config.get("global_branch_pool_size", 8))
+            ),
+            global_context_blocks=int(
+                config.get("global_blocks", config.get("global_branch_context_blocks", 3))
+            ),
+            prediction_mode=str(config.get("prediction_mode", "direct_temperature")),
+            target_normalization_mode=str(config.get("target_normalization_mode", "none")),
+            target_mean_K=float(config.get("target_mean_K", 0.0)),
+            target_std_K=float(config.get("target_std_K", 1.0)),
         )
     if architecture in {
         "miniunet_refine_conditioned_decomposed_feature_fusion",
