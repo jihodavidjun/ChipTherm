@@ -73,6 +73,7 @@ class SpectralConv2d(nn.Module):
         if x.ndim != 4:
             raise ValueError(f"SpectralConv2d expects [B,C,H,W], got {tuple(x.shape)}")
         batch, _, height, width = x.shape
+        x = x.contiguous()
         spectrum = torch.fft.rfft2(x, norm="ortho")
         output = torch.zeros(
             batch,
