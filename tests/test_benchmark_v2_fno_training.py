@@ -34,9 +34,166 @@ comparison = load_script(
     "compare_benchmark_v2_fno_models_test",
     REPO_ROOT / "scripts/compare_benchmark_v2_fno_models.py",
 )
+evaluator = load_script(
+    "evaluate_residual_cnn_fno_test",
+    REPO_ROOT / "scripts/evaluate_residual_cnn.py",
+)
 
 
 class BenchmarkV2FNOTrainingTests(unittest.TestCase):
+    def test_residual_fno_evaluation_dispatch_uses_raw_total_power(self) -> None:
+        torch.manual_seed(3)
+        model = build_model(
+            {
+                "architecture": "fno2d_residual_decomposed_conditioned",
+                "input_channels": 4,
+                "metadata_dim": 3,
+                "metadata_hidden_dim": 8,
+                "metadata_embedding_dim": 8,
+                "fno_width": 6,
+                "fno_layers": 1,
+                "fno_modes_x": 3,
+                "fno_modes_y": 3,
+                "fno_projection_channels": 8,
+                "delta_R_eff_target_mean_K_per_W": 0.2,
+                "delta_R_eff_target_std_K_per_W": 0.1,
+            }
+        ).eval()
+        model_input = torch.randn(2, 4, 16, 16)
+        metadata = torch.randn(2, 3)
+        raw_total_power = torch.tensor([11.0, 37.0], dtype=torch.float32)
+        with torch.no_grad():
+            outputs = evaluator.call_model(
+                model,
+                model_input,
+                metadata,
+                None,
+                conditioned=True,
+                graph_enabled=False,
+                total_power_W=raw_total_power,
+            )
+        torch.testing.assert_close(
+            outputs["mean_rise"],
+            raw_total_power * outputs["delta_R_eff"],
+        )
+        source_base = torch.randn(2, 16, 16) + 350.0
+        reconstructed = evaluator.reconstruct_decomposed_temperature(
+            outputs,
+            torch.tensor([318.15, 318.15]),
+            source_base,
+            mean_head_mode="residual_resistance",
+        )
+        expected = (
+            source_base
+            + raw_total_power[:, None, None] * outputs["delta_R_eff"][:, None, None]
+            + outputs["centered_field"]
+        )
+        torch.testing.assert_close(reconstructed, expected)
+        self.assertTrue(torch.isfinite(reconstructed).all())
+
+    def test_residual_fno_missing_or_invalid_total_power_fails_clearly(self) -> None:
+        model = build_model(
+            {
+                "architecture": "fno2d_residual_decomposed_conditioned",
+                "input_channels": 2,
+                "metadata_dim": 2,
+                "metadata_hidden_dim": 4,
+                "metadata_embedding_dim": 4,
+                "fno_width": 4,
+                "fno_layers": 1,
+                "fno_modes_x": 2,
+                "fno_modes_y": 2,
+                "fno_projection_channels": 4,
+            }
+        )
+        x = torch.randn(2, 2, 8, 8)
+        metadata = torch.randn(2, 2)
+        with self.assertRaisesRegex(ValueError, r"raw batch\['total_power_W'\]"):
+            evaluator.call_model(
+                model,
+                x,
+                metadata,
+                None,
+                conditioned=True,
+                graph_enabled=False,
+            )
+        with self.assertRaisesRegex(ValueError, "strictly positive"):
+            evaluator.call_model(
+                model,
+                x,
+                metadata,
+                None,
+                conditioned=True,
+                graph_enabled=False,
+                total_power_W=torch.tensor([1.0, 0.0]),
+            )
+
+    def test_direct_fno_and_canonical_residual_cnn_dispatch_remain_compatible(self) -> None:
+        direct = DirectTemperatureFNO2d(
+            input_channels=3,
+            metadata_dim=2,
+            metadata_hidden_dim=4,
+            metadata_embedding_dim=4,
+            width=4,
+            layers=1,
+            modes_x=2,
+            modes_y=2,
+            projection_channels=4,
+        ).eval()
+        x = torch.randn(2, 3, 8, 8)
+        metadata = torch.randn(2, 2)
+        with torch.no_grad():
+            direct_output = evaluator.call_model(
+                direct,
+                x,
+                metadata,
+                None,
+                conditioned=True,
+                graph_enabled=False,
+            )
+        self.assertEqual(tuple(direct_output.shape), (2, 1, 8, 8))
+
+        canonical_cnn = build_model(
+            {
+                "architecture": "miniunet_refine_conditioned_decomposed_feature_fusion",
+                "input_channels": 6,
+                "output_channels": 1,
+                "base_channels": 4,
+                "depth": 3,
+                "refine_channels": 4,
+                "refine_blocks": 1,
+                "refinement_channel_indices": [0, 1],
+                "refinement_channel_names": ["power", "occupancy"],
+                "metadata_dim": 3,
+                "metadata_hidden_dim": 4,
+                "metadata_embedding_dim": 4,
+                "physics_input_mode": "source_superposition_v1",
+                "global_branch_channel_indices": [0, 1, 5],
+                "global_branch_channel_names": ["power", "occupancy", "source_base"],
+                "global_hidden_channels": 4,
+                "global_pool_size": 8,
+                "global_context_blocks": 1,
+                "mean_head_mode": "residual_resistance",
+                "delta_R_eff_target_mean_K_per_W": 0.1,
+                "delta_R_eff_target_std_K_per_W": 0.2,
+            }
+        ).eval()
+        power = torch.tensor([5.0, 9.0])
+        with torch.no_grad():
+            cnn_output = evaluator.call_model(
+                canonical_cnn,
+                torch.randn(2, 6, 64, 64),
+                torch.randn(2, 3),
+                None,
+                conditioned=True,
+                graph_enabled=False,
+                total_power_W=power,
+            )
+        torch.testing.assert_close(
+            cnn_output["mean_rise"],
+            power * cnn_output["delta_R_eff"],
+        )
+
     def test_prediction_mode_validation(self) -> None:
         trainer.validate_prediction_mode(
             "direct_temperature_fno",

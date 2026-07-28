@@ -1286,6 +1286,16 @@ def call_model(
             kwargs["total_power_W"] = total_power_W
         return model(model_input, metadata_input, graph_batch, **kwargs)
     if conditioned:
+        if getattr(model, "architecture", "") == RESIDUAL_FNO_ARCHITECTURE:
+            total_power_W = validate_residual_fno_total_power(
+                total_power_W,
+                model_input=model_input,
+            )
+            return model(
+                model_input,
+                metadata_input,
+                total_power_W=total_power_W,
+            )
         if getattr(model, "architecture", "") == "miniunet_refine_conditioned_decomposed_feature_fusion":
             return model(
                 model_input,
@@ -1303,6 +1313,63 @@ def call_model(
             )
         return model(model_input, metadata_input)
     return model(model_input)
+
+
+def validate_residual_fno_total_power(
+    total_power_W: torch.Tensor | None,
+    *,
+    model_input: torch.Tensor,
+) -> torch.Tensor:
+    if total_power_W is None:
+        raise ValueError(
+            "residual FNO evaluation requires raw batch['total_power_W']; "
+            "it must not be inferred from normalized metadata or targets"
+        )
+    if not torch.is_tensor(total_power_W):
+        raise TypeError(
+            "residual FNO total_power_W must be a tensor from batch['total_power_W']"
+        )
+    batch_size = int(model_input.shape[0])
+    if total_power_W.ndim not in {1, 2} or (
+        total_power_W.ndim == 2 and int(total_power_W.shape[1]) != 1
+    ):
+        raise ValueError(
+            "residual FNO total_power_W must have shape [B] or [B,1], "
+            f"got {tuple(total_power_W.shape)}"
+        )
+    if int(total_power_W.numel()) != batch_size:
+        raise ValueError(
+            "residual FNO total_power_W batch size mismatch: "
+            f"model_input batch={batch_size}, total_power_W shape={tuple(total_power_W.shape)}"
+        )
+    if total_power_W.device != model_input.device:
+        raise ValueError(
+            "residual FNO total_power_W device mismatch: "
+            f"model_input={model_input.device}, total_power_W={total_power_W.device}"
+        )
+    if not total_power_W.is_floating_point():
+        raise TypeError(
+            f"residual FNO total_power_W must be floating point, got {total_power_W.dtype}"
+        )
+    if total_power_W.dtype != torch.float32:
+        raise TypeError(
+            "residual FNO evaluation expects the same float32 total_power_W used "
+            f"during training, got {total_power_W.dtype}"
+        )
+    if not torch.isfinite(total_power_W).all():
+        bad = torch.nonzero(~torch.isfinite(total_power_W), as_tuple=False)
+        raise ValueError(
+            "residual FNO total_power_W contains non-finite values; "
+            f"first bad index={bad[0].tolist() if bad.numel() else []}"
+        )
+    if torch.any(total_power_W <= 0.0):
+        bad = torch.nonzero(total_power_W <= 0.0, as_tuple=False)
+        raise ValueError(
+            "residual FNO total_power_W must be strictly positive under the "
+            "canonical Benchmark v2 dataset semantics; "
+            f"first bad index={bad[0].tolist() if bad.numel() else []}"
+        )
+    return total_power_W
 
 
 def append_gate_rows(
