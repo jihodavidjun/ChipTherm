@@ -9,6 +9,11 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+PROTOCOLS = (
+    "known_family_sample_test",
+    "primary_validation_families",
+    "primary_test_families",
+)
 
 
 def main() -> int:
@@ -23,6 +28,16 @@ def main() -> int:
     parser.add_argument("--profile-components", action="store_true")
     parser.add_argument("--save-predictions", action="store_true")
     parser.add_argument("--error-analysis", action="store_true")
+    parser.add_argument(
+        "--protocols",
+        nargs="+",
+        choices=PROTOCOLS,
+        default=list(PROTOCOLS),
+        help=(
+            "Immutable evaluation protocols to run. Defaults to all three for backward "
+            "compatibility; sensitivity selection should request known-family and validation only."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     if args.data_root is None:
@@ -34,7 +49,8 @@ def main() -> int:
         "primary_validation_families": index_root / "family_split/val_index.csv",
         "primary_test_families": index_root / "family_split/test_index.csv",
     }
-    for name, index in evaluations.items():
+    for name in args.protocols:
+        index = evaluations[name]
         command = [
             sys.executable,
             "scripts/evaluate_residual_cnn.py",
