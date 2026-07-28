@@ -81,6 +81,12 @@ SAMPLE_COLUMNS = [
     "mean_bias_removed_rmse_K",
 ]
 
+RESIDUAL_OPERATOR_ARCHITECTURES = {
+    "fno2d_residual_decomposed_conditioned",
+    "ufno2d_residual_decomposed_conditioned",
+    "sau_fno2d_residual_decomposed_conditioned",
+}
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Analyze residual CNN error modes for ChipTherm.")
@@ -192,6 +198,7 @@ def architecture_info(model_config: dict[str, Any]) -> dict[str, Any]:
             "miniunet_refine_conditioned_decomposed_feature_fusion_graph",
             "miniunet_refine_conditioned_decomposed_pairwise",
             "miniunet_refine_conditioned_decomposed_pairwise_basis",
+            *RESIDUAL_OPERATOR_ARCHITECTURES,
         },
         "decomposed": architecture in {
             "miniunet_refine_decomposed",
@@ -204,6 +211,7 @@ def architecture_info(model_config: dict[str, Any]) -> dict[str, Any]:
             "miniunet_refine_conditioned_decomposed_feature_fusion_graph",
             "miniunet_refine_conditioned_decomposed_pairwise",
             "miniunet_refine_conditioned_decomposed_pairwise_basis",
+            *RESIDUAL_OPERATOR_ARCHITECTURES,
         },
         "graph_enabled": architecture in {
             "miniunet_refine_conditioned_decomposed_graph",

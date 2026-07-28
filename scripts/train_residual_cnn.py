@@ -222,11 +222,14 @@ DIRECT_FNO_ARCHITECTURE = "fno2d_direct_conditioned"
 RESIDUAL_FNO_ARCHITECTURE = "fno2d_residual_decomposed_conditioned"
 DIRECT_UFNO_ARCHITECTURE = "ufno2d_direct_conditioned"
 RESIDUAL_UFNO_ARCHITECTURE = "ufno2d_residual_decomposed_conditioned"
+DIRECT_SAU_FNO_ARCHITECTURE = "sau_fno2d_direct_conditioned"
+RESIDUAL_SAU_FNO_ARCHITECTURE = "sau_fno2d_residual_decomposed_conditioned"
 DIRECT_PREDICTION_MODES = {
     "direct_temperature",
     "direct_temperature_source_conditioned",
     "direct_temperature_fno",
     "direct_temperature_ufno",
+    "direct_temperature_sau_fno",
 }
 
 
@@ -241,6 +244,10 @@ def resolve_prediction_mode(requested: str, architecture: str) -> str:
         return "direct_temperature_ufno"
     if architecture == RESIDUAL_UFNO_ARCHITECTURE:
         return "residual_decomposed_ufno"
+    if architecture == DIRECT_SAU_FNO_ARCHITECTURE:
+        return "direct_temperature_sau_fno"
+    if architecture == RESIDUAL_SAU_FNO_ARCHITECTURE:
+        return "residual_decomposed_sau_fno"
     if architecture == DIRECT_ARCHITECTURE:
         return "direct_temperature"
     if "decomposed" in architecture:
@@ -260,7 +267,11 @@ def validate_prediction_mode(
             else (
                 DIRECT_UFNO_ARCHITECTURE
                 if prediction_mode == "direct_temperature_ufno"
-                else DIRECT_ARCHITECTURE
+                else (
+                    DIRECT_SAU_FNO_ARCHITECTURE
+                    if prediction_mode == "direct_temperature_sau_fno"
+                    else DIRECT_ARCHITECTURE
+                )
             )
         )
         if architecture != expected_architecture:
@@ -281,6 +292,7 @@ def validate_prediction_mode(
         DIRECT_ARCHITECTURE,
         DIRECT_FNO_ARCHITECTURE,
         DIRECT_UFNO_ARCHITECTURE,
+        DIRECT_SAU_FNO_ARCHITECTURE,
     }:
         raise ValueError(f"architecture={architecture} requires its direct prediction mode")
     if architecture == RESIDUAL_FNO_ARCHITECTURE:
@@ -303,6 +315,18 @@ def validate_prediction_mode(
         if physics_input_mode != "source_superposition_v1":
             raise ValueError(
                 "residual_decomposed_ufno requires "
+                "physics_input_mode=source_superposition_v1"
+            )
+        return
+    if architecture == RESIDUAL_SAU_FNO_ARCHITECTURE:
+        if prediction_mode != "residual_decomposed_sau_fno":
+            raise ValueError(
+                f"architecture={RESIDUAL_SAU_FNO_ARCHITECTURE} requires "
+                "prediction_mode=residual_decomposed_sau_fno"
+            )
+        if physics_input_mode != "source_superposition_v1":
+            raise ValueError(
+                "residual_decomposed_sau_fno requires "
                 "physics_input_mode=source_superposition_v1"
             )
         return
@@ -342,6 +366,8 @@ def main() -> int:
             RESIDUAL_FNO_ARCHITECTURE,
             DIRECT_UFNO_ARCHITECTURE,
             RESIDUAL_UFNO_ARCHITECTURE,
+            DIRECT_SAU_FNO_ARCHITECTURE,
+            RESIDUAL_SAU_FNO_ARCHITECTURE,
         ],
     )
     parser.add_argument("--refine-channels", default=32, type=int)
@@ -362,6 +388,8 @@ def main() -> int:
             "residual_decomposed_fno",
             "direct_temperature_ufno",
             "residual_decomposed_ufno",
+            "direct_temperature_sau_fno",
+            "residual_decomposed_sau_fno",
         ],
         help="Checkpoint-visible output semantics. auto preserves legacy architecture behavior.",
     )
@@ -400,6 +428,12 @@ def main() -> int:
         default="published_mixed",
         choices=["published_mixed", "none"],
     )
+    parser.add_argument(
+        "--sau-fno-adaptation-profile",
+        default="sau_fno_paper_adapted",
+        choices=["sau_fno_paper_adapted"],
+    )
+    parser.add_argument("--sau-attention-dim", default=32, type=int)
     parser.add_argument(
         "--direct-target-normalization",
         default="none",
@@ -519,7 +553,12 @@ def main() -> int:
             setattr(args, argument, int(fno_profile[profile_key]))
     if (
         args.model_architecture
-        in {DIRECT_UFNO_ARCHITECTURE, RESIDUAL_UFNO_ARCHITECTURE}
+        in {
+            DIRECT_UFNO_ARCHITECTURE,
+            RESIDUAL_UFNO_ARCHITECTURE,
+            DIRECT_SAU_FNO_ARCHITECTURE,
+            RESIDUAL_SAU_FNO_ARCHITECTURE,
+        }
         and fno_layers_was_default
     ):
         args.fno_layers = 6
@@ -585,12 +624,19 @@ def main() -> int:
     is_ufno_arch = args.model_architecture in {
         DIRECT_UFNO_ARCHITECTURE,
         RESIDUAL_UFNO_ARCHITECTURE,
+        DIRECT_SAU_FNO_ARCHITECTURE,
+        RESIDUAL_SAU_FNO_ARCHITECTURE,
+    }
+    is_sau_fno_arch = args.model_architecture in {
+        DIRECT_SAU_FNO_ARCHITECTURE,
+        RESIDUAL_SAU_FNO_ARCHITECTURE,
     }
     is_operator_arch = is_fno_arch or is_ufno_arch
     is_direct_arch = args.model_architecture in {
         DIRECT_ARCHITECTURE,
         DIRECT_FNO_ARCHITECTURE,
         DIRECT_UFNO_ARCHITECTURE,
+        DIRECT_SAU_FNO_ARCHITECTURE,
     }
     is_generic_graph_arch = args.model_architecture in {
         "miniunet_refine_conditioned_decomposed_graph",
@@ -616,6 +662,8 @@ def main() -> int:
         RESIDUAL_FNO_ARCHITECTURE,
         DIRECT_UFNO_ARCHITECTURE,
         RESIDUAL_UFNO_ARCHITECTURE,
+        DIRECT_SAU_FNO_ARCHITECTURE,
+        RESIDUAL_SAU_FNO_ARCHITECTURE,
     }
     is_decomposed_arch = args.model_architecture in {
         "miniunet_refine_decomposed",
@@ -630,6 +678,7 @@ def main() -> int:
         "miniunet_refine_conditioned_decomposed_pairwise_basis",
         RESIDUAL_FNO_ARCHITECTURE,
         RESIDUAL_UFNO_ARCHITECTURE,
+        RESIDUAL_SAU_FNO_ARCHITECTURE,
     }
     if args.physics_input == "gated_v1" and not is_conditioned_arch:
         raise SystemExit("--physics-input gated_v1 requires a metadata-conditioned architecture")
@@ -677,6 +726,10 @@ def main() -> int:
             raise SystemExit("--ufno-domain-padding must be non-negative")
         if not 0.0 <= args.ufno_unet_dropout < 1.0:
             raise SystemExit("--ufno-unet-dropout must be in [0, 1)")
+    if is_sau_fno_arch and args.sau_attention_dim != args.fno_width:
+        raise SystemExit(
+            "sau_fno_paper_adapted requires --sau-attention-dim to equal --fno-width"
+        )
     if args.model_architecture == DIRECT_UFNO_ARCHITECTURE:
         if args.direct_target_normalization != "train_standard":
             raise SystemExit(
@@ -692,6 +745,27 @@ def main() -> int:
         if args.physics_input != "source_superposition_v1":
             raise SystemExit(
                 "residual_decomposed_ufno requires "
+                "--physics-input source_superposition_v1"
+            )
+    if args.model_architecture == DIRECT_SAU_FNO_ARCHITECTURE:
+        if args.direct_target_normalization != "train_standard":
+            raise SystemExit(
+                "direct_temperature_sau_fno requires "
+                "--direct-target-normalization train_standard"
+            )
+        if args.physics_input != "none":
+            raise SystemExit(
+                "direct_temperature_sau_fno must exclude the source/base input"
+            )
+    if args.model_architecture == RESIDUAL_SAU_FNO_ARCHITECTURE:
+        if args.mean_head_mode != "residual_resistance":
+            raise SystemExit(
+                "residual_decomposed_sau_fno requires "
+                "--mean-head-mode residual_resistance"
+            )
+        if args.physics_input != "source_superposition_v1":
+            raise SystemExit(
+                "residual_decomposed_sau_fno requires "
                 "--physics-input source_superposition_v1"
             )
 
@@ -818,6 +892,23 @@ def main() -> int:
                     "ufno_domain_padding": args.ufno_domain_padding,
                     "ufno_padding_mode": args.ufno_padding_mode,
                     "ufno_branch_fusion": "add",
+                }
+            )
+        if is_sau_fno_arch:
+            model_config.update(
+                {
+                    "sau_fno_adaptation_profile": args.sau_fno_adaptation_profile,
+                    "sau_attention_enabled": True,
+                    "sau_attention_dim": args.sau_attention_dim,
+                    "sau_attention_placement": (
+                        "after_final_ufourier_activation_after_padding_crop"
+                    ),
+                    "sau_attention_type": (
+                        "single_head_unscaled_spatial_self_attention"
+                    ),
+                    "sau_number_of_heads": 1,
+                    "sau_softmax_axis": "key_token_axis_-1",
+                    "sau_fusion_rule": "softmax(Q @ K^T, dim=-1) @ W_h(V)",
                 }
             )
     elif args.model_architecture != "miniunet":
@@ -957,6 +1048,8 @@ def main() -> int:
         "global_blocks": args.global_blocks,
         "global_pool_size": args.global_pool_size,
         "global_branch_channels": args.global_branch_channels,
+        "sau_fno_adaptation_profile": args.sau_fno_adaptation_profile,
+        "sau_attention_dim": args.sau_attention_dim,
         "channel_routing_mode": args.channel_routing_mode,
         "pairwise_hidden_dim": args.pairwise_hidden_dim,
         "pairwise_layers": args.pairwise_layers,

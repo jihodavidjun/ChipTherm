@@ -40,11 +40,14 @@ DIRECT_FNO_ARCHITECTURE = "fno2d_direct_conditioned"
 RESIDUAL_FNO_ARCHITECTURE = "fno2d_residual_decomposed_conditioned"
 DIRECT_UFNO_ARCHITECTURE = "ufno2d_direct_conditioned"
 RESIDUAL_UFNO_ARCHITECTURE = "ufno2d_residual_decomposed_conditioned"
+DIRECT_SAU_FNO_ARCHITECTURE = "sau_fno2d_direct_conditioned"
+RESIDUAL_SAU_FNO_ARCHITECTURE = "sau_fno2d_residual_decomposed_conditioned"
 DIRECT_PREDICTION_MODES = {
     "direct_temperature",
     "direct_temperature_source_conditioned",
     "direct_temperature_fno",
     "direct_temperature_ufno",
+    "direct_temperature_sau_fno",
 }
 
 
@@ -68,6 +71,7 @@ def checkpoint_prediction_mode(checkpoint: dict[str, Any], architecture: str) ->
         DIRECT_ARCHITECTURE,
         DIRECT_FNO_ARCHITECTURE,
         DIRECT_UFNO_ARCHITECTURE,
+        DIRECT_SAU_FNO_ARCHITECTURE,
     }:
         raise ValueError("direct-temperature checkpoint is missing explicit prediction_mode")
     return "residual_decomposed" if "decomposed" in architecture else "residual"
@@ -107,6 +111,7 @@ def validate_checkpoint_prediction_mode(
         DIRECT_ARCHITECTURE,
         DIRECT_FNO_ARCHITECTURE,
         DIRECT_UFNO_ARCHITECTURE,
+        DIRECT_SAU_FNO_ARCHITECTURE,
     }
     if direct != direct_architecture:
         raise ValueError(
@@ -126,6 +131,12 @@ def validate_checkpoint_prediction_mode(
             raise ValueError(
                 "direct_temperature_ufno requires ufno2d_direct_conditioned with "
                 "physics_input_mode=none"
+            )
+    if prediction_mode == "direct_temperature_sau_fno":
+        if architecture != DIRECT_SAU_FNO_ARCHITECTURE or physics_input_mode != "none":
+            raise ValueError(
+                "direct_temperature_sau_fno requires "
+                "sau_fno2d_direct_conditioned with physics_input_mode=none"
             )
     if (
         prediction_mode == "direct_temperature_source_conditioned"
@@ -154,6 +165,17 @@ def validate_checkpoint_prediction_mode(
         if physics_input_mode != "source_superposition_v1":
             raise ValueError(
                 "residual_decomposed_ufno requires "
+                "physics_input_mode=source_superposition_v1"
+            )
+    if architecture == RESIDUAL_SAU_FNO_ARCHITECTURE:
+        if prediction_mode != "residual_decomposed_sau_fno":
+            raise ValueError(
+                "sau_fno2d_residual_decomposed_conditioned requires "
+                "prediction_mode=residual_decomposed_sau_fno"
+            )
+        if physics_input_mode != "source_superposition_v1":
+            raise ValueError(
+                "residual_decomposed_sau_fno requires "
                 "physics_input_mode=source_superposition_v1"
             )
 
@@ -217,6 +239,7 @@ def main() -> int:
         "miniunet_refine_conditioned_decomposed_pairwise_basis",
         RESIDUAL_FNO_ARCHITECTURE,
         RESIDUAL_UFNO_ARCHITECTURE,
+        RESIDUAL_SAU_FNO_ARCHITECTURE,
     }
     conditioned = architecture in {
         "miniunet_refine_conditioned",
@@ -234,6 +257,8 @@ def main() -> int:
         RESIDUAL_FNO_ARCHITECTURE,
         DIRECT_UFNO_ARCHITECTURE,
         RESIDUAL_UFNO_ARCHITECTURE,
+        DIRECT_SAU_FNO_ARCHITECTURE,
+        RESIDUAL_SAU_FNO_ARCHITECTURE,
     }
     graph_stats = checkpoint["model_config"].get("graph_normalization")
     physics_input_mode = str(checkpoint["model_config"].get("physics_input_mode", "v1"))
@@ -435,20 +460,35 @@ def main() -> int:
         "improvement_vs_physics_baseline": improvement,
     }
     component_profile = None
-    if args.profile_components and graph_enabled:
-        component_profile = profile_components(
-            model,
-            loader,
-            stats,
-            device,
-            conditioned=conditioned,
-            physics_input_mode=physics_input_mode,
-            mean_head_mode=mean_head_mode,
-            graph_stats=graph_stats,
-            graph_correction_scale=args.graph_correction_scale,
-            global_correction_scale=args.global_correction_scale,
-            disabled_fusion_scales=disabled_fusion_scales,
-        )
+    if args.profile_components:
+        if graph_enabled:
+            component_profile = profile_components(
+                model,
+                loader,
+                stats,
+                device,
+                conditioned=conditioned,
+                physics_input_mode=physics_input_mode,
+                mean_head_mode=mean_head_mode,
+                graph_stats=graph_stats,
+                graph_correction_scale=args.graph_correction_scale,
+                global_correction_scale=args.global_correction_scale,
+                disabled_fusion_scales=disabled_fusion_scales,
+            )
+        elif hasattr(model, "forward_profile"):
+            component_profile = profile_operator_components(
+                model,
+                loader,
+                stats,
+                device,
+                conditioned=conditioned,
+                physics_input_mode=physics_input_mode,
+                mean_head_mode=mean_head_mode,
+            )
+        else:
+            component_profile = {
+                "error": "checkpoint model does not expose forward_profile"
+            }
         payload["component_runtime"] = component_profile
         (out_dir / "component_runtime.json").write_text(json.dumps(component_profile, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     (out_dir / "metrics.json").write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -1276,6 +1316,85 @@ def summarize_times(values: list[float]) -> dict[str, float]:
     }
 
 
+@torch.no_grad()
+def profile_operator_components(
+    model: nn.Module,
+    loader: DataLoader[dict[str, Any]],
+    stats: NormalizationStats,
+    device: torch.device,
+    *,
+    conditioned: bool,
+    physics_input_mode: str,
+    mean_head_mode: str,
+    warmup_batches: int = 2,
+    profile_batches: int = 20,
+) -> dict[str, Any]:
+    timing_values: dict[str, list[float]] = defaultdict(list)
+    measured = 0
+
+    def sync() -> None:
+        synchronize(device)
+
+    for batch_index, batch in enumerate(loader):
+        sync()
+        prep_start = time.perf_counter()
+        x = batch["x"].to(device, non_blocking=True)
+        physics = batch["physics"].to(device, non_blocking=True)
+        physics_v1 = batch.get("physics_v1")
+        if physics_v1 is not None:
+            physics_v1 = physics_v1.to(device, non_blocking=True)
+        metadata_input = build_metadata_input(batch.get("metadata_vector"), stats)
+        if conditioned and metadata_input is None:
+            raise ValueError("conditioned operator model requires metadata")
+        if metadata_input is not None:
+            metadata_input = metadata_input.to(device, non_blocking=True)
+        model_input = build_model_input(
+            x,
+            physics,
+            stats,
+            physics_input_mode=physics_input_mode,
+            physics_v1=physics_v1,
+        )
+        total_power = batch["total_power_W"].to(
+            device, non_blocking=True
+        ).float()
+        sync()
+        prep_time = time.perf_counter() - prep_start
+
+        profile_kwargs: dict[str, Any] = {"synchronize": sync}
+        if mean_head_mode == "residual_resistance":
+            profile_kwargs["total_power_W"] = validate_residual_fno_total_power(
+                total_power, model_input=model_input
+            )
+        sync()
+        forward_start = time.perf_counter()
+        _output, component_times = model.forward_profile(
+            model_input, metadata_input, **profile_kwargs
+        )
+        sync()
+        total_time = time.perf_counter() - forward_start
+        if batch_index >= warmup_batches:
+            timing_values["batch_preparation_s"].append(prep_time)
+            timing_values["total_forward_s"].append(total_time)
+            for key, value in component_times.items():
+                timing_values[key].append(float(value))
+            measured += 1
+        if measured >= profile_batches:
+            break
+    return {
+        "warmup_batches": warmup_batches,
+        "profiled_batches": measured,
+        "timings": {
+            key: summarize_times(values)
+            for key, values in sorted(timing_values.items())
+        },
+        "profile_scope": (
+            "batch preparation, unchanged U-FNO backbone, exact SAU attention, "
+            "and direct projection or residual centered/mean heads"
+        ),
+    }
+
+
 def prepare_graph_batch(
     batch: dict[str, Any],
     graph_enabled: bool,
@@ -1320,6 +1439,7 @@ def call_model(
         if getattr(model, "architecture", "") in {
             RESIDUAL_FNO_ARCHITECTURE,
             RESIDUAL_UFNO_ARCHITECTURE,
+            RESIDUAL_SAU_FNO_ARCHITECTURE,
         }:
             total_power_W = validate_residual_fno_total_power(
                 total_power_W,

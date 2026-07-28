@@ -23,6 +23,8 @@ MODEL_ARGUMENTS = {
     "residual_fno": "residual_fno_root",
     "direct_ufno": "direct_ufno_root",
     "residual_ufno": "residual_ufno_root",
+    "direct_sau_fno": "direct_sau_fno_root",
+    "residual_sau_fno": "residual_sau_fno_root",
 }
 
 
@@ -73,6 +75,7 @@ def enrich_effects(rows: list[dict[str, Any]]) -> None:
         formulation = str(row["formulation"])
         row["decomposition_gain_K"] = None
         row["local_multiscale_gain_K"] = None
+        row["attention_gain_K"] = None
         if formulation == "residual":
             direct = lookup.get((f"direct_{backbone}", protocol))
             if direct is not None and row.get("mae_K") is not None:
@@ -81,6 +84,10 @@ def enrich_effects(rows: list[dict[str, Any]]) -> None:
             plain = lookup.get((f"{formulation}_fno", protocol))
             if plain is not None and row.get("mae_K") is not None:
                 row["local_multiscale_gain_K"] = float(plain["mae_K"]) - float(row["mae_K"])
+        if backbone == "sau_fno":
+            ufno = lookup.get((f"{formulation}_ufno", protocol))
+            if ufno is not None and row.get("mae_K") is not None:
+                row["attention_gain_K"] = float(ufno["mae_K"]) - float(row["mae_K"])
 
 
 def mark_pareto(rows: list[dict[str, Any]]) -> None:
@@ -113,16 +120,17 @@ def write_report(path: Path, rows: list[dict[str, Any]]) -> None:
     lines = [
         "# Benchmark v2 Operator Comparison",
         "",
-        "Positive gains mean the residual formulation or U-Net augmentation reduced MAE.",
+        "Positive gains mean the residual formulation, U-Net augmentation, or attention reduced MAE.",
         "",
-        "| Model | Protocol | MAE K | RMSE K | Decomposition gain K | U-Net gain K | Params | Runtime ms | Pareto |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---|",
+        "| Model | Protocol | MAE K | RMSE K | Decomposition gain K | U-Net gain K | Attention gain K | Params | Runtime ms | Pareto |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
     for row in rows:
         lines.append(
             f"| {row['model']} | {row['protocol']} | {base.fmt(row.get('mae_K'))} | "
             f"{base.fmt(row.get('rmse_K'))} | {base.fmt(row.get('decomposition_gain_K'))} | "
             f"{base.fmt(row.get('local_multiscale_gain_K'))} | "
+            f"{base.fmt(row.get('attention_gain_K'))} | "
             f"{base.fmt_int(row.get('parameter_count'))} | "
             f"{base.fmt_ms(row.get('runtime_per_sample_s'))} | "
             f"{'yes' if row.get('pareto_accuracy_runtime') else 'no'} |"
@@ -134,6 +142,7 @@ def write_report(path: Path, rows: list[dict[str, Any]]) -> None:
             "",
             "- `decomposition_gain = direct_MAE - residual_MAE` for a matched backbone.",
             "- `U-Net gain = FNO_MAE - U-FNO_MAE` for a matched formulation.",
+            "- `attention gain = U-FNO_MAE - SAU-FNO_MAE` for a matched formulation.",
             "- Held-out primary-test metrics are descriptive only and are not used to select a model.",
         ]
     )

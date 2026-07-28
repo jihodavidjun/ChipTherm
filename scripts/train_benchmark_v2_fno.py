@@ -58,12 +58,28 @@ EXPERIMENTS = {
         "mean_head_mode": "residual_resistance",
         "target": "source_superposition_residual_K",
     },
+    "direct_sau_fno": {
+        "architecture": "sau_fno2d_direct_conditioned",
+        "prediction_mode": "direct_temperature_sau_fno",
+        "physics_input": "none",
+        "mean_head_mode": "direct_k",
+        "target": "absolute_temperature_K",
+    },
+    "residual_sau_fno": {
+        "architecture": "sau_fno2d_residual_decomposed_conditioned",
+        "prediction_mode": "residual_decomposed_sau_fno",
+        "physics_input": "source_superposition_v1",
+        "mean_head_mode": "residual_resistance",
+        "target": "source_superposition_residual_K",
+    },
 }
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Train a controlled Benchmark v2 direct or residual FNO/U-FNO."
+        description=(
+            "Train a controlled Benchmark v2 direct or residual FNO/U-FNO/SAU-FNO."
+        )
     )
     parser.add_argument("--experiment", required=True, choices=sorted(EXPERIMENTS))
     parser.add_argument("--data-root", default=os.environ.get("CHIPTHERM_V2_DATA_ROOT"), type=Path)
@@ -216,7 +232,10 @@ def main() -> int:
         "--seed",
         str(args.seed),
     ]
-    if "ufno" in expected["architecture"]:
+    if (
+        "ufno" in expected["architecture"]
+        or "sau_fno" in expected["architecture"]
+    ):
         command.extend(
             [
                 "--ufno-adaptation-profile",
@@ -231,6 +250,15 @@ def main() -> int:
                 str(config["ufno_domain_padding"]),
                 "--ufno-padding-mode",
                 str(config["ufno_padding_mode"]),
+            ]
+        )
+    if "sau_fno" in expected["architecture"]:
+        command.extend(
+            [
+                "--sau-fno-adaptation-profile",
+                str(config["sau_fno_adaptation_profile"]),
+                "--sau-attention-dim",
+                str(config["sau_attention_dim"]),
             ]
         )
     if args.experiment.startswith("direct"):
@@ -278,6 +306,7 @@ def validate_config(config: dict[str, Any], expected: dict[str, str]) -> None:
     if expected["prediction_mode"] in {
         "direct_temperature_fno",
         "direct_temperature_ufno",
+        "direct_temperature_sau_fno",
     }:
         if config.get("direct_target_normalization") != "train_standard":
             raise ValueError("direct operator model requires train-only target standardization")
@@ -290,7 +319,10 @@ def validate_config(config: dict[str, Any], expected: dict[str, str]) -> None:
     ):
         if int(config.get(key, 0)) <= 0:
             raise ValueError(f"{key} must be positive")
-    if "ufno" in expected["architecture"]:
+    if (
+        "ufno" in expected["architecture"]
+        or "sau_fno" in expected["architecture"]
+    ):
         required_ufno = {
             "ufno_adaptation_profile": "ufno_published_adapted",
             "ufno_unet_depth": 3,
@@ -313,6 +345,35 @@ def validate_config(config: dict[str, Any], expected: dict[str, str]) -> None:
                 "actual": config.get("fno_layers"),
             }
         if expected["prediction_mode"] == "residual_decomposed_ufno":
+            for key in ("mean_correction_sign", "centered_correction_sign"):
+                if int(config.get(key, 0)) != 1:
+                    mismatches[key] = {
+                        "expected": 1,
+                        "actual": config.get(key),
+                    }
+        if "sau_fno" in expected["architecture"]:
+            required_sau = {
+                "sau_fno_adaptation_profile": "sau_fno_paper_adapted",
+                "sau_attention_enabled": True,
+                "sau_attention_placement": "after_final_ufourier_block",
+                "sau_attention_type": "single_head_unscaled_spatial_self_attention",
+                "sau_number_of_heads": 1,
+                "sau_softmax_axis": "key_token_axis_-1",
+            }
+            for key, value in required_sau.items():
+                if config.get(key) != value:
+                    mismatches[key] = {
+                        "expected": value,
+                        "actual": config.get(key),
+                    }
+            if int(config.get("sau_attention_dim", 0)) != int(
+                config.get("fno_width", -1)
+            ):
+                mismatches["sau_attention_dim"] = {
+                    "expected": config.get("fno_width"),
+                    "actual": config.get("sau_attention_dim"),
+                }
+        if expected["prediction_mode"] == "residual_decomposed_sau_fno":
             for key in ("mean_correction_sign", "centered_correction_sign"):
                 if int(config.get(key, 0)) != 1:
                     mismatches[key] = {

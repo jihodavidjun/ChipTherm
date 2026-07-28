@@ -35,12 +35,16 @@ class OperatorComparisonTests(unittest.TestCase):
             "residual_fno": "residual_decomposed_fno",
             "direct_ufno": "direct_temperature_ufno",
             "residual_ufno": "residual_decomposed_ufno",
+            "direct_sau_fno": "direct_temperature_sau_fno",
+            "residual_sau_fno": "residual_decomposed_sau_fno",
         }
         maes = {
             "direct_fno": 2.0,
             "residual_fno": 1.5,
             "direct_ufno": 1.8,
             "residual_ufno": 1.2,
+            "direct_sau_fno": 1.7,
+            "residual_sau_fno": 1.1,
         }
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -83,8 +87,8 @@ class OperatorComparisonTests(unittest.TestCase):
                             }
                         )
             headline, families = comparison.aggregate_comparison(roots)
-            self.assertEqual(len(headline), 12)
-            self.assertEqual(len(families), 12)
+            self.assertEqual(len(headline), 18)
+            self.assertEqual(len(families), 18)
             self.assertTrue(all(row["mae_K"] is not None for row in families))
             operator.enrich_effects(headline)
             lookup = {
@@ -99,6 +103,12 @@ class OperatorComparisonTests(unittest.TestCase):
             )
             self.assertAlmostEqual(
                 lookup[("residual_ufno", test)]["local_multiscale_gain_K"], 0.3
+            )
+            self.assertAlmostEqual(
+                lookup[("direct_sau_fno", test)]["attention_gain_K"], 0.1
+            )
+            self.assertAlmostEqual(
+                lookup[("residual_sau_fno", test)]["attention_gain_K"], 0.1
             )
 
     def test_missing_learned_family_metric_fails_clearly(self) -> None:

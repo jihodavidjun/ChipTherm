@@ -2456,6 +2456,83 @@ class DecomposedMiniUNetWithPairwiseBasisOperator(nn.Module):
 def build_model(config: dict[str, object]) -> nn.Module:
     architecture = str(config.get("architecture") or config.get("name") or "miniunet").lower()
     if architecture in {
+        "sau_fno2d_direct_conditioned",
+        "sau_fno2d_residual_decomposed_conditioned",
+    }:
+        from chiptherm.ml.sau_fno_models import (
+            DIRECT_SAU_FNO_ARCHITECTURE,
+            ConditionedDirectSAUFNO2d,
+            ConditionedResidualDecomposedSAUFNO2d,
+        )
+
+        common = {
+            "input_channels": int(
+                config.get(
+                    "input_channels",
+                    33 if architecture == DIRECT_SAU_FNO_ARCHITECTURE else 34,
+                )
+            ),
+            "output_channels": int(config.get("output_channels", 1)),
+            "metadata_dim": int(config.get("metadata_dim", 15)),
+            "metadata_hidden_dim": int(config.get("metadata_hidden_dim", 64)),
+            "metadata_embedding_dim": int(config.get("metadata_embedding_dim", 64)),
+            "width": int(config.get("fno_width", config.get("width", 32))),
+            "layers": int(config.get("fno_layers", config.get("layers", 6))),
+            "modes_x": int(config.get("fno_modes_x", config.get("modes_x", 12))),
+            "modes_y": int(config.get("fno_modes_y", config.get("modes_y", 12))),
+            "activation": str(
+                config.get("fno_activation", config.get("activation", "gelu"))
+            ),
+            "projection_channels": int(
+                config.get(
+                    "fno_projection_channels",
+                    config.get("projection_channels", 64),
+                )
+            ),
+            "capacity_profile": str(config.get("fno_capacity_profile", "fno_small")),
+            "adaptation_profile": str(
+                config.get("sau_fno_adaptation_profile", "sau_fno_paper_adapted")
+            ),
+            "unet_branch_indices": tuple(
+                int(index)
+                for index in config.get("ufno_unet_branch_indices", (3, 4, 5))
+            ),
+            "unet_depth": int(config.get("ufno_unet_depth", 3)),
+            "unet_dropout": float(config.get("ufno_unet_dropout", 0.0)),
+            "domain_padding": int(config.get("ufno_domain_padding", 8)),
+            "padding_mode": str(config.get("ufno_padding_mode", "published_mixed")),
+            "attention_dim": int(
+                config.get(
+                    "sau_attention_dim",
+                    config.get("fno_width", config.get("width", 32)),
+                )
+            ),
+        }
+        if architecture == DIRECT_SAU_FNO_ARCHITECTURE:
+            return ConditionedDirectSAUFNO2d(
+                **common,
+                target_normalization_mode=str(
+                    config.get("target_normalization_mode", "train_standard")
+                ),
+                target_mean_K=float(config.get("target_mean_K", 0.0)),
+                target_std_K=float(config.get("target_std_K", 1.0)),
+            )
+        return ConditionedResidualDecomposedSAUFNO2d(
+            **common,
+            delta_R_eff_mean_K_per_W=float(
+                config.get(
+                    "delta_R_eff_target_mean_K_per_W",
+                    config.get("delta_R_eff_mean_K_per_W", 0.0),
+                )
+            ),
+            delta_R_eff_std_K_per_W=float(
+                config.get(
+                    "delta_R_eff_target_std_K_per_W",
+                    config.get("delta_R_eff_std_K_per_W", 1.0),
+                )
+            ),
+        )
+    if architecture in {
         "ufno2d_direct_conditioned",
         "ufno2d_residual_decomposed_conditioned",
     }:

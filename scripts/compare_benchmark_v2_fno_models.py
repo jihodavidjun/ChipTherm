@@ -21,9 +21,11 @@ MODEL_ARGUMENTS = {
     "direct_cnn": "direct_cnn_root",
     "direct_fno": "direct_fno_root",
     "direct_ufno": "direct_ufno_root",
+    "direct_sau_fno": "direct_sau_fno_root",
     "residual_cnn": "residual_cnn_root",
     "residual_fno": "residual_fno_root",
     "residual_ufno": "residual_ufno_root",
+    "residual_sau_fno": "residual_sau_fno_root",
 }
 
 
@@ -32,10 +34,12 @@ def main() -> int:
     parser.add_argument("--direct-cnn-root", type=Path)
     parser.add_argument("--direct-fno-root", type=Path)
     parser.add_argument("--direct-ufno-root", type=Path)
+    parser.add_argument("--direct-sau-fno-root", type=Path)
     parser.add_argument("--source-only-root", type=Path)
     parser.add_argument("--residual-cnn-root", type=Path)
     parser.add_argument("--residual-fno-root", type=Path)
     parser.add_argument("--residual-ufno-root", type=Path)
+    parser.add_argument("--residual-sau-fno-root", type=Path)
     parser.add_argument("--out-dir", required=True, type=Path)
     args = parser.parse_args()
     roots = {
@@ -72,9 +76,11 @@ def aggregate_comparison(
         "direct_cnn": {"direct_temperature", ""},
         "direct_fno": {"direct_temperature_fno"},
         "direct_ufno": {"direct_temperature_ufno"},
+        "direct_sau_fno": {"direct_temperature_sau_fno"},
         "residual_cnn": {"residual_decomposed", ""},
         "residual_fno": {"residual_decomposed_fno"},
         "residual_ufno": {"residual_decomposed_ufno"},
+        "residual_sau_fno": {"residual_decomposed_sau_fno"},
     }
     for model_name, root in roots.items():
         for protocol in PROTOCOLS:
@@ -91,9 +97,13 @@ def aggregate_comparison(
                 "model": model_name,
                 "formulation": "direct" if model_name.startswith("direct") else "residual",
                 "backbone": (
-                    "ufno"
-                    if model_name.endswith("ufno")
-                    else ("fno" if model_name.endswith("fno") else "cnn")
+                    "sau_fno"
+                    if model_name.endswith("sau_fno")
+                    else (
+                        "ufno"
+                        if model_name.endswith("ufno")
+                        else ("fno" if model_name.endswith("fno") else "cnn")
+                    )
                 ),
                 "protocol": protocol,
                 "num_samples": metrics.get("num_samples"),
