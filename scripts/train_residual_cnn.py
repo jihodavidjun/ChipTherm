@@ -220,10 +220,13 @@ def physics_input_channel_count(mode: str) -> int:
 DIRECT_ARCHITECTURE = "miniunet_refine_conditioned_direct_temperature_feature_fusion"
 DIRECT_FNO_ARCHITECTURE = "fno2d_direct_conditioned"
 RESIDUAL_FNO_ARCHITECTURE = "fno2d_residual_decomposed_conditioned"
+DIRECT_UFNO_ARCHITECTURE = "ufno2d_direct_conditioned"
+RESIDUAL_UFNO_ARCHITECTURE = "ufno2d_residual_decomposed_conditioned"
 DIRECT_PREDICTION_MODES = {
     "direct_temperature",
     "direct_temperature_source_conditioned",
     "direct_temperature_fno",
+    "direct_temperature_ufno",
 }
 
 
@@ -234,6 +237,10 @@ def resolve_prediction_mode(requested: str, architecture: str) -> str:
         return "direct_temperature_fno"
     if architecture == RESIDUAL_FNO_ARCHITECTURE:
         return "residual_decomposed_fno"
+    if architecture == DIRECT_UFNO_ARCHITECTURE:
+        return "direct_temperature_ufno"
+    if architecture == RESIDUAL_UFNO_ARCHITECTURE:
+        return "residual_decomposed_ufno"
     if architecture == DIRECT_ARCHITECTURE:
         return "direct_temperature"
     if "decomposed" in architecture:
@@ -250,7 +257,11 @@ def validate_prediction_mode(
         expected_architecture = (
             DIRECT_FNO_ARCHITECTURE
             if prediction_mode == "direct_temperature_fno"
-            else DIRECT_ARCHITECTURE
+            else (
+                DIRECT_UFNO_ARCHITECTURE
+                if prediction_mode == "direct_temperature_ufno"
+                else DIRECT_ARCHITECTURE
+            )
         )
         if architecture != expected_architecture:
             raise ValueError(
@@ -266,7 +277,11 @@ def validate_prediction_mode(
                 f"prediction_mode={prediction_mode} requires physics_input_mode={required_physics}"
             )
         return
-    if architecture in {DIRECT_ARCHITECTURE, DIRECT_FNO_ARCHITECTURE}:
+    if architecture in {
+        DIRECT_ARCHITECTURE,
+        DIRECT_FNO_ARCHITECTURE,
+        DIRECT_UFNO_ARCHITECTURE,
+    }:
         raise ValueError(f"architecture={architecture} requires its direct prediction mode")
     if architecture == RESIDUAL_FNO_ARCHITECTURE:
         if prediction_mode != "residual_decomposed_fno":
@@ -277,6 +292,18 @@ def validate_prediction_mode(
         if physics_input_mode != "source_superposition_v1":
             raise ValueError(
                 "residual_decomposed_fno requires physics_input_mode=source_superposition_v1"
+            )
+        return
+    if architecture == RESIDUAL_UFNO_ARCHITECTURE:
+        if prediction_mode != "residual_decomposed_ufno":
+            raise ValueError(
+                f"architecture={RESIDUAL_UFNO_ARCHITECTURE} requires "
+                "prediction_mode=residual_decomposed_ufno"
+            )
+        if physics_input_mode != "source_superposition_v1":
+            raise ValueError(
+                "residual_decomposed_ufno requires "
+                "physics_input_mode=source_superposition_v1"
             )
         return
     if prediction_mode not in {"residual", "residual_decomposed"}:
@@ -313,6 +340,8 @@ def main() -> int:
             "miniunet_refine_conditioned_decomposed_pairwise_basis",
             DIRECT_FNO_ARCHITECTURE,
             RESIDUAL_FNO_ARCHITECTURE,
+            DIRECT_UFNO_ARCHITECTURE,
+            RESIDUAL_UFNO_ARCHITECTURE,
         ],
     )
     parser.add_argument("--refine-channels", default=32, type=int)
@@ -331,6 +360,8 @@ def main() -> int:
             "direct_temperature_source_conditioned",
             "direct_temperature_fno",
             "residual_decomposed_fno",
+            "direct_temperature_ufno",
+            "residual_decomposed_ufno",
         ],
         help="Checkpoint-visible output semantics. auto preserves legacy architecture behavior.",
     )
@@ -350,6 +381,25 @@ def main() -> int:
         choices=["film"],
     )
     parser.add_argument("--fno-projection-channels", default=None, type=int)
+    parser.add_argument(
+        "--ufno-adaptation-profile",
+        default="ufno_published_adapted",
+        choices=["ufno_published_adapted"],
+    )
+    parser.add_argument(
+        "--ufno-unet-branch-indices",
+        nargs="+",
+        default=[3, 4, 5],
+        type=int,
+    )
+    parser.add_argument("--ufno-unet-depth", default=3, type=int)
+    parser.add_argument("--ufno-unet-dropout", default=0.0, type=float)
+    parser.add_argument("--ufno-domain-padding", default=8, type=int)
+    parser.add_argument(
+        "--ufno-padding-mode",
+        default="published_mixed",
+        choices=["published_mixed", "none"],
+    )
     parser.add_argument(
         "--direct-target-normalization",
         default="none",
@@ -457,6 +507,7 @@ def main() -> int:
     parser.add_argument("--lineage-manifest", default=None, type=Path)
     args = parser.parse_args()
     fno_profile = FNO_CAPACITY_PROFILES[args.fno_capacity_profile]
+    fno_layers_was_default = args.fno_layers is None
     for argument, profile_key in (
         ("fno_width", "width"),
         ("fno_layers", "layers"),
@@ -466,6 +517,12 @@ def main() -> int:
     ):
         if getattr(args, argument) is None:
             setattr(args, argument, int(fno_profile[profile_key]))
+    if (
+        args.model_architecture
+        in {DIRECT_UFNO_ARCHITECTURE, RESIDUAL_UFNO_ARCHITECTURE}
+        and fno_layers_was_default
+    ):
+        args.fno_layers = 6
     if args.temp_loss_weight < 0.0:
         raise SystemExit("--temp-loss-weight must be non-negative")
     if args.hotspot_loss_weight < 0.0:
@@ -525,9 +582,15 @@ def main() -> int:
         DIRECT_FNO_ARCHITECTURE,
         RESIDUAL_FNO_ARCHITECTURE,
     }
+    is_ufno_arch = args.model_architecture in {
+        DIRECT_UFNO_ARCHITECTURE,
+        RESIDUAL_UFNO_ARCHITECTURE,
+    }
+    is_operator_arch = is_fno_arch or is_ufno_arch
     is_direct_arch = args.model_architecture in {
         DIRECT_ARCHITECTURE,
         DIRECT_FNO_ARCHITECTURE,
+        DIRECT_UFNO_ARCHITECTURE,
     }
     is_generic_graph_arch = args.model_architecture in {
         "miniunet_refine_conditioned_decomposed_graph",
@@ -551,6 +614,8 @@ def main() -> int:
         "miniunet_refine_conditioned_decomposed_pairwise_basis",
         DIRECT_FNO_ARCHITECTURE,
         RESIDUAL_FNO_ARCHITECTURE,
+        DIRECT_UFNO_ARCHITECTURE,
+        RESIDUAL_UFNO_ARCHITECTURE,
     }
     is_decomposed_arch = args.model_architecture in {
         "miniunet_refine_decomposed",
@@ -564,6 +629,7 @@ def main() -> int:
         "miniunet_refine_conditioned_decomposed_pairwise",
         "miniunet_refine_conditioned_decomposed_pairwise_basis",
         RESIDUAL_FNO_ARCHITECTURE,
+        RESIDUAL_UFNO_ARCHITECTURE,
     }
     if args.physics_input == "gated_v1" and not is_conditioned_arch:
         raise SystemExit("--physics-input gated_v1 requires a metadata-conditioned architecture")
@@ -583,7 +649,7 @@ def main() -> int:
         raise SystemExit("--coarse-spatial-loss-enabled requires a decomposed architecture")
     if is_direct_arch and args.coarse_spatial_loss_enabled:
         raise SystemExit("direct-temperature baseline does not support coarse spatial loss")
-    if is_fno_arch:
+    if is_operator_arch:
         for name in ("fno_width", "fno_layers", "fno_modes_x", "fno_modes_y", "fno_projection_channels"):
             if int(getattr(args, name)) <= 0:
                 raise SystemExit(f"--{name.replace('_', '-')} must be positive")
@@ -598,6 +664,35 @@ def main() -> int:
         if args.physics_input != "source_superposition_v1":
             raise SystemExit(
                 "residual_decomposed_fno requires --physics-input source_superposition_v1"
+            )
+    if is_ufno_arch:
+        if args.fno_layers != 6 or tuple(args.ufno_unet_branch_indices) != (3, 4, 5):
+            raise SystemExit(
+                "ufno_published_adapted requires --fno-layers 6 and "
+                "--ufno-unet-branch-indices 3 4 5"
+            )
+        if args.ufno_unet_depth != 3:
+            raise SystemExit("ufno_published_adapted requires --ufno-unet-depth 3")
+        if args.ufno_domain_padding < 0:
+            raise SystemExit("--ufno-domain-padding must be non-negative")
+        if not 0.0 <= args.ufno_unet_dropout < 1.0:
+            raise SystemExit("--ufno-unet-dropout must be in [0, 1)")
+    if args.model_architecture == DIRECT_UFNO_ARCHITECTURE:
+        if args.direct_target_normalization != "train_standard":
+            raise SystemExit(
+                "direct_temperature_ufno requires --direct-target-normalization train_standard"
+            )
+        if args.physics_input != "none":
+            raise SystemExit("direct_temperature_ufno must exclude the source/base input")
+    if args.model_architecture == RESIDUAL_UFNO_ARCHITECTURE:
+        if args.mean_head_mode != "residual_resistance":
+            raise SystemExit(
+                "residual_decomposed_ufno requires --mean-head-mode residual_resistance"
+            )
+        if args.physics_input != "source_superposition_v1":
+            raise SystemExit(
+                "residual_decomposed_ufno requires "
+                "--physics-input source_superposition_v1"
             )
 
     set_seed(args.seed)
@@ -657,7 +752,7 @@ def main() -> int:
     refinement_channel_indices, refinement_channel_names = refinement_channels_for_dataset(
         dataset_input_channels,
         stats,
-        enabled=args.model_architecture != "miniunet" and not is_fno_arch,
+        enabled=args.model_architecture != "miniunet" and not is_operator_arch,
         routing_mode=args.channel_routing_mode,
     )
     global_channel_indices, global_channel_names = global_branch_channels_for_dataset(
@@ -697,7 +792,7 @@ def main() -> int:
         "base_channels": args.base_channels,
         "depth": args.depth,
     }
-    if is_fno_arch:
+    if is_operator_arch:
         model_config.update(
             {
                 "fno_capacity_profile": args.fno_capacity_profile,
@@ -710,6 +805,21 @@ def main() -> int:
                 "fno_projection_channels": args.fno_projection_channels,
             }
         )
+        if is_ufno_arch:
+            model_config.update(
+                {
+                    "ufno_reference_commit": (
+                        "8315fd7b5bd75282b7efe42ee6b8de86543d13cc"
+                    ),
+                    "ufno_adaptation_profile": args.ufno_adaptation_profile,
+                    "ufno_unet_branch_indices": list(args.ufno_unet_branch_indices),
+                    "ufno_unet_depth": args.ufno_unet_depth,
+                    "ufno_unet_dropout": args.ufno_unet_dropout,
+                    "ufno_domain_padding": args.ufno_domain_padding,
+                    "ufno_padding_mode": args.ufno_padding_mode,
+                    "ufno_branch_fusion": "add",
+                }
+            )
     elif args.model_architecture != "miniunet":
         model_config.update(
             {

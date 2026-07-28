@@ -38,10 +38,13 @@ from chiptherm.ml.normalization import (
 DIRECT_ARCHITECTURE = "miniunet_refine_conditioned_direct_temperature_feature_fusion"
 DIRECT_FNO_ARCHITECTURE = "fno2d_direct_conditioned"
 RESIDUAL_FNO_ARCHITECTURE = "fno2d_residual_decomposed_conditioned"
+DIRECT_UFNO_ARCHITECTURE = "ufno2d_direct_conditioned"
+RESIDUAL_UFNO_ARCHITECTURE = "ufno2d_residual_decomposed_conditioned"
 DIRECT_PREDICTION_MODES = {
     "direct_temperature",
     "direct_temperature_source_conditioned",
     "direct_temperature_fno",
+    "direct_temperature_ufno",
 }
 
 
@@ -61,7 +64,11 @@ def checkpoint_prediction_mode(checkpoint: dict[str, Any], architecture: str) ->
     explicit = model_config.get("prediction_mode") or training_config.get("prediction_mode")
     if explicit:
         return str(explicit)
-    if architecture in {DIRECT_ARCHITECTURE, DIRECT_FNO_ARCHITECTURE}:
+    if architecture in {
+        DIRECT_ARCHITECTURE,
+        DIRECT_FNO_ARCHITECTURE,
+        DIRECT_UFNO_ARCHITECTURE,
+    }:
         raise ValueError("direct-temperature checkpoint is missing explicit prediction_mode")
     return "residual_decomposed" if "decomposed" in architecture else "residual"
 
@@ -96,7 +103,11 @@ def validate_checkpoint_prediction_mode(
     physics_input_mode: str,
 ) -> None:
     direct = prediction_mode in DIRECT_PREDICTION_MODES
-    direct_architecture = architecture in {DIRECT_ARCHITECTURE, DIRECT_FNO_ARCHITECTURE}
+    direct_architecture = architecture in {
+        DIRECT_ARCHITECTURE,
+        DIRECT_FNO_ARCHITECTURE,
+        DIRECT_UFNO_ARCHITECTURE,
+    }
     if direct != direct_architecture:
         raise ValueError(
             "checkpoint prediction mode and architecture are incompatible: "
@@ -108,6 +119,12 @@ def validate_checkpoint_prediction_mode(
         if architecture != DIRECT_FNO_ARCHITECTURE or physics_input_mode != "none":
             raise ValueError(
                 "direct_temperature_fno requires fno2d_direct_conditioned with "
+                "physics_input_mode=none"
+            )
+    if prediction_mode == "direct_temperature_ufno":
+        if architecture != DIRECT_UFNO_ARCHITECTURE or physics_input_mode != "none":
+            raise ValueError(
+                "direct_temperature_ufno requires ufno2d_direct_conditioned with "
                 "physics_input_mode=none"
             )
     if (
@@ -127,6 +144,17 @@ def validate_checkpoint_prediction_mode(
         if physics_input_mode != "source_superposition_v1":
             raise ValueError(
                 "residual_decomposed_fno requires physics_input_mode=source_superposition_v1"
+            )
+    if architecture == RESIDUAL_UFNO_ARCHITECTURE:
+        if prediction_mode != "residual_decomposed_ufno":
+            raise ValueError(
+                "ufno2d_residual_decomposed_conditioned requires "
+                "prediction_mode=residual_decomposed_ufno"
+            )
+        if physics_input_mode != "source_superposition_v1":
+            raise ValueError(
+                "residual_decomposed_ufno requires "
+                "physics_input_mode=source_superposition_v1"
             )
 
 
@@ -188,6 +216,7 @@ def main() -> int:
         "miniunet_refine_conditioned_decomposed_pairwise",
         "miniunet_refine_conditioned_decomposed_pairwise_basis",
         RESIDUAL_FNO_ARCHITECTURE,
+        RESIDUAL_UFNO_ARCHITECTURE,
     }
     conditioned = architecture in {
         "miniunet_refine_conditioned",
@@ -203,6 +232,8 @@ def main() -> int:
         "miniunet_refine_conditioned_decomposed_pairwise_basis",
         DIRECT_FNO_ARCHITECTURE,
         RESIDUAL_FNO_ARCHITECTURE,
+        DIRECT_UFNO_ARCHITECTURE,
+        RESIDUAL_UFNO_ARCHITECTURE,
     }
     graph_stats = checkpoint["model_config"].get("graph_normalization")
     physics_input_mode = str(checkpoint["model_config"].get("physics_input_mode", "v1"))
@@ -1286,7 +1317,10 @@ def call_model(
             kwargs["total_power_W"] = total_power_W
         return model(model_input, metadata_input, graph_batch, **kwargs)
     if conditioned:
-        if getattr(model, "architecture", "") == RESIDUAL_FNO_ARCHITECTURE:
+        if getattr(model, "architecture", "") in {
+            RESIDUAL_FNO_ARCHITECTURE,
+            RESIDUAL_UFNO_ARCHITECTURE,
+        }:
             total_power_W = validate_residual_fno_total_power(
                 total_power_W,
                 model_input=model_input,

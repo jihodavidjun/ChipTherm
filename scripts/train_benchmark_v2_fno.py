@@ -44,12 +44,26 @@ EXPERIMENTS = {
         "mean_head_mode": "residual_resistance",
         "target": "source_superposition_residual_K",
     },
+    "direct_ufno": {
+        "architecture": "ufno2d_direct_conditioned",
+        "prediction_mode": "direct_temperature_ufno",
+        "physics_input": "none",
+        "mean_head_mode": "direct_k",
+        "target": "absolute_temperature_K",
+    },
+    "residual_ufno": {
+        "architecture": "ufno2d_residual_decomposed_conditioned",
+        "prediction_mode": "residual_decomposed_ufno",
+        "physics_input": "source_superposition_v1",
+        "mean_head_mode": "residual_resistance",
+        "target": "source_superposition_residual_K",
+    },
 }
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Train a controlled Benchmark v2 direct or residual FNO."
+        description="Train a controlled Benchmark v2 direct or residual FNO/U-FNO."
     )
     parser.add_argument("--experiment", required=True, choices=sorted(EXPERIMENTS))
     parser.add_argument("--data-root", default=os.environ.get("CHIPTHERM_V2_DATA_ROOT"), type=Path)
@@ -104,8 +118,8 @@ def main() -> int:
         "model_architecture": expected["architecture"],
         "prediction_mode": expected["prediction_mode"],
         "target": expected["target"],
-        "source_superposition_used_as_model_input": args.experiment == "residual",
-        "source_superposition_used_as_output_base": args.experiment == "residual",
+        "source_superposition_used_as_model_input": args.experiment.startswith("residual"),
+        "source_superposition_used_as_output_base": args.experiment.startswith("residual"),
         "source_superposition_version": args.source_version,
         "preflight_report_sha256": sha256_file(args.preflight_report),
         "source_version_index_manifest_sha256": sha256_file(index_manifest),
@@ -122,12 +136,14 @@ def main() -> int:
         "primary_heldout_used_for_selection": False,
         "reconstruction": (
             "direct train-standardized absolute temperature"
-            if args.experiment == "direct"
+            if args.experiment.startswith("direct")
             else (
                 "source_superposition_base_K + total_power_W * "
                 "delta_R_eff_K_per_W + zero_mean_centered_field_K"
             )
         ),
+        "mean_correction_sign": None if args.experiment.startswith("direct") else 1,
+        "centered_correction_sign": None if args.experiment.startswith("direct") else 1,
         "resolved_training_config_sha256": hashlib.sha256(
             json.dumps(config, sort_keys=True).encode("utf-8")
         ).hexdigest(),
@@ -200,7 +216,24 @@ def main() -> int:
         "--seed",
         str(args.seed),
     ]
-    if args.experiment == "direct":
+    if "ufno" in expected["architecture"]:
+        command.extend(
+            [
+                "--ufno-adaptation-profile",
+                str(config["ufno_adaptation_profile"]),
+                "--ufno-unet-branch-indices",
+                *[str(index) for index in config["ufno_unet_branch_indices"]],
+                "--ufno-unet-depth",
+                str(config["ufno_unet_depth"]),
+                "--ufno-unet-dropout",
+                str(config["ufno_unet_dropout"]),
+                "--ufno-domain-padding",
+                str(config["ufno_domain_padding"]),
+                "--ufno-padding-mode",
+                str(config["ufno_padding_mode"]),
+            ]
+        )
+    if args.experiment.startswith("direct"):
         command.extend(["--direct-target-normalization", "train_standard"])
     else:
         command.extend(
@@ -242,9 +275,12 @@ def validate_config(config: dict[str, Any], expected: dict[str, str]) -> None:
     }
     if mismatches:
         raise ValueError(f"invalid controlled FNO config: {mismatches}")
-    if expected["prediction_mode"] == "direct_temperature_fno":
+    if expected["prediction_mode"] in {
+        "direct_temperature_fno",
+        "direct_temperature_ufno",
+    }:
         if config.get("direct_target_normalization") != "train_standard":
-            raise ValueError("direct FNO requires train-only target standardization")
+            raise ValueError("direct operator model requires train-only target standardization")
     for key in (
         "fno_width",
         "fno_layers",
@@ -254,6 +290,37 @@ def validate_config(config: dict[str, Any], expected: dict[str, str]) -> None:
     ):
         if int(config.get(key, 0)) <= 0:
             raise ValueError(f"{key} must be positive")
+    if "ufno" in expected["architecture"]:
+        required_ufno = {
+            "ufno_adaptation_profile": "ufno_published_adapted",
+            "ufno_unet_depth": 3,
+            "ufno_domain_padding": 8,
+            "ufno_padding_mode": "published_mixed",
+        }
+        mismatches = {
+            key: {"expected": value, "actual": config.get(key)}
+            for key, value in required_ufno.items()
+            if config.get(key) != value
+        }
+        if list(config.get("ufno_unet_branch_indices", [])) != [3, 4, 5]:
+            mismatches["ufno_unet_branch_indices"] = {
+                "expected": [3, 4, 5],
+                "actual": config.get("ufno_unet_branch_indices"),
+            }
+        if int(config.get("fno_layers", 0)) != 6:
+            mismatches["fno_layers"] = {
+                "expected": 6,
+                "actual": config.get("fno_layers"),
+            }
+        if expected["prediction_mode"] == "residual_decomposed_ufno":
+            for key in ("mean_correction_sign", "centered_correction_sign"):
+                if int(config.get(key, 0)) != 1:
+                    mismatches[key] = {
+                        "expected": 1,
+                        "actual": config.get(key),
+                    }
+        if mismatches:
+            raise ValueError(f"invalid task-adapted published U-FNO config: {mismatches}")
 
 
 if __name__ == "__main__":

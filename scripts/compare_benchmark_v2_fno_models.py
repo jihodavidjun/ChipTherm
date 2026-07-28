@@ -20,8 +20,10 @@ PROTOCOLS = (
 MODEL_ARGUMENTS = {
     "direct_cnn": "direct_cnn_root",
     "direct_fno": "direct_fno_root",
+    "direct_ufno": "direct_ufno_root",
     "residual_cnn": "residual_cnn_root",
     "residual_fno": "residual_fno_root",
+    "residual_ufno": "residual_ufno_root",
 }
 
 
@@ -29,9 +31,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Compare the controlled Benchmark v2 CNN/FNO 2x2.")
     parser.add_argument("--direct-cnn-root", type=Path)
     parser.add_argument("--direct-fno-root", type=Path)
+    parser.add_argument("--direct-ufno-root", type=Path)
     parser.add_argument("--source-only-root", type=Path)
     parser.add_argument("--residual-cnn-root", type=Path)
     parser.add_argument("--residual-fno-root", type=Path)
+    parser.add_argument("--residual-ufno-root", type=Path)
     parser.add_argument("--out-dir", required=True, type=Path)
     args = parser.parse_args()
     roots = {
@@ -65,10 +69,12 @@ def aggregate_comparison(
     headline: list[dict[str, Any]] = []
     families: list[dict[str, Any]] = []
     expected_modes = {
-        "direct_cnn": {"direct_temperature"},
+        "direct_cnn": {"direct_temperature", ""},
         "direct_fno": {"direct_temperature_fno"},
-        "residual_cnn": {"residual_decomposed"},
+        "direct_ufno": {"direct_temperature_ufno"},
+        "residual_cnn": {"residual_decomposed", ""},
         "residual_fno": {"residual_decomposed_fno"},
+        "residual_ufno": {"residual_decomposed_ufno"},
     }
     for model_name, root in roots.items():
         for protocol in PROTOCOLS:
@@ -84,7 +90,11 @@ def aggregate_comparison(
             row = {
                 "model": model_name,
                 "formulation": "direct" if model_name.startswith("direct") else "residual",
-                "backbone": "fno" if model_name.endswith("fno") else "cnn",
+                "backbone": (
+                    "ufno"
+                    if model_name.endswith("ufno")
+                    else ("fno" if model_name.endswith("fno") else "cnn")
+                ),
                 "protocol": protocol,
                 "num_samples": metrics.get("num_samples"),
                 "mae_K": final.get("mae_K"),
@@ -132,17 +142,25 @@ def aggregate_comparison(
                         "mae_K": first_numeric(
                             family_row,
                             "final_temperature_mae_K",
+                            "cnn_final_mae_K",
                             "mae_K",
                             "final_mae_K",
                         ),
                         "rmse_K": first_numeric(
                             family_row,
                             "final_temperature_rmse_K",
+                            "cnn_final_rmse_K",
                             "rmse_K",
                             "final_rmse_K",
                         ),
                     }
                 )
+                if families[-1]["mae_K"] is None:
+                    raise ValueError(
+                        "learned-model per-family MAE is missing: "
+                        f"model={model_name}, protocol={protocol}, family={family}, "
+                        f"available_columns={sorted(family_row)}"
+                    )
     return headline, families
 
 
