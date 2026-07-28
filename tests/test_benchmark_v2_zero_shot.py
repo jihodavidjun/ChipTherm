@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import copy
+import json
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -15,18 +17,28 @@ from scripts.analyze_benchmark_v2_zero_shot import (  # noqa: E402
     EXPECTED_PRIMARY_SPLIT,
     EXPECTED_PROTOCOLS,
     MODEL_LABELS,
+    _locate_protocol_dir_from_tiers,
     aggregate_metric_rows,
     assign_ood_tiers,
     build_aggregate_model_comparison,
     build_per_family_metrics,
     build_source_improvement_rows,
     fit_descriptor_space,
+    load_training_lineage,
+    locate_protocol_dir,
     reconcile_aggregate_metrics,
     validate_descriptor_table,
 )
 
 
 def main() -> None:
+    test_canonical_selection_preferred_over_legacy()
+    test_canonical_primary_test_preferred()
+    test_legacy_evaluation_fallback()
+    test_missing_protocol_is_clear()
+    test_same_priority_tier_ambiguity_is_clear()
+    test_real_run_layout_needs_no_symlink_staging()
+    test_training_lineage_precedes_checkpoint_fallback()
     test_family_aggregation_and_macro_micro()
     test_train_only_descriptor_normalization()
     test_out_of_range_and_deterministic_tiers()
@@ -34,6 +46,120 @@ def main() -> None:
     test_aggregate_metric_reconciliation()
     test_source_improvement_calculation()
     print("benchmark v2 zero-shot diagnostic tests passed")
+
+
+def make_directory(root: Path, relative: str) -> Path:
+    path = root / relative
+    path.mkdir(parents=True)
+    return path
+
+
+def test_canonical_selection_preferred_over_legacy() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        preferred = make_directory(root, "evaluation_selection/known_family_sample_test")
+        make_directory(root, "evaluation/known_family_sample_test")
+        assert locate_protocol_dir(root, "known_family_sample_test") == preferred
+
+        preferred_val = make_directory(
+            root, "evaluation_selection/primary_validation_families"
+        )
+        make_directory(root, "evaluation/primary_validation_families")
+        assert locate_protocol_dir(root, "primary_validation_families") == preferred_val
+
+
+def test_canonical_primary_test_preferred() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        preferred = make_directory(
+            root, "evaluation_primary_test/primary_test_families"
+        )
+        make_directory(root, "evaluation/primary_test_families")
+        make_directory(root, "evaluation_selection/primary_test_families")
+        assert locate_protocol_dir(root, "primary_test_families") == preferred
+
+
+def test_legacy_evaluation_fallback() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        legacy_known = make_directory(root, "evaluation/known_family_sample_test")
+        legacy_val = make_directory(root, "evaluation/primary_validation_families")
+        legacy_test = make_directory(root, "evaluation/primary_test_families")
+        assert locate_protocol_dir(root, "known_family_sample_test") == legacy_known
+        assert locate_protocol_dir(root, "primary_validation_families") == legacy_val
+        assert locate_protocol_dir(root, "primary_test_families") == legacy_test
+
+
+def test_missing_protocol_is_clear() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        try:
+            locate_protocol_dir(root, "primary_test_families")
+        except FileNotFoundError as exc:
+            message = str(exc)
+            assert "no valid primary_test_families directory" in message
+            assert "evaluation_primary_test/primary_test_families" in message
+        else:
+            raise AssertionError("missing protocol directory was accepted")
+
+
+def test_same_priority_tier_ambiguity_is_clear() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        make_directory(root, "canonical_a/known_family_sample_test")
+        make_directory(root, "canonical_b/known_family_sample_test")
+        tiers = (
+            (
+                "canonical_a/known_family_sample_test",
+                "canonical_b/known_family_sample_test",
+            ),
+        )
+        try:
+            _locate_protocol_dir_from_tiers(
+                root, "known_family_sample_test", tiers
+            )
+        except ValueError as exc:
+            message = str(exc)
+            assert "ambiguous known_family_sample_test" in message
+            assert "priority tier 1" in message
+        else:
+            raise AssertionError("same-tier ambiguity was accepted")
+
+
+def test_real_run_layout_needs_no_symlink_staging() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "residual_operator_run"
+        expected = {
+            "known_family_sample_test": make_directory(
+                root, "evaluation_selection/known_family_sample_test"
+            ),
+            "primary_validation_families": make_directory(
+                root, "evaluation_selection/primary_validation_families"
+            ),
+            "primary_test_families": make_directory(
+                root, "evaluation_primary_test/primary_test_families"
+            ),
+        }
+        # Legacy duplicates are intentionally present, as in the synced run roots.
+        for protocol in expected:
+            make_directory(root, f"evaluation/{protocol}")
+        assert {
+            protocol: locate_protocol_dir(root, protocol)
+            for protocol in expected
+        } == expected
+
+
+def test_training_lineage_precedes_checkpoint_fallback() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        expected = {"schema_version": 1, "source_superposition_version": "test"}
+        (root / "training_lineage.json").write_text(
+            json.dumps(expected), encoding="utf-8"
+        )
+        checkpoint = root / "checkpoints/best.pt"
+        checkpoint.parent.mkdir(parents=True)
+        checkpoint.write_bytes(b"not a checkpoint")
+        assert load_training_lineage(root) == expected
 
 
 def sample(uid: str, family: str, mae: float, source: float = 3.0) -> dict[str, str]:

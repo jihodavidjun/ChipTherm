@@ -39,6 +39,21 @@ EXPECTED_PROTOCOLS = {
     },
 }
 MODEL_LABELS = ("cnn", "fno", "ufno", "sau_fno")
+PROTOCOL_DIRECTORY_PRIORITY = {
+    "known_family_sample_test": (
+        ("evaluation_selection/known_family_sample_test",),
+        ("evaluation/known_family_sample_test",),
+    ),
+    "primary_validation_families": (
+        ("evaluation_selection/primary_validation_families",),
+        ("evaluation/primary_validation_families",),
+    ),
+    "primary_test_families": (
+        ("evaluation_primary_test/primary_test_families",),
+        ("evaluation/primary_test_families",),
+        ("evaluation_selection/primary_test_families",),
+    ),
+}
 NON_DESCRIPTOR_COLUMNS = {"family_uid", "split", "primary_category", "placement_style"}
 METRIC_COLUMNS = {
     "mae_K": "mae_K",
@@ -340,19 +355,36 @@ def load_and_validate_model_artifacts(
 
 
 def locate_protocol_dir(root: Path, protocol: str) -> Path:
-    candidates = (
-        root / "evaluation" / protocol,
-        root / "evaluation_selection" / protocol,
-        root / "evaluation_primary_test" / protocol,
-        root / protocol,
+    try:
+        priority_tiers = PROTOCOL_DIRECTORY_PRIORITY[protocol]
+    except KeyError as exc:
+        raise ValueError(
+            f"unsupported protocol {protocol!r}; expected one of "
+            f"{tuple(PROTOCOL_DIRECTORY_PRIORITY)}"
+        ) from exc
+    return _locate_protocol_dir_from_tiers(root, protocol, priority_tiers)
+
+
+def _locate_protocol_dir_from_tiers(
+    root: Path,
+    protocol: str,
+    priority_tiers: Sequence[Sequence[str]],
+) -> Path:
+    searched: list[str] = []
+    for tier_index, relative_paths in enumerate(priority_tiers, 1):
+        candidates = [root / relative_path for relative_path in relative_paths]
+        searched.extend(str(path) for path in candidates)
+        found = [path for path in candidates if path.is_dir()]
+        if len(found) > 1:
+            raise ValueError(
+                f"ambiguous {protocol} directories in priority tier {tier_index} "
+                f"under {root}: {[str(path) for path in found]}"
+            )
+        if found:
+            return found[0]
+    raise FileNotFoundError(
+        f"no valid {protocol} directory exists under {root}; searched={searched}"
     )
-    found = [path for path in candidates if path.is_dir()]
-    if len(found) != 1:
-        raise FileNotFoundError(
-            f"expected exactly one {protocol} directory under {root}; "
-            f"found={[str(path) for path in found]}"
-        )
-    return found[0]
 
 
 def load_training_lineage(root: Path) -> dict[str, Any]:
