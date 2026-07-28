@@ -32,6 +32,7 @@ from chiptherm.ml.graph_models import (
     move_graph_to_device,
     normalize_graph_batch,
 )
+from chiptherm.ml.fno_models import FNO_CAPACITY_PROFILES
 from chiptherm.ml.models import build_model, count_parameters
 from chiptherm.ml.normalization import (
     DirectTemperatureTargetStats,
@@ -217,11 +218,22 @@ def physics_input_channel_count(mode: str) -> int:
 
 
 DIRECT_ARCHITECTURE = "miniunet_refine_conditioned_direct_temperature_feature_fusion"
+DIRECT_FNO_ARCHITECTURE = "fno2d_direct_conditioned"
+RESIDUAL_FNO_ARCHITECTURE = "fno2d_residual_decomposed_conditioned"
+DIRECT_PREDICTION_MODES = {
+    "direct_temperature",
+    "direct_temperature_source_conditioned",
+    "direct_temperature_fno",
+}
 
 
 def resolve_prediction_mode(requested: str, architecture: str) -> str:
     if requested != "auto":
         return requested
+    if architecture == DIRECT_FNO_ARCHITECTURE:
+        return "direct_temperature_fno"
+    if architecture == RESIDUAL_FNO_ARCHITECTURE:
+        return "residual_decomposed_fno"
     if architecture == DIRECT_ARCHITECTURE:
         return "direct_temperature"
     if "decomposed" in architecture:
@@ -234,21 +246,39 @@ def validate_prediction_mode(
     architecture: str,
     physics_input_mode: str,
 ) -> None:
-    if prediction_mode in {"direct_temperature", "direct_temperature_source_conditioned"}:
-        if architecture != DIRECT_ARCHITECTURE:
+    if prediction_mode in DIRECT_PREDICTION_MODES:
+        expected_architecture = (
+            DIRECT_FNO_ARCHITECTURE
+            if prediction_mode == "direct_temperature_fno"
+            else DIRECT_ARCHITECTURE
+        )
+        if architecture != expected_architecture:
             raise ValueError(
-                f"prediction_mode={prediction_mode} requires architecture={DIRECT_ARCHITECTURE}"
+                f"prediction_mode={prediction_mode} requires architecture={expected_architecture}"
             )
         required_physics = (
-            "none" if prediction_mode == "direct_temperature" else "source_superposition_v1"
+            "source_superposition_v1"
+            if prediction_mode == "direct_temperature_source_conditioned"
+            else "none"
         )
         if physics_input_mode != required_physics:
             raise ValueError(
                 f"prediction_mode={prediction_mode} requires physics_input_mode={required_physics}"
             )
         return
-    if architecture == DIRECT_ARCHITECTURE:
-        raise ValueError(f"architecture={DIRECT_ARCHITECTURE} requires a direct prediction mode")
+    if architecture in {DIRECT_ARCHITECTURE, DIRECT_FNO_ARCHITECTURE}:
+        raise ValueError(f"architecture={architecture} requires its direct prediction mode")
+    if architecture == RESIDUAL_FNO_ARCHITECTURE:
+        if prediction_mode != "residual_decomposed_fno":
+            raise ValueError(
+                f"architecture={RESIDUAL_FNO_ARCHITECTURE} requires "
+                "prediction_mode=residual_decomposed_fno"
+            )
+        if physics_input_mode != "source_superposition_v1":
+            raise ValueError(
+                "residual_decomposed_fno requires physics_input_mode=source_superposition_v1"
+            )
+        return
     if prediction_mode not in {"residual", "residual_decomposed"}:
         raise ValueError(f"unsupported prediction_mode: {prediction_mode}")
 
@@ -281,6 +311,8 @@ def main() -> int:
             "miniunet_refine_conditioned_decomposed_feature_fusion_graph",
             "miniunet_refine_conditioned_decomposed_pairwise",
             "miniunet_refine_conditioned_decomposed_pairwise_basis",
+            DIRECT_FNO_ARCHITECTURE,
+            RESIDUAL_FNO_ARCHITECTURE,
         ],
     )
     parser.add_argument("--refine-channels", default=32, type=int)
@@ -297,9 +329,27 @@ def main() -> int:
             "residual_decomposed",
             "direct_temperature",
             "direct_temperature_source_conditioned",
+            "direct_temperature_fno",
+            "residual_decomposed_fno",
         ],
         help="Checkpoint-visible output semantics. auto preserves legacy architecture behavior.",
     )
+    parser.add_argument(
+        "--fno-capacity-profile",
+        default="fno_small",
+        choices=["fno_small", "fno_standard"],
+    )
+    parser.add_argument("--fno-width", default=None, type=int)
+    parser.add_argument("--fno-layers", default=None, type=int)
+    parser.add_argument("--fno-modes-x", default=None, type=int)
+    parser.add_argument("--fno-modes-y", default=None, type=int)
+    parser.add_argument("--fno-activation", default="gelu", choices=["gelu"])
+    parser.add_argument(
+        "--fno-metadata-conditioning",
+        default="film",
+        choices=["film"],
+    )
+    parser.add_argument("--fno-projection-channels", default=None, type=int)
     parser.add_argument(
         "--direct-target-normalization",
         default="none",
@@ -406,6 +456,16 @@ def main() -> int:
     parser.add_argument("--checkpoint-frequency", default=10, type=int)
     parser.add_argument("--lineage-manifest", default=None, type=Path)
     args = parser.parse_args()
+    fno_profile = FNO_CAPACITY_PROFILES[args.fno_capacity_profile]
+    for argument, profile_key in (
+        ("fno_width", "width"),
+        ("fno_layers", "layers"),
+        ("fno_modes_x", "modes_x"),
+        ("fno_modes_y", "modes_y"),
+        ("fno_projection_channels", "projection_channels"),
+    ):
+        if getattr(args, argument) is None:
+            setattr(args, argument, int(fno_profile[profile_key]))
     if args.temp_loss_weight < 0.0:
         raise SystemExit("--temp-loss-weight must be non-negative")
     if args.hotspot_loss_weight < 0.0:
@@ -461,7 +521,14 @@ def main() -> int:
         DIRECT_ARCHITECTURE,
         "miniunet_refine_conditioned_decomposed_feature_fusion_graph",
     }
-    is_direct_arch = args.model_architecture == DIRECT_ARCHITECTURE
+    is_fno_arch = args.model_architecture in {
+        DIRECT_FNO_ARCHITECTURE,
+        RESIDUAL_FNO_ARCHITECTURE,
+    }
+    is_direct_arch = args.model_architecture in {
+        DIRECT_ARCHITECTURE,
+        DIRECT_FNO_ARCHITECTURE,
+    }
     is_generic_graph_arch = args.model_architecture in {
         "miniunet_refine_conditioned_decomposed_graph",
         "miniunet_refine_conditioned_decomposed_global_graph",
@@ -482,6 +549,8 @@ def main() -> int:
         "miniunet_refine_conditioned_decomposed_feature_fusion_graph",
         "miniunet_refine_conditioned_decomposed_pairwise",
         "miniunet_refine_conditioned_decomposed_pairwise_basis",
+        DIRECT_FNO_ARCHITECTURE,
+        RESIDUAL_FNO_ARCHITECTURE,
     }
     is_decomposed_arch = args.model_architecture in {
         "miniunet_refine_decomposed",
@@ -494,6 +563,7 @@ def main() -> int:
         "miniunet_refine_conditioned_decomposed_feature_fusion_graph",
         "miniunet_refine_conditioned_decomposed_pairwise",
         "miniunet_refine_conditioned_decomposed_pairwise_basis",
+        RESIDUAL_FNO_ARCHITECTURE,
     }
     if args.physics_input == "gated_v1" and not is_conditioned_arch:
         raise SystemExit("--physics-input gated_v1 requires a metadata-conditioned architecture")
@@ -513,6 +583,22 @@ def main() -> int:
         raise SystemExit("--coarse-spatial-loss-enabled requires a decomposed architecture")
     if is_direct_arch and args.coarse_spatial_loss_enabled:
         raise SystemExit("direct-temperature baseline does not support coarse spatial loss")
+    if is_fno_arch:
+        for name in ("fno_width", "fno_layers", "fno_modes_x", "fno_modes_y", "fno_projection_channels"):
+            if int(getattr(args, name)) <= 0:
+                raise SystemExit(f"--{name.replace('_', '-')} must be positive")
+    if args.model_architecture == DIRECT_FNO_ARCHITECTURE:
+        if args.direct_target_normalization != "train_standard":
+            raise SystemExit("direct_temperature_fno requires --direct-target-normalization train_standard")
+        if args.physics_input != "none":
+            raise SystemExit("direct_temperature_fno must exclude the source/base input")
+    if args.model_architecture == RESIDUAL_FNO_ARCHITECTURE:
+        if args.mean_head_mode != "residual_resistance":
+            raise SystemExit("residual_decomposed_fno requires --mean-head-mode residual_resistance")
+        if args.physics_input != "source_superposition_v1":
+            raise SystemExit(
+                "residual_decomposed_fno requires --physics-input source_superposition_v1"
+            )
 
     set_seed(args.seed)
     device = select_device(args.device)
@@ -571,7 +657,7 @@ def main() -> int:
     refinement_channel_indices, refinement_channel_names = refinement_channels_for_dataset(
         dataset_input_channels,
         stats,
-        enabled=args.model_architecture != "miniunet",
+        enabled=args.model_architecture != "miniunet" and not is_fno_arch,
         routing_mode=args.channel_routing_mode,
     )
     global_channel_indices, global_channel_names = global_branch_channels_for_dataset(
@@ -611,7 +697,20 @@ def main() -> int:
         "base_channels": args.base_channels,
         "depth": args.depth,
     }
-    if args.model_architecture != "miniunet":
+    if is_fno_arch:
+        model_config.update(
+            {
+                "fno_capacity_profile": args.fno_capacity_profile,
+                "fno_width": args.fno_width,
+                "fno_layers": args.fno_layers,
+                "fno_modes_x": args.fno_modes_x,
+                "fno_modes_y": args.fno_modes_y,
+                "fno_activation": args.fno_activation,
+                "fno_metadata_conditioning": args.fno_metadata_conditioning,
+                "fno_projection_channels": args.fno_projection_channels,
+            }
+        )
+    elif args.model_architecture != "miniunet":
         model_config.update(
             {
                 "refine_channels": args.refine_channels,
@@ -931,6 +1030,8 @@ def main() -> int:
         best_val_mae = float(resumed.get("best_val_mae_K", float("inf")))
         epochs_without_improvement = int(resumed.get("epochs_without_improvement", 0))
 
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
     for epoch in range(start_epoch, args.epochs + 1):
         epoch_start = time.perf_counter()
         train_losses = train_one_epoch(
@@ -1104,6 +1205,12 @@ def main() -> int:
             "best_validation_final_temperature_mae_K": best_val_mae,
             "last_completed_epoch": last_completed_epoch,
             "final_training_losses": last_train_losses,
+            "parameter_count": count_parameters(model),
+            "peak_gpu_memory_bytes": (
+                int(torch.cuda.max_memory_allocated(device))
+                if device.type == "cuda"
+                else None
+            ),
             "coarse_spatial_loss": {
                 "enabled": args.coarse_spatial_loss_enabled,
                 "weight": args.coarse_spatial_loss_weight,
@@ -1362,7 +1469,7 @@ def train_one_epoch(
         batch_size = int(x.shape[0])
 
         optimizer.zero_grad(set_to_none=True)
-        if prediction_mode in {"direct_temperature", "direct_temperature_source_conditioned"}:
+        if prediction_mode in DIRECT_PREDICTION_MODES:
             if direct_target_stats is None:
                 raise ValueError("direct-temperature training requires train-fitted target statistics")
             pred_direct = call_model(
@@ -1516,7 +1623,7 @@ def train_one_epoch(
     return {
         "total_loss": total_loss / denominator,
         "direct_map_loss": residual_loss_total / denominator
-        if prediction_mode in {"direct_temperature", "direct_temperature_source_conditioned"}
+        if prediction_mode in DIRECT_PREDICTION_MODES
         else 0.0,
         "residual_loss": residual_loss_total / denominator,
         "temp_loss_scaled": temp_loss_scaled_total / denominator,
@@ -1678,7 +1785,7 @@ def evaluate_model(
             physics_input_mode=physics_input_mode,
             physics_v1=physics_v1,
         )
-        if prediction_mode in {"direct_temperature", "direct_temperature_source_conditioned"}:
+        if prediction_mode in DIRECT_PREDICTION_MODES:
             if direct_target_stats is None:
                 raise ValueError("direct-temperature evaluation requires train-fitted target statistics")
             pred_direct = call_model(
@@ -1803,7 +1910,7 @@ def evaluate_model(
         "normalized_residual_loss": total_loss / max(total_samples, 1),
         "direct_map_loss": (
             total_loss / max(total_samples, 1)
-            if prediction_mode in {"direct_temperature", "direct_temperature_source_conditioned"}
+            if prediction_mode in DIRECT_PREDICTION_MODES
             else None
         ),
         "prediction_mode": prediction_mode,

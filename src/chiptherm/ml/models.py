@@ -2455,6 +2455,60 @@ class DecomposedMiniUNetWithPairwiseBasisOperator(nn.Module):
 
 def build_model(config: dict[str, object]) -> nn.Module:
     architecture = str(config.get("architecture") or config.get("name") or "miniunet").lower()
+    if architecture in {"fno2d_direct_conditioned", "fno2d_residual_decomposed_conditioned"}:
+        from chiptherm.ml.fno_models import (
+            FNO_CAPACITY_PROFILES,
+            DirectTemperatureFNO2d,
+            ResidualDecomposedFNO2d,
+        )
+
+        capacity_profile = str(config.get("fno_capacity_profile", "fno_small"))
+        if capacity_profile not in FNO_CAPACITY_PROFILES:
+            raise ValueError(f"unsupported FNO capacity profile: {capacity_profile}")
+        profile = FNO_CAPACITY_PROFILES[capacity_profile]
+        common = {
+            "input_channels": int(config.get("input_channels", 33 if architecture == "fno2d_direct_conditioned" else 34)),
+            "output_channels": int(config.get("output_channels", 1)),
+            "metadata_dim": int(config.get("metadata_dim", 15)),
+            "metadata_hidden_dim": int(config.get("metadata_hidden_dim", 64)),
+            "metadata_embedding_dim": int(config.get("metadata_embedding_dim", 64)),
+            "width": int(config.get("fno_width", config.get("width", profile["width"]))),
+            "layers": int(config.get("fno_layers", config.get("layers", profile["layers"]))),
+            "modes_x": int(config.get("fno_modes_x", config.get("modes_x", profile["modes_x"]))),
+            "modes_y": int(config.get("fno_modes_y", config.get("modes_y", profile["modes_y"]))),
+            "activation": str(config.get("fno_activation", config.get("activation", "gelu"))),
+            "projection_channels": int(
+                config.get(
+                    "fno_projection_channels",
+                    config.get("projection_channels", profile["projection_channels"]),
+                )
+            ),
+            "capacity_profile": capacity_profile,
+        }
+        if architecture == "fno2d_direct_conditioned":
+            return DirectTemperatureFNO2d(
+                **common,
+                target_normalization_mode=str(
+                    config.get("target_normalization_mode", "train_standard")
+                ),
+                target_mean_K=float(config.get("target_mean_K", 0.0)),
+                target_std_K=float(config.get("target_std_K", 1.0)),
+            )
+        return ResidualDecomposedFNO2d(
+            **common,
+            delta_R_eff_mean_K_per_W=float(
+                config.get(
+                    "delta_R_eff_target_mean_K_per_W",
+                    config.get("delta_R_eff_mean_K_per_W", 0.0),
+                )
+            ),
+            delta_R_eff_std_K_per_W=float(
+                config.get(
+                    "delta_R_eff_target_std_K_per_W",
+                    config.get("delta_R_eff_std_K_per_W", 1.0),
+                )
+            ),
+        )
     if architecture == "miniunet":
         return MiniUNet(
             input_channels=int(config.get("input_channels", 9)),

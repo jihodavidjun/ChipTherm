@@ -36,6 +36,13 @@ from chiptherm.ml.normalization import (
 
 
 DIRECT_ARCHITECTURE = "miniunet_refine_conditioned_direct_temperature_feature_fusion"
+DIRECT_FNO_ARCHITECTURE = "fno2d_direct_conditioned"
+RESIDUAL_FNO_ARCHITECTURE = "fno2d_residual_decomposed_conditioned"
+DIRECT_PREDICTION_MODES = {
+    "direct_temperature",
+    "direct_temperature_source_conditioned",
+    "direct_temperature_fno",
+}
 
 
 def physics_input_channel_count(mode: str) -> int:
@@ -54,7 +61,7 @@ def checkpoint_prediction_mode(checkpoint: dict[str, Any], architecture: str) ->
     explicit = model_config.get("prediction_mode") or training_config.get("prediction_mode")
     if explicit:
         return str(explicit)
-    if architecture == DIRECT_ARCHITECTURE:
+    if architecture in {DIRECT_ARCHITECTURE, DIRECT_FNO_ARCHITECTURE}:
         raise ValueError("direct-temperature checkpoint is missing explicit prediction_mode")
     return "residual_decomposed" if "decomposed" in architecture else "residual"
 
@@ -63,7 +70,7 @@ def direct_target_stats_from_checkpoint(
     checkpoint: dict[str, Any],
     prediction_mode: str,
 ) -> DirectTemperatureTargetStats | None:
-    if prediction_mode not in {"direct_temperature", "direct_temperature_source_conditioned"}:
+    if prediction_mode not in DIRECT_PREDICTION_MODES:
         return None
     model_config = checkpoint.get("model_config", {})
     training_config = checkpoint.get("training_config", {})
@@ -88,14 +95,21 @@ def validate_checkpoint_prediction_mode(
     architecture: str,
     physics_input_mode: str,
 ) -> None:
-    direct = prediction_mode in {"direct_temperature", "direct_temperature_source_conditioned"}
-    if direct != (architecture == DIRECT_ARCHITECTURE):
+    direct = prediction_mode in DIRECT_PREDICTION_MODES
+    direct_architecture = architecture in {DIRECT_ARCHITECTURE, DIRECT_FNO_ARCHITECTURE}
+    if direct != direct_architecture:
         raise ValueError(
             "checkpoint prediction mode and architecture are incompatible: "
             f"prediction_mode={prediction_mode}, architecture={architecture}"
         )
     if prediction_mode == "direct_temperature" and physics_input_mode != "none":
         raise ValueError("direct_temperature checkpoint must use physics_input_mode=none")
+    if prediction_mode == "direct_temperature_fno":
+        if architecture != DIRECT_FNO_ARCHITECTURE or physics_input_mode != "none":
+            raise ValueError(
+                "direct_temperature_fno requires fno2d_direct_conditioned with "
+                "physics_input_mode=none"
+            )
     if (
         prediction_mode == "direct_temperature_source_conditioned"
         and physics_input_mode != "source_superposition_v1"
@@ -104,6 +118,16 @@ def validate_checkpoint_prediction_mode(
             "direct_temperature_source_conditioned checkpoint must use "
             "physics_input_mode=source_superposition_v1"
         )
+    if architecture == RESIDUAL_FNO_ARCHITECTURE:
+        if prediction_mode != "residual_decomposed_fno":
+            raise ValueError(
+                "fno2d_residual_decomposed_conditioned requires "
+                "prediction_mode=residual_decomposed_fno"
+            )
+        if physics_input_mode != "source_superposition_v1":
+            raise ValueError(
+                "residual_decomposed_fno requires physics_input_mode=source_superposition_v1"
+            )
 
 
 def main() -> int:
@@ -163,6 +187,7 @@ def main() -> int:
         "miniunet_refine_conditioned_decomposed_feature_fusion_graph",
         "miniunet_refine_conditioned_decomposed_pairwise",
         "miniunet_refine_conditioned_decomposed_pairwise_basis",
+        RESIDUAL_FNO_ARCHITECTURE,
     }
     conditioned = architecture in {
         "miniunet_refine_conditioned",
@@ -176,6 +201,8 @@ def main() -> int:
         "miniunet_refine_conditioned_decomposed_feature_fusion_graph",
         "miniunet_refine_conditioned_decomposed_pairwise",
         "miniunet_refine_conditioned_decomposed_pairwise_basis",
+        DIRECT_FNO_ARCHITECTURE,
+        RESIDUAL_FNO_ARCHITECTURE,
     }
     graph_stats = checkpoint["model_config"].get("graph_normalization")
     physics_input_mode = str(checkpoint["model_config"].get("physics_input_mode", "v1"))
@@ -201,7 +228,7 @@ def main() -> int:
     dataset = ChipThermDataset(
         args.index,
         target="temperature"
-        if prediction_mode in {"direct_temperature", "direct_temperature_source_conditioned"}
+        if prediction_mode in DIRECT_PREDICTION_MODES
         else "residual",
         return_metadata=True,
         return_graph=graph_enabled,
@@ -609,7 +636,7 @@ def evaluate(
         )
         coarse_norm = None
         alpha = None
-        if prediction_mode in {"direct_temperature", "direct_temperature_source_conditioned"}:
+        if prediction_mode in DIRECT_PREDICTION_MODES:
             if direct_target_stats is None:
                 raise ValueError("direct-temperature evaluation requires checkpoint target statistics")
             pred_direct = model(model_input, metadata_input) if conditioned else model(model_input)
@@ -703,10 +730,7 @@ def evaluate(
             pred_norm = model(model_input, metadata_input) if conditioned else model(model_input)
             pred_residual = unnormalize_residual(pred_norm.squeeze(1), stats)
             pred_temperature = physics + pred_residual
-        if not decomposed and prediction_mode not in {
-            "direct_temperature",
-            "direct_temperature_source_conditioned",
-        }:
+        if not decomposed and prediction_mode not in DIRECT_PREDICTION_MODES:
             if coarse_norm is not None:
                 coarse_residual = unnormalize_residual(coarse_norm.squeeze(1), stats)
                 coarse_temperature = physics + coarse_residual
