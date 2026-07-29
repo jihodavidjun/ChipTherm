@@ -200,6 +200,12 @@ def main() -> int:
     parser.add_argument("--disable-global-fusion-32", action="store_true")
     parser.add_argument("--disable-global-fusion-64", action="store_true")
     parser.add_argument("--graph-rasterizer-mode", default=None, choices=["vectorized", "legacy"])
+    parser.add_argument(
+        "--weights",
+        default="auto",
+        choices=["auto", "ema", "raw"],
+        help="Checkpoint weights to evaluate. Auto honors new checkpoint defaults and uses raw for legacy checkpoints.",
+    )
     args = parser.parse_args()
     if args.disable_graph_correction:
         args.graph_correction_scale = 0.0
@@ -216,7 +222,11 @@ def main() -> int:
     model = build_model(checkpoint["model_config"]).to(device)
     if args.graph_rasterizer_mode is not None and hasattr(model, "graph_rasterizer_mode"):
         model.graph_rasterizer_mode = args.graph_rasterizer_mode
-    model.load_state_dict(checkpoint["model_state_dict"])
+    selected_state, selected_weights = select_checkpoint_state_dict(
+        checkpoint,
+        args.weights,
+    )
+    model.load_state_dict(selected_state)
     model.eval()
     architecture = str(checkpoint["model_config"].get("architecture", "miniunet"))
     graph_enabled = architecture in {
@@ -393,6 +403,7 @@ def main() -> int:
         "schema_version": 1,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "checkpoint": str(args.checkpoint.resolve()),
+        "checkpoint_weights": selected_weights,
         "index": str(args.index.resolve()),
         "model": {
             "config": checkpoint["model_config"],
@@ -2200,6 +2211,34 @@ def synchronize(device: torch.device) -> None:
         torch.cuda.synchronize()
     elif device.type == "mps" and hasattr(torch, "mps"):
         torch.mps.synchronize()
+
+
+def select_checkpoint_state_dict(
+    checkpoint: dict[str, Any],
+    requested: str = "auto",
+) -> tuple[dict[str, torch.Tensor], str]:
+    if requested not in {"auto", "ema", "raw"}:
+        raise ValueError(f"unsupported checkpoint weight selection: {requested}")
+    selected = requested
+    if selected == "auto":
+        selected = str(
+            checkpoint.get("evaluation_default_weights")
+            or checkpoint.get("training_config", {}).get(
+                "evaluation_default_weights"
+            )
+            or "raw"
+        )
+    if selected == "ema":
+        state = checkpoint.get("ema_model_state_dict")
+        if not isinstance(state, dict):
+            raise ValueError(
+                "EMA weights were requested but this checkpoint has no ema_model_state_dict"
+            )
+        return state, "ema"
+    state = checkpoint.get("model_state_dict")
+    if not isinstance(state, dict):
+        raise ValueError("checkpoint has no raw model_state_dict")
+    return state, "raw"
 
 
 def load_checkpoint(path: Path, device: torch.device) -> dict[str, Any]:

@@ -158,6 +158,7 @@ def main() -> int:
         "--global-hidden-channels", str(config["global_hidden_channels"]),
         "--global-pool-size", str(config["global_pool_size"]),
         "--scheduler", str(config["scheduler"]),
+        "--cosine-eta-min", str(config.get("cosine_eta_min", 1.0e-6)),
         "--early-stopping-patience", str(config["early_stopping_patience"]),
         "--checkpoint-frequency", str(config["checkpoint_frequency"]),
         "--lineage-manifest", str(lineage_path),
@@ -165,6 +166,8 @@ def main() -> int:
         "--num-workers", str(args.workers),
         "--seed", str(args.seed),
     ]
+    if bool(config.get("ema_enabled", False)):
+        command.extend(["--ema", "--ema-decay", str(config.get("ema_decay", 0.999))])
     if coarse_config["enabled"]:
         command.append("--coarse-spatial-loss-enabled")
     if args.resume:

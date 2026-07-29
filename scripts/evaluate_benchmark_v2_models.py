@@ -38,6 +38,12 @@ def main() -> int:
     parser.add_argument("--save-predictions", action="store_true")
     parser.add_argument("--error-analysis", action="store_true")
     parser.add_argument(
+        "--weights",
+        default="auto",
+        choices=["auto", "ema", "raw"],
+        help="Pass through checkpoint weight selection to evaluate_residual_cnn.py.",
+    )
+    parser.add_argument(
         "--protocols",
         nargs="+",
         choices=PROTOCOLS,
@@ -74,6 +80,7 @@ def main() -> int:
             "--device", args.device,
             "--num-workers", str(args.workers),
             "--measure-end-to-end",
+            "--weights", args.weights,
         ]
         if args.profile_components:
             command.append("--profile-components")

@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import random
 import sys
 import time
 from collections import defaultdict
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -33,6 +35,7 @@ from chiptherm.ml.graph_models import (
     normalize_graph_batch,
 )
 from chiptherm.ml.fno_models import FNO_CAPACITY_PROFILES
+from chiptherm.ml.ema import ExponentialMovingAverage
 from chiptherm.ml.models import build_model, count_parameters
 from chiptherm.ml.normalization import (
     DirectTemperatureTargetStats,
@@ -166,6 +169,9 @@ def build_resume_signature(config: dict[str, Any]) -> dict[str, Any]:
             str((config.get("model") or {}).get("architecture", "miniunet")),
         ),
         "direct_target_normalization_mode": "none",
+        "cosine_eta_min": 1.0e-6,
+        "ema_enabled": False,
+        "ema_decay": 0.999,
     }
     return {
         key: config.get(key, optional_defaults[key]) if key in optional_defaults else config[key]
@@ -180,6 +186,9 @@ def build_resume_signature(config: dict[str, Any]) -> dict[str, Any]:
             "direct_target_normalization_mode",
             "mean_head_mode",
             "scheduler",
+            "cosine_eta_min",
+            "ema_enabled",
+            "ema_decay",
             "temp_loss_weight",
             "hotspot_loss_weight",
             "hotspot_top_frac",
@@ -204,6 +213,9 @@ def normalize_resume_signature(signature: dict[str, Any] | None) -> dict[str, An
     architecture = str((normalized.get("model") or {}).get("architecture", "miniunet"))
     normalized.setdefault("prediction_mode", resolve_prediction_mode("auto", architecture))
     normalized.setdefault("direct_target_normalization_mode", "none")
+    normalized.setdefault("cosine_eta_min", 1.0e-6)
+    normalized.setdefault("ema_enabled", False)
+    normalized.setdefault("ema_decay", 0.999)
     return normalized
 
 
@@ -526,6 +538,14 @@ def main() -> int:
     parser.add_argument("--num-workers", default=0, type=int)
     parser.add_argument("--seed", default=0, type=int)
     parser.add_argument("--scheduler", default="none", choices=["none", "plateau", "cosine"])
+    parser.add_argument("--cosine-eta-min", default=1.0e-6, type=float)
+    parser.add_argument(
+        "--ema",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Maintain an exponential moving average and use it for validation/checkpoint selection.",
+    )
+    parser.add_argument("--ema-decay", default=0.999, type=float)
     parser.add_argument("--temp-loss-weight", default=0.0, type=float)
     parser.add_argument("--hotspot-loss-weight", default=0.0, type=float)
     parser.add_argument("--hotspot-top-frac", default=0.05, type=float)
@@ -540,6 +560,13 @@ def main() -> int:
     parser.add_argument("--checkpoint-frequency", default=10, type=int)
     parser.add_argument("--lineage-manifest", default=None, type=Path)
     args = parser.parse_args()
+    if (
+        args.scheduler == "cosine"
+        and (args.cosine_eta_min < 0.0 or args.cosine_eta_min >= args.lr)
+    ):
+        raise SystemExit("--cosine-eta-min must be non-negative and smaller than --lr")
+    if args.ema and not 0.0 < args.ema_decay < 1.0:
+        raise SystemExit("--ema-decay must be strictly between 0 and 1")
     fno_profile = FNO_CAPACITY_PROFILES[args.fno_capacity_profile]
     fno_layers_was_default = args.fno_layers is None
     for argument, profile_key in (
@@ -1067,6 +1094,10 @@ def main() -> int:
         "num_workers": args.num_workers,
         "seed": args.seed,
         "scheduler": args.scheduler,
+        "cosine_eta_min": args.cosine_eta_min,
+        "ema_enabled": args.ema,
+        "ema_decay": args.ema_decay,
+        "evaluation_default_weights": "ema" if args.ema else "raw",
         "temp_loss_weight": args.temp_loss_weight,
         "temp_loss_scaling": "temperature L1 loss in Kelvin divided by train residual_std before weighting",
         "hotspot_loss_weight": args.hotspot_loss_weight,
@@ -1156,7 +1187,13 @@ def main() -> int:
             )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    scheduler = make_scheduler(args.scheduler, optimizer, args.epochs)
+    scheduler = make_scheduler(
+        args.scheduler,
+        optimizer,
+        args.epochs,
+        eta_min=args.cosine_eta_min,
+    )
+    ema = ExponentialMovingAverage(model, args.ema_decay) if args.ema else None
     criterion = nn.SmoothL1Loss()
     temp_criterion = nn.L1Loss()
 
@@ -1203,6 +1240,7 @@ def main() -> int:
     start_epoch = 1
     last_completed_epoch = 0
     last_train_losses: dict[str, float] | None = None
+    global_optimizer_step = 0
     training_lineage = (
         json.loads(args.lineage_manifest.read_text(encoding="utf-8"))
         if args.lineage_manifest
@@ -1224,14 +1262,36 @@ def main() -> int:
         )
         if resumed_signature != normalize_resume_signature(config["resume_signature"]):
             raise SystemExit("resume checkpoint training recipe differs from requested training")
+        requested_config_sha256 = hashlib.sha256(
+            json.dumps(
+                config["resume_signature"],
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        if (
+            resumed.get("config_sha256") is not None
+            and resumed["config_sha256"] != requested_config_sha256
+        ):
+            raise SystemExit("resume checkpoint config hash differs from requested training")
         model.load_state_dict(resumed["model_state_dict"])
         optimizer.load_state_dict(resumed["optimizer_state_dict"])
         if scheduler is not None and resumed.get("scheduler_state_dict") is not None:
             scheduler.load_state_dict(resumed["scheduler_state_dict"])
+        if ema is not None:
+            ema_state = resumed.get("ema_state_dict")
+            ema_model_state = resumed.get("ema_model_state_dict")
+            if ema_state is None or ema_model_state is None:
+                raise SystemExit("EMA resume requested but checkpoint has no EMA state")
+            ema.load_state_dict(
+                {**ema_state, "shadow": ema_model_state},
+                model=model,
+            )
         start_epoch = int(resumed["epoch"]) + 1
         last_completed_epoch = int(resumed["epoch"])
         best_val_mae = float(resumed.get("best_val_mae_K", float("inf")))
         epochs_without_improvement = int(resumed.get("epochs_without_improvement", 0))
+        global_optimizer_step = int(resumed.get("global_optimizer_step", 0))
 
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
@@ -1266,32 +1326,18 @@ def main() -> int:
             mean_head_mode=args.mean_head_mode,
             prediction_mode=prediction_mode,
             direct_target_stats=direct_target_stats,
+            ema=ema,
         )
+        global_optimizer_step += int(train_losses["optimizer_steps"])
         last_train_losses = train_losses
         last_completed_epoch = epoch
-        val_metrics, val_by_case = evaluate_model(
-            model,
-            val_loader,
-            criterion,
-            stats,
-            device,
-            decomposed=is_decomposed_arch,
-            conditioned=is_conditioned_arch,
-            lambda_final=args.lambda_final,
-            lambda_mean=args.lambda_mean,
-            physics_input_mode=args.physics_input,
-            graph_enabled=is_graph_arch,
-            graph_stats=graph_stats,
-            lambda_chiplet_mean=args.lambda_chiplet_mean,
-            mean_head_mode=args.mean_head_mode,
-            prediction_mode=prediction_mode,
-            direct_target_stats=direct_target_stats,
+        evaluation_context = (
+            ema.average_parameters(model) if ema is not None else nullcontext()
         )
-        train_final_mae_K: float | None = None
-        if should_compute_train_mae(epoch, args.epochs, args.train_mae_every):
-            train_metrics, _ = evaluate_model(
+        with evaluation_context:
+            val_metrics, val_by_case = evaluate_model(
                 model,
-                train_eval_loader,
+                val_loader,
                 criterion,
                 stats,
                 device,
@@ -1307,6 +1353,30 @@ def main() -> int:
                 prediction_mode=prediction_mode,
                 direct_target_stats=direct_target_stats,
             )
+        train_final_mae_K: float | None = None
+        if should_compute_train_mae(epoch, args.epochs, args.train_mae_every):
+            evaluation_context = (
+                ema.average_parameters(model) if ema is not None else nullcontext()
+            )
+            with evaluation_context:
+                train_metrics, _ = evaluate_model(
+                    model,
+                    train_eval_loader,
+                    criterion,
+                    stats,
+                    device,
+                    decomposed=is_decomposed_arch,
+                    conditioned=is_conditioned_arch,
+                    lambda_final=args.lambda_final,
+                    lambda_mean=args.lambda_mean,
+                    physics_input_mode=args.physics_input,
+                    graph_enabled=is_graph_arch,
+                    graph_stats=graph_stats,
+                    lambda_chiplet_mean=args.lambda_chiplet_mean,
+                    mean_head_mode=args.mean_head_mode,
+                    prediction_mode=prediction_mode,
+                    direct_target_stats=direct_target_stats,
+                )
             train_final_mae_K = float(train_metrics["final_temperature"]["mae_K"])
         epoch_runtime_s = time.perf_counter() - epoch_start
         val_final_mae = float(val_metrics["final_temperature"]["mae_K"])
@@ -1334,6 +1404,8 @@ def main() -> int:
                 best_val_mae=best_val_mae,
                 epochs_without_improvement=epochs_without_improvement,
                 training_lineage=training_lineage,
+                ema=ema,
+                global_optimizer_step=global_optimizer_step,
             )
         else:
             epochs_without_improvement += 1
@@ -1351,6 +1423,8 @@ def main() -> int:
             best_val_mae=best_val_mae,
             epochs_without_improvement=epochs_without_improvement,
             training_lineage=training_lineage,
+            ema=ema,
+            global_optimizer_step=global_optimizer_step,
         )
         if args.checkpoint_frequency > 0 and epoch % args.checkpoint_frequency == 0:
             save_checkpoint(
@@ -1366,6 +1440,8 @@ def main() -> int:
                 best_val_mae=best_val_mae,
                 epochs_without_improvement=epochs_without_improvement,
                 training_lineage=training_lineage,
+                ema=ema,
+                global_optimizer_step=global_optimizer_step,
             )
         append_train_log(
             log_path,
@@ -1409,6 +1485,8 @@ def main() -> int:
             "last_completed_epoch": last_completed_epoch,
             "final_training_losses": last_train_losses,
             "parameter_count": count_parameters(model),
+            "global_optimizer_step": global_optimizer_step,
+            "evaluation_weights": "ema" if ema is not None else "raw",
             "peak_gpu_memory_bytes": (
                 int(torch.cuda.max_memory_allocated(device))
                 if device.type == "cuda"
@@ -1622,6 +1700,7 @@ def train_one_epoch(
     mean_head_mode: str = "direct_k",
     prediction_mode: str = "residual",
     direct_target_stats: DirectTemperatureTargetStats | None = None,
+    ema: ExponentialMovingAverage | None = None,
 ) -> dict[str, float]:
     model.train()
     total_loss = 0.0
@@ -1648,6 +1727,7 @@ def train_one_epoch(
     basis_coeff_acc = VectorSummaryAccumulator()
     basis_weighted_coeff_acc = VectorSummaryAccumulator()
     total_samples = 0
+    optimizer_steps = 0
     for batch in loader:
         x = batch["x"].to(device, non_blocking=True)
         physics = batch["physics"].to(device, non_blocking=True)
@@ -1809,6 +1889,9 @@ def train_one_epoch(
             weighted_coarse_spatial_loss = pred.new_tensor(0.0)
         loss.backward()
         optimizer.step()
+        if ema is not None:
+            ema.update(model)
+        optimizer_steps += 1
 
         total_loss += float(loss.item()) * batch_size
         residual_loss_total += float(residual_loss.item()) * batch_size
@@ -1843,6 +1926,7 @@ def train_one_epoch(
         "graph_correction_abs_mean": graph_correction_total / denominator,
         "global_correction_abs_mean": global_correction_total / denominator,
         "chiplet_mean_loss_K": chiplet_mean_loss_total / denominator,
+        "optimizer_steps": float(optimizer_steps),
         **gate_acc.prefixed("gate_alpha"),
         **pairwise_k_acc.prefixed("pairwise_k"),
         **pairwise_contribution_acc.prefixed("pairwise_contribution"),
@@ -2605,16 +2689,49 @@ def save_checkpoint(
     best_val_mae: float,
     epochs_without_improvement: int,
     training_lineage: dict[str, Any] | None,
+    ema: ExponentialMovingAverage | None,
+    global_optimizer_step: int,
 ) -> None:
+    config_sha256 = hashlib.sha256(
+        json.dumps(
+            config.get("resume_signature", config),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
     torch.save(
         {
-            "schema_version": 1,
+            "schema_version": 2 if ema is not None else 1,
             "epoch": epoch,
             "best": best,
             "model_state_dict": model.state_dict(),
+            "ema_model_state_dict": ema.model_state_dict() if ema is not None else None,
+            "ema_state_dict": (
+                {
+                    "decay": ema.decay,
+                    "num_updates": ema.num_updates,
+                }
+                if ema is not None
+                else None
+            ),
+            "ema_decay": ema.decay if ema is not None else None,
+            "evaluation_default_weights": "ema" if ema is not None else "raw",
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
-            "model_config": config.get("model", model.config()),
+            "global_optimizer_step": int(global_optimizer_step),
+            "config_sha256": config_sha256,
+            "parameter_count": count_parameters(model),
+            "model_seed": config.get("seed"),
+            "source_version": (
+                training_lineage.get("source_superposition_version")
+                if training_lineage is not None
+                else None
+            ),
+            "model_config": (
+                config["model"]
+                if "model" in config
+                else model.config()
+            ),
             "training_config": config,
             "normalization": stats.to_dict(),
             "metrics": metrics,
@@ -2871,6 +2988,8 @@ def make_scheduler(
     scheduler_name: str,
     optimizer: torch.optim.Optimizer,
     epochs: int,
+    *,
+    eta_min: float = 1.0e-6,
 ) -> torch.optim.lr_scheduler.LRScheduler | torch.optim.lr_scheduler.ReduceLROnPlateau | None:
     if scheduler_name == "none":
         return None
@@ -2886,7 +3005,7 @@ def make_scheduler(
         return torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
             T_max=max(int(epochs), 1),
-            eta_min=1.0e-6,
+            eta_min=float(eta_min),
         )
     raise ValueError(f"unsupported scheduler: {scheduler_name}")
 
