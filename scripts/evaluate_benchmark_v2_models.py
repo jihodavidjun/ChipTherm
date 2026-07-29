@@ -20,6 +20,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Evaluate a frozen Benchmark v2 residual model on immutable protocols.")
     parser.add_argument("--data-root", default=os.environ.get("CHIPTHERM_V2_DATA_ROOT"), type=Path)
     parser.add_argument("--source-version", required=True)
+    parser.add_argument(
+        "--known-family-index",
+        type=Path,
+        default=None,
+        help=(
+            "Optional family-scaling known-test index. Held-out validation and "
+            "primary-test indices always remain canonical."
+        ),
+    )
     parser.add_argument("--checkpoint", required=True, type=Path)
     parser.add_argument("--out-dir", required=True, type=Path)
     parser.add_argument("--batch-size", default=64, type=int)
@@ -45,7 +54,11 @@ def main() -> int:
     root = args.data_root.expanduser().resolve()
     index_root = root / f"derived/indices/full_50x200/source_superposition/{args.source_version}"
     evaluations = {
-        "known_family_sample_test": index_root / "sample_split/test_index.csv",
+        "known_family_sample_test": (
+            args.known_family_index.expanduser().resolve()
+            if args.known_family_index is not None
+            else index_root / "sample_split/test_index.csv"
+        ),
         "primary_validation_families": index_root / "family_split/val_index.csv",
         "primary_test_families": index_root / "family_split/test_index.csv",
     }

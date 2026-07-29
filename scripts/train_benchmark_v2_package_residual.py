@@ -49,6 +49,16 @@ def main() -> int:
     parser.add_argument("--workers", default=4, type=int)
     parser.add_argument("--seed", default=1, type=int)
     parser.add_argument("--train-family-count", default=40, choices=[5, 10, 20, 30, 40], type=int)
+    parser.add_argument(
+        "--prepared-index-root",
+        type=Path,
+        default=None,
+        help=(
+            "Optional immutable family-scaling subset containing train_index.csv, "
+            "val_index.csv, and subset_manifest.json. The default canonical index "
+            "generation path is unchanged when omitted."
+        ),
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--smoke-test", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -60,24 +70,39 @@ def main() -> int:
         raise SystemExit("training preflight has not passed")
     root = args.data_root.expanduser().resolve()
     version_root = root / f"derived/indices/full_50x200/source_superposition/{args.source_version}"
-    sample_split_root = prepare_residual_scaling_indices(
-        root,
-        source_version=args.source_version,
-        family_count=args.train_family_count,
-        seed=int(preflight.get("determinism", {}).get("seed", 20260721)),
-    )
-    index_root = version_root
+    if args.prepared_index_root is None:
+        sample_split_root = prepare_residual_scaling_indices(
+            root,
+            source_version=args.source_version,
+            family_count=args.train_family_count,
+            seed=int(preflight.get("determinism", {}).get("seed", 20260721)),
+        )
+        manifest = version_root / "index_manifest.json"
+    else:
+        sample_split_root = args.prepared_index_root.expanduser().resolve()
+        manifest = sample_split_root / "subset_manifest.json"
+        if not manifest.is_file():
+            raise SystemExit(f"prepared subset manifest is missing: {manifest}")
+        subset = json.loads(manifest.read_text(encoding="utf-8"))
+        if int(subset.get("family_count", -1)) != args.train_family_count:
+            raise SystemExit("prepared subset family_count does not match --train-family-count")
+        if subset.get("source_version") != args.source_version:
+            raise SystemExit("prepared subset source version does not match --source-version")
+        if subset.get("selection_uses_heldout_families") is not False:
+            raise SystemExit("prepared subset does not prove held-out-family exclusion")
     train_index = sample_split_root / "train_index.csv"
     val_index = sample_split_root / "val_index.csv"
-    manifest = index_root / "index_manifest.json"
     if not all(path.is_file() for path in (train_index, val_index, manifest)):
         raise SystemExit("validated source-version residual indices are missing")
-    if args.train_family_count == 40:
-        counts = {"train": len(read_csv(train_index)), "val": len(read_csv(val_index))}
-        if counts != {"train": 6400, "val": 800}:
-            raise SystemExit(
-                f"final residual optimization must use the 6400/800 train-family split, got {counts}"
-            )
+    counts = {"train": len(read_csv(train_index)), "val": len(read_csv(val_index))}
+    expected_counts = {
+        "train": 160 * args.train_family_count,
+        "val": 20 * args.train_family_count,
+    }
+    if counts != expected_counts:
+        raise SystemExit(
+            f"residual scaling split counts must be {expected_counts}, got {counts}"
+        )
     config = yaml.safe_load(args.config.read_text(encoding="utf-8"))
     coarse_config = resolve_coarse_spatial_loss_config(config)
     out_dir = args.out_dir.expanduser().resolve()
