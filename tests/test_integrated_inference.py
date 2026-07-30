@@ -87,7 +87,12 @@ class IntegratedInferenceSmokeTest(unittest.TestCase):
         rows = rows_from_batch_metadata(batch["metadata"], 1)
         result = self.model.predict_batch(batch, rows, source_batch_size=8, profile_components=True)
 
-        for key in ("source_superposition_base_K", "final_temperature_K", "cnn_only_temperature_K"):
+        for key in (
+            "source_superposition_base_K",
+            "final_temperature_K",
+            "final_temperature_host_K",
+            "cnn_only_temperature_K",
+        ):
             value = result[key]
             self.assertEqual(tuple(value.shape), (1, 64, 64), key)
             self.assertTrue(torch.isfinite(value).all(), key)

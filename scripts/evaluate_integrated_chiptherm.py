@@ -26,8 +26,8 @@ from chiptherm.ml.dataset import ChipThermDataset, chiptherm_collate  # noqa: E4
 from chiptherm.ml.graph_models import chiplet_metric_values  # noqa: E402
 from chiptherm.ml.integrated_inference import (  # noqa: E402
     IntegratedChipThermModel,
-    resolve_path,
-    rows_from_batch_metadata,
+    resolve_declared_path,
+    sha256_file,
 )
 
 
@@ -41,7 +41,16 @@ def main() -> int:
     parser.add_argument("--source-checkpoint", required=True, type=Path)
     parser.add_argument("--residual-checkpoint", required=True, type=Path)
     parser.add_argument("--index", required=True, type=Path)
+    parser.add_argument(
+        "--data-root",
+        default=None,
+        type=Path,
+        help="Declared Benchmark v2 root used to resolve every portable index path.",
+    )
+    parser.add_argument("--metadata-root", default=None, type=Path)
+    parser.add_argument("--graph-root", default=None, type=Path)
     parser.add_argument("--out-dir", required=True, type=Path)
+    parser.add_argument("--mode", default="reference", choices=["reference", "optimized"])
     parser.add_argument("--package-batch-size", nargs="+", default=[8], type=int)
     parser.add_argument("--source-batch-size", nargs="+", default=[64], type=int)
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda", "mps"])
@@ -75,10 +84,15 @@ def main() -> int:
     out_dir = args.out_dir.expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     device = select_device(args.device)
+    if args.mode in {"reference", "optimized"} and args.precision != "fp32":
+        raise SystemExit("authoritative reference/optimized modes require --precision fp32")
+    model_load_start = time.perf_counter()
     integrated = IntegratedChipThermModel(
         source_checkpoint=args.source_checkpoint,
         residual_checkpoint=args.residual_checkpoint,
         device=device,
+        data_root=args.data_root,
+        execution_mode=args.mode,
         deterministic=args.deterministic,
         precision=args.precision,
         channels_last=args.channels_last,
@@ -88,6 +102,8 @@ def main() -> int:
         device_summation=args.device_summation,
         non_blocking_transfer=args.non_blocking_transfer,
     )
+    integrated.device_synchronize()
+    model_loading_s = time.perf_counter() - model_load_start
     canonical_rows_all = read_rows(args.index)
     canonical_rows = select_rows(canonical_rows_all, max_samples=args.max_samples, mode=args.sample_selection)
     cached_rows = read_rows(args.compare_cached_index) if args.compare_cached_index else None
@@ -104,6 +120,9 @@ def main() -> int:
             payload = evaluate_once(
                 integrated=integrated,
                 index=args.index,
+                data_root=args.data_root,
+                metadata_root=args.metadata_root,
+                graph_root=args.graph_root,
                 cached_rows=cached_rows,
                 selected_rows=canonical_rows,
                 out_dir=out_dir,
@@ -117,7 +136,7 @@ def main() -> int:
                 sample_selection=args.sample_selection,
                 warmup_batches=args.warmup_batches,
                 timed_batches=args.timed_batches if (len(args.package_batch_size) > 1 or len(args.source_batch_size) > 1) else None,
-                inference_mode=args.inference_mode,
+                inference_mode=bool(args.inference_mode or args.mode == "optimized"),
                 pinned_memory=args.pinned_memory,
             )
             runtime_rows.append(runtime_summary_row(package_batch_size, source_batch_size, payload))
@@ -125,6 +144,7 @@ def main() -> int:
                 primary_payload = payload
 
     assert primary_payload is not None
+    primary_payload["runtime"]["model_loading_s"] = model_loading_s
     write_csv(out_dir / "integrated_runtime_by_batch_size.csv", runtime_rows)
     write_csv(out_dir / "runtime_sweep.csv", runtime_rows)
     write_csv(out_dir / "integrated_runtime_components.csv", runtime_component_rows(primary_payload))
@@ -139,7 +159,32 @@ def main() -> int:
     (out_dir / "numerical_equivalence.json").write_text(json.dumps(primary_payload["equivalence"], indent=2, sort_keys=True) + "\n", encoding="utf-8")
     (out_dir / "integrated_manifest.json").write_text(json.dumps(primary_payload["manifest"], indent=2, sort_keys=True) + "\n", encoding="utf-8")
     (out_dir / "integrated_inference_manifest.json").write_text(json.dumps(primary_payload["manifest"], indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    (out_dir / "integrated_runtime_manifest.json").write_text(
+        json.dumps(primary_payload["manifest"], indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    (out_dir / "integrated_runtime_summary.json").write_text(
+        json.dumps(primary_payload["runtime"], indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    (out_dir / "integrated_equivalence_report.json").write_text(
+        json.dumps(primary_payload["equivalence"], indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    write_csv(out_dir / "integrated_runtime_metrics.csv", runtime_rows)
+    write_csv(out_dir / "integrated_stage_breakdown.csv", runtime_component_rows(primary_payload))
+    write_csv(
+        out_dir / "integrated_runtime_by_source_count.csv",
+        primary_payload["runtime"].get("runtime_by_source_count", []),
+    )
+    environment = dict(primary_payload["manifest"].get("software", {}))
+    environment["model_loading_s"] = model_loading_s
+    (out_dir / "environment_metadata.json").write_text(
+        json.dumps(environment, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    optimization_inventory = build_optimization_inventory(args, primary_payload)
+    (out_dir / "optimization_inventory.json").write_text(
+        json.dumps(optimization_inventory, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     write_report(out_dir / "integrated_report.md", primary_payload)
+    write_report(out_dir / "integrated_runtime_report.md", primary_payload)
 
     if args.compare_cached_index and primary_payload["equivalence"].get("ok") is False:
         (out_dir / "FAILED_NUMERICAL_EQUIVALENCE").write_text(
@@ -165,6 +210,9 @@ def evaluate_once(
     *,
     integrated: IntegratedChipThermModel,
     index: Path,
+    data_root: Path | None,
+    metadata_root: Path | None,
+    graph_root: Path | None,
     cached_rows: list[dict[str, str]] | None,
     selected_rows: list[dict[str, str]],
     out_dir: Path,
@@ -181,7 +229,18 @@ def evaluate_once(
     inference_mode: bool,
     pinned_memory: bool,
 ) -> dict[str, Any]:
-    dataset = ChipThermDataset(index, target="residual", return_metadata=True, return_graph=integrated.graph_enabled)
+    dataset = ChipThermDataset(
+        index,
+        target="residual",
+        return_metadata=True,
+        metadata_root=metadata_root,
+        graph_root=graph_root,
+        return_graph=integrated.graph_enabled,
+        physical_representation=str(integrated.residual_config.get("physical_representation", "dimensional")),
+        load_temperature=False,
+        load_physics=False,
+        load_residual=False,
+    )
     dataset.rows = list(selected_rows)
     loader = DataLoader(
         dataset,
@@ -219,6 +278,7 @@ def evaluate_once(
     sample_offset = 0
     measured_batches = 0
     total_batches = 0
+    cold_start_latency_s: float | None = None
     while True:
         if timed_batches is not None and measured_batches >= timed_batches:
             break
@@ -229,7 +289,8 @@ def evaluate_once(
         except StopIteration:
             break
         batch_size = int(batch["x"].shape[0])
-        batch_rows = rows_from_batch_metadata(batch["metadata"], batch_size)
+        batch_rows = selected_rows[sample_offset : sample_offset + batch_size]
+        integrated.device_synchronize()
         batch_start = time.perf_counter()
         context = torch.inference_mode() if inference_mode else nullcontext()
         with context:
@@ -239,24 +300,38 @@ def evaluate_once(
                 source_batch_size=source_batch_size,
                 profile_components=profile_components,
             )
+        integrated.device_synchronize()
         total_latency_s = time.perf_counter() - batch_start + data_loading_s
+        if cold_start_latency_s is None:
+            cold_start_latency_s = total_latency_s
         if total_batches >= warmup_batches:
             timings = dict(result["timings"])
             timings["data_loading_batch_preparation_s"] = data_loading_s
             timings["raw_input_to_output_latency_s"] = total_latency_s
-            runtime.update(timings, batch_size, sum(result["source_counts"]))
+            runtime.update(
+                timings,
+                batch_size,
+                result["source_counts"],
+                timing_methods=result.get("timing_methods"),
+            )
             measured_batches += 1
         source_counts.extend(int(value) for value in result["source_counts"])
 
-        temperature = result["temperature"]
+        temperature = load_target_batch(batch_rows, data_root=data_root).to(device)
         final = result["final_temperature_K"]
         cnn_only = result["cnn_only_temperature_K"]
         base = result["source_superposition_base_K"]
         outputs = result["outputs"]
         ambient = result["ambient_K"]
-        centered_pred = final - final.mean(dim=(-2, -1), keepdim=True)
-        centered_target = temperature - temperature.mean(dim=(-2, -1), keepdim=True)
-        mean_target = (temperature - ambient[:, None, None]).mean(dim=(-2, -1))
+        if integrated.mean_head_mode == "residual_resistance":
+            residual_target = temperature - base
+            mean_target = residual_target.mean(dim=(-2, -1))
+            centered_target = residual_target - mean_target[:, None, None]
+        else:
+            mean_target = (temperature - ambient[:, None, None]).mean(dim=(-2, -1))
+            centered_target = temperature - temperature.mean(dim=(-2, -1), keepdim=True)
+        centered_pred = outputs["centered_field"]
+        centered_pred = centered_pred - centered_pred.mean(dim=(-2, -1), keepdim=True)
 
         final_acc.update(final, temperature)
         cnn_only_acc.update(cnn_only, temperature)
@@ -286,7 +361,14 @@ def evaluate_once(
 
         if cached_rows is not None:
             cached_batch = cached_rows[sample_offset : sample_offset + batch_size]
-            compare_cached_batch(integrated, batch, cached_batch, result, equivalence)
+            compare_cached_batch(
+                integrated,
+                batch,
+                cached_batch,
+                result,
+                equivalence,
+                data_root=data_root,
+            )
         sample_offset += batch_size
         total_batches += 1
 
@@ -309,11 +391,20 @@ def evaluate_once(
         },
     }
     runtime_payload = runtime.compute()
+    runtime_payload["cold_start_host_to_host_s"] = cold_start_latency_s
+    runtime_payload["stage_accounting_note"] = (
+        "Some profile components are nested diagnostics (for example residual submodules inside "
+        "residual_total_forward_s); stage percentages must not be summed unless parent rows are excluded."
+    )
     add_gpu_model_runtime(runtime_payload)
     if device.type == "cuda":
         runtime_payload["peak_cuda_memory_allocated_bytes"] = int(torch.cuda.max_memory_allocated(device))
         runtime_payload["peak_cuda_memory_reserved_bytes"] = int(torch.cuda.max_memory_reserved(device))
     runtime_payload["hotspot_reference_s_per_package"] = HOTSPOT_REFERENCE_S
+    runtime_payload["hotspot_reference_semantics"] = (
+        "Recorded CPU wall time per package from the existing benchmark; "
+        "hardware-specific, non-amortized, and not part of ChipTherm inference."
+    )
     runtime_payload["speedup_vs_hotspot"] = (
         HOTSPOT_REFERENCE_S / runtime_payload["runtime_per_package_s"]
         if runtime_payload.get("runtime_per_package_s")
@@ -330,6 +421,8 @@ def evaluate_once(
         {
             "package_batch_size": package_batch_size,
             "source_batch_size": source_batch_size,
+            "index": str(index.expanduser().resolve()),
+            "index_sha256": sha256_file(index.expanduser().resolve()),
             "profile_components": profile_components,
             "max_samples": max_samples,
             "sample_selection": sample_selection if max_samples is not None else "full",
@@ -340,6 +433,14 @@ def evaluate_once(
             "hard_tolerance_K": HARD_TOLERANCE_K,
             "inference_mode": inference_mode,
             "pinned_memory": pinned_memory,
+            "num_workers": num_workers,
+            "data_loading_semantics": (
+                "Synchronous per-batch load included in host-to-host latency"
+                if num_workers == 0
+                else "DataLoader prefetch/worker overlap enabled; throughput timing, not cold single-request loading"
+            ),
+            "target_loading_note": "HotSpot target arrays are loaded after the timed inference boundary for metrics only.",
+            "target_used_by_model": False,
         }
     )
     source_counts_array = np.asarray(source_counts, dtype=np.float64) if source_counts else np.asarray([], dtype=np.float64)
@@ -375,13 +476,17 @@ def compare_cached_batch(
     cached_rows: list[dict[str, str]],
     integrated_result: dict[str, Any],
     equivalence: "EquivalenceAccumulator",
+    *,
+    data_root: Path | None,
 ) -> None:
     source_base_values = []
     for row in cached_rows:
         value = row.get("source_superposition_base_path")
         if not value:
             raise ValueError(f"cached row {row.get('sample_uid')} is missing source_superposition_base_path")
-        source_base_values.append(np.load(resolve_path(value)).astype(np.float32, copy=False))
+        source_base_values.append(
+            np.load(resolve_declared_path(value, data_root=data_root)).astype(np.float32, copy=False)
+        )
     cached_base = torch.from_numpy(np.stack(source_base_values).astype(np.float32, copy=False))
     cached_result = integrated.residual_from_base(batch, cached_base)
     equivalence.update("source_superposition_base_K", integrated_result["source_superposition_base_K"], cached_base.to(integrated.device))
@@ -503,12 +608,37 @@ class RuntimeAccumulator:
         self.values: dict[str, list[float]] = defaultdict(list)
         self.total_packages = 0
         self.total_sources = 0
+        self.batch_records: list[dict[str, float]] = []
+        self.timing_methods: dict[str, str] = {}
 
-    def update(self, timings: dict[str, float], packages: int, sources: int) -> None:
+    def update(
+        self,
+        timings: dict[str, float],
+        packages: int,
+        source_counts: list[int],
+        *,
+        timing_methods: dict[str, str] | None = None,
+    ) -> None:
+        sources = sum(int(value) for value in source_counts)
         self.total_packages += int(packages)
         self.total_sources += int(sources)
         for key, value in timings.items():
             self.values[key].append(float(value))
+        for key, method in (timing_methods or {}).items():
+            previous = self.timing_methods.get(key)
+            if previous is not None and previous != method:
+                raise ValueError(f"inconsistent timing method for {key}: {previous} != {method}")
+            self.timing_methods[key] = method
+        latency = float(timings.get("raw_input_to_output_latency_s", 0.0))
+        self.batch_records.append(
+            {
+                "packages": float(packages),
+                "sources": float(sources),
+                "mean_sources_per_package": float(sources / max(packages, 1)),
+                "latency_s": latency,
+                "latency_s_per_package": float(latency / max(packages, 1)),
+            }
+        )
 
     def compute(self) -> dict[str, Any]:
         total_latency = sum(self.values.get("raw_input_to_output_latency_s", []))
@@ -521,6 +651,10 @@ class RuntimeAccumulator:
             "throughput_packages_per_s": self.total_packages / total_latency if total_latency > 0 else None,
             "batch_latency_s": summarize_runtime_values(self.values.get("raw_input_to_output_latency_s", [])),
             "components": {},
+            "runtime_by_source_count": sorted(
+                self.batch_records,
+                key=lambda row: (row["mean_sources_per_package"], row["packages"]),
+            ),
         }
         for key, values in sorted(self.values.items()):
             arr = np.asarray(values, dtype=np.float64)
@@ -528,9 +662,18 @@ class RuntimeAccumulator:
                 "total_s": float(arr.sum()),
                 "mean_s_per_batch": float(arr.mean()),
                 "median_s_per_batch": float(np.median(arr)),
+                "std_s_per_batch": float(arr.std()),
+                "p50_s_per_batch": float(np.percentile(arr, 50)),
+                "p90_s_per_batch": float(np.percentile(arr, 90)),
                 "p95_s_per_batch": float(np.percentile(arr, 95)),
                 "p99_s_per_batch": float(np.percentile(arr, 99)),
                 "mean_s_per_package": float(arr.sum() / max(self.total_packages, 1)),
+                "timing_method": self.timing_methods.get(
+                    key,
+                    "synchronized_wall_clock"
+                    if key == "raw_input_to_output_latency_s"
+                    else "host_wall_clock",
+                ),
             }
         return result
 
@@ -621,9 +764,15 @@ def runtime_summary_row(package_batch_size: int, source_batch_size: int, payload
 
 def runtime_component_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
     rows = []
+    full_runtime = float(payload["runtime"].get("runtime_total_s") or 0.0)
     for name, component in sorted(payload["runtime"].get("components", {}).items()):
         row = {"component": name}
         row.update(component)
+        row["percent_of_full_host_to_host"] = (
+            100.0 * float(component.get("total_s", 0.0)) / full_runtime
+            if full_runtime > 0
+            else None
+        )
         rows.append(row)
     return rows
 
@@ -661,8 +810,68 @@ def summarize_runtime_values(values: list[float]) -> dict[str, float]:
     return {
         "mean_s": float(arr.mean()),
         "median_s": float(np.median(arr)),
+        "std_s": float(arr.std()),
+        "p50_s": float(np.percentile(arr, 50)),
+        "p90_s": float(np.percentile(arr, 90)),
         "p95_s": float(np.percentile(arr, 95)),
         "p99_s": float(np.percentile(arr, 99)),
+    }
+
+
+def load_target_batch(rows: list[dict[str, str]], *, data_root: Path | None) -> torch.Tensor:
+    arrays: list[np.ndarray] = []
+    for row in rows:
+        value = row.get("y_path") or row.get("target_path") or row.get("final_temperature")
+        if not value:
+            raise ValueError(
+                f"{row.get('sample_uid', '<unknown>')} is missing a target path; "
+                f"available columns={sorted(row)}"
+            )
+        path = resolve_declared_path(value, data_root=data_root)
+        array = np.load(path).astype(np.float32, copy=False)
+        if array.shape != (64, 64):
+            raise ValueError(f"{path} target shape is {array.shape}, expected (64, 64)")
+        if not np.isfinite(array).all():
+            raise ValueError(f"{path} target contains NaN/Inf")
+        arrays.append(array)
+    return torch.from_numpy(np.stack(arrays).astype(np.float32, copy=False))
+
+
+def build_optimization_inventory(args: argparse.Namespace, payload: dict[str, Any]) -> dict[str, Any]:
+    enabled = {
+        "torch_inference_mode": bool(args.inference_mode or args.mode == "optimized"),
+        "pinned_memory": bool(args.pinned_memory),
+        "non_blocking_transfer": bool(args.non_blocking_transfer),
+        "channels_last": bool(args.channels_last),
+        "torch_compile_source": bool(args.compile_source),
+        "torch_compile_package_cnn": bool(args.compile_package_cnn),
+        "torch_compile_graph": bool(args.compile_graph),
+        "device_summation": bool(args.device_summation),
+    }
+    unsafe = {
+        "channels_last",
+        "torch_compile_source",
+        "torch_compile_package_cnn",
+        "torch_compile_graph",
+        "device_summation",
+    }
+    entries = []
+    for name, active in enabled.items():
+        if not active:
+            status = "not_enabled"
+        elif name in unsafe:
+            status = "experimental_requires_strict_equivalence"
+        elif name == "torch_inference_mode":
+            status = "candidate_requires_strict_equivalence_and_gt_measurement"
+        else:
+            status = "pending_gt_measurement"
+        entries.append({"optimization": name, "enabled": active, "status": status})
+    return {
+        "mode": args.mode,
+        "authoritative_precision": args.precision,
+        "equivalence": payload.get("equivalence", {}),
+        "optimizations": entries,
+        "selection_rule": "Accept only after <=1e-5 K reference-output max difference, <=1e-6 K aggregate MAE difference, and measured GT speedup.",
     }
 
 
@@ -800,13 +1009,10 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
 def add_gpu_model_runtime(runtime_payload: dict[str, Any]) -> None:
     components = runtime_payload.get("components", {})
     gpu_keys = (
-        "source_host_to_device_transfer_s",
         "source_input_normalization_s",
         "source_response_model_inference_s",
         "source_kw_denormalization_s",
         "source_power_scaling_s",
-        "source_segment_sum_s",
-        "ambient_base_reconstruction_s",
         "residual_input_assembly_s",
         "residual_total_forward_s",
         "final_reconstruction_s",
@@ -815,7 +1021,7 @@ def add_gpu_model_runtime(runtime_payload: dict[str, Any]) -> None:
     present = []
     for key in gpu_keys:
         component = components.get(key)
-        if component:
+        if component and component.get("timing_method") == "cuda_event":
             total += float(component.get("total_s", 0.0))
             present.append(key)
     packages = float(runtime_payload.get("num_packages") or 0.0)
@@ -824,8 +1030,25 @@ def add_gpu_model_runtime(runtime_payload: dict[str, Any]) -> None:
     runtime_payload["gpu_model_throughput_packages_per_s"] = packages / total if total > 0 else None
     runtime_payload["gpu_model_runtime_components"] = present
     runtime_payload["gpu_model_runtime_note"] = (
-        "This is model-side tensor work after DataLoader timing and excludes package YAML/JSON parsing and source raster construction. "
-        "With host summation it still includes source_segment_sum_s because it is part of the model assembly path."
+        "Sum of CUDA-event-measured FP32 device compute stages. It excludes H2D transfer, "
+        "package parsing, raster construction, host float64 source summation, and model loading."
+    )
+    transfer_total = 0.0
+    transfer_present = []
+    for key in ("canonical_batch_host_to_device_s", "source_host_to_device_transfer_s"):
+        transfer = components.get(key, {})
+        if transfer.get("timing_method") == "cuda_event":
+            transfer_total += float(transfer.get("total_s", 0.0))
+            transfer_present.append(key)
+    runtime_payload["host_to_device_transfer_total_s"] = (
+        transfer_total if transfer_present else None
+    )
+    runtime_payload["host_to_device_transfer_components"] = transfer_present
+    output_transfer = components.get("final_device_to_host_transfer_s", {})
+    runtime_payload["device_to_host_output_transfer_total_s"] = (
+        float(output_transfer.get("total_s", 0.0))
+        if output_transfer.get("timing_method") == "cuda_event"
+        else None
     )
 
 
@@ -865,11 +1088,15 @@ def write_report(path: Path, payload: dict[str, Any]) -> None:
         f"| Chiplet peak MAE K | {metrics.get('chiplet_peak_temperature', {}).get('mae_K', float('nan')):.4f} |",
         f"| Inter-chiplet delta-T MAE K | {metrics.get('inter_chiplet_delta_T', {}).get('mae_K', float('nan')):.4f} |",
         f"| Integrated runtime/package s | {runtime.get('runtime_per_package_s', float('nan')):.6f} |",
+        f"| Residual CNN-only runtime/package s | {runtime.get('components', {}).get('residual_total_forward_s', {}).get('mean_s_per_package', float('nan')):.6f} |",
+        f"| Source-response runtime/package s | {runtime.get('components', {}).get('source_response_model_inference_s', {}).get('mean_s_per_package', float('nan')):.6f} |",
         f"| Speedup vs HotSpot | {runtime.get('speedup_vs_hotspot', float('nan')):.1f}x |",
         "",
         f"Numerical equivalence ok: `{equivalence.get('ok')}`",
         "",
         "Cached source-base runtime is not the uncached deployment runtime; this integrated report includes source-base generation.",
+        "The HotSpot reference is recorded CPU wall time per package and is hardware-specific and non-amortized.",
+        "Model loading and metric-only HotSpot target loading are reported/excluded from steady-state inference as documented.",
         "",
     ]
     path.write_text("\n".join(lines), encoding="utf-8")

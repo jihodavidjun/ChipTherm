@@ -221,6 +221,9 @@ class ChipThermDataset(Dataset):
         graph_root: str | Path | None = None,
         return_graph: bool = True,
         physical_representation: PhysicalRepresentation = "dimensional",
+        load_temperature: bool = True,
+        load_physics: bool = True,
+        load_residual: bool = True,
     ) -> None:
         self.index_csv = Path(index_csv).expanduser().resolve()
         self.transform = transform
@@ -230,6 +233,9 @@ class ChipThermDataset(Dataset):
         self.graph_root = Path(graph_root).expanduser().resolve() if graph_root is not None else None
         self.return_graph = bool(return_graph)
         self.physical_representation = str(physical_representation)
+        self.load_temperature = bool(load_temperature)
+        self.load_physics = bool(load_physics)
+        self.load_residual = bool(load_residual)
         if target not in {"residual", "temperature"}:
             raise ValueError("target must be 'residual' or 'temperature'")
         if self.physical_representation not in {"dimensional", "dimensionless_v1", "dimensionless_v2"}:
@@ -252,28 +258,45 @@ class ChipThermDataset(Dataset):
 
         x = self._load_tensor(row["x_path"], expected_ndim=3)
         x = self._apply_physical_representation(row, x)
-        temperature = self._load_tensor(self._temperature_path_for_row(row), expected_ndim=2)
-        physics_path_value = self._prediction_path_for_row(row)
-        physics = self._load_tensor(physics_path_value, expected_ndim=2)
-        residual_path_value = self._residual_path_for_row(row)
-        residual_path = self._resolve_path(residual_path_value) if residual_path_value else None
-        if residual_path is not None and residual_path.exists():
-            residual = self._load_tensor(residual_path_value, expected_ndim=2)
-        else:
-            residual = temperature - physics
-
-        target_tensor = residual if self.target == "residual" else temperature
         sample: dict[str, Any] = {
             "x": x,
-            "target": target_tensor,
-            "physics": physics,
-            "temperature": temperature,
-            "residual": residual,
             "ambient_K": torch.tensor(self._ambient_for_row(row), dtype=torch.float32),
             "total_power_W": torch.tensor(self._total_power_for_row(row), dtype=torch.float32),
         }
+        temperature = (
+            self._load_tensor(self._temperature_path_for_row(row), expected_ndim=2)
+            if self.load_temperature
+            else None
+        )
+        physics = (
+            self._load_tensor(self._prediction_path_for_row(row), expected_ndim=2)
+            if self.load_physics
+            else None
+        )
+        residual: torch.Tensor | None = None
+        if self.load_residual:
+            if temperature is None or physics is None:
+                raise ValueError(
+                    "load_residual=True requires load_temperature=True and load_physics=True"
+                )
+            residual_path_value = self._residual_path_for_row(row)
+            residual_path = self._resolve_path(residual_path_value) if residual_path_value else None
+            if residual_path is not None and residual_path.exists():
+                residual = self._load_tensor(residual_path_value, expected_ndim=2)
+            else:
+                residual = temperature - physics
+        if temperature is not None:
+            sample["temperature"] = temperature
+        if physics is not None:
+            sample["physics"] = physics
+        if residual is not None:
+            sample["residual"] = residual
+        if self.target == "residual" and residual is not None:
+            sample["target"] = residual
+        elif self.target == "temperature" and temperature is not None:
+            sample["target"] = temperature
         physics_v1_path_value = self._physics_v1_path_for_row(row)
-        if physics_v1_path_value is not None:
+        if self.load_physics and physics_v1_path_value is not None:
             sample["physics_v1"] = self._load_tensor(physics_v1_path_value, expected_ndim=2)
         metadata_vector = self._metadata_vector_for_row(row)
         if metadata_vector is not None:
