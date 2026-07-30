@@ -169,6 +169,7 @@ def build_resume_signature(config: dict[str, Any]) -> dict[str, Any]:
             str((config.get("model") or {}).get("architecture", "miniunet")),
         ),
         "direct_target_normalization_mode": "none",
+        "weight_decay": 1.0e-2,
         "cosine_eta_min": 1.0e-6,
         "ema_enabled": False,
         "ema_decay": 0.999,
@@ -180,6 +181,7 @@ def build_resume_signature(config: dict[str, Any]) -> dict[str, Any]:
             "val_index",
             "batch_size",
             "lr",
+            "weight_decay",
             "physics_input_mode",
             "physical_representation",
             "prediction_mode",
@@ -213,6 +215,7 @@ def normalize_resume_signature(signature: dict[str, Any] | None) -> dict[str, An
     architecture = str((normalized.get("model") or {}).get("architecture", "miniunet"))
     normalized.setdefault("prediction_mode", resolve_prediction_mode("auto", architecture))
     normalized.setdefault("direct_target_normalization_mode", "none")
+    normalized.setdefault("weight_decay", 1.0e-2)
     normalized.setdefault("cosine_eta_min", 1.0e-6)
     normalized.setdefault("ema_enabled", False)
     normalized.setdefault("ema_decay", 0.999)
@@ -354,6 +357,12 @@ def main() -> int:
     parser.add_argument("--epochs", default=50, type=int)
     parser.add_argument("--batch-size", default=32, type=int)
     parser.add_argument("--lr", default=1.0e-3, type=float)
+    parser.add_argument(
+        "--weight-decay",
+        default=1.0e-2,
+        type=float,
+        help="AdamW weight decay. The default preserves the historical implicit AdamW value.",
+    )
     parser.add_argument("--base-channels", default=16, type=int)
     parser.add_argument("--depth", default=3, type=int)
     parser.add_argument(
@@ -523,6 +532,11 @@ def main() -> int:
     parser.add_argument("--lambda-chiplet-mean", default=0.0, type=float)
     parser.add_argument("--freeze-cnn", action="store_true")
     parser.add_argument("--init-checkpoint", default=None, type=Path, help="Optional checkpoint used to initialize matching model or CNN-submodule weights.")
+    parser.add_argument(
+        "--require-full-init-checkpoint",
+        action="store_true",
+        help="Require --init-checkpoint to match every model state tensor exactly.",
+    )
     parser.add_argument("--lambda-final", default=1.0, type=float)
     parser.add_argument("--lambda-mean", default=0.1, type=float)
     parser.add_argument(
@@ -567,6 +581,8 @@ def main() -> int:
         raise SystemExit("--cosine-eta-min must be non-negative and smaller than --lr")
     if args.ema and not 0.0 < args.ema_decay < 1.0:
         raise SystemExit("--ema-decay must be strictly between 0 and 1")
+    if args.require_full_init_checkpoint and args.init_checkpoint is None:
+        raise SystemExit("--require-full-init-checkpoint requires --init-checkpoint")
     fno_profile = FNO_CAPACITY_PROFILES[args.fno_capacity_profile]
     fno_layers_was_default = args.fno_layers is None
     for argument, profile_key in (
@@ -1038,6 +1054,7 @@ def main() -> int:
         "epochs": args.epochs,
         "batch_size": args.batch_size,
         "lr": args.lr,
+        "weight_decay": args.weight_decay,
         "base_channels": args.base_channels,
         "depth": args.depth,
         "model_architecture": args.model_architecture,
@@ -1088,6 +1105,7 @@ def main() -> int:
         "lambda_chiplet_mean": args.lambda_chiplet_mean,
         "freeze_cnn": args.freeze_cnn,
         "init_checkpoint": str(args.init_checkpoint.resolve()) if args.init_checkpoint else None,
+        "require_full_init_checkpoint": args.require_full_init_checkpoint,
         "refine_channels": args.refine_channels,
         "refine_blocks": args.refine_blocks,
         "device": str(device),
@@ -1140,7 +1158,16 @@ def main() -> int:
     model = build_model(model_config).to(device)
     if args.resume and args.init_checkpoint:
         raise SystemExit("--resume and --init-checkpoint are mutually exclusive")
-    init_summary = load_initial_checkpoint(model, args.init_checkpoint, device) if args.init_checkpoint else None
+    init_summary = (
+        load_initial_checkpoint(
+            model,
+            args.init_checkpoint,
+            device,
+            require_full=args.require_full_init_checkpoint,
+        )
+        if args.init_checkpoint
+        else None
+    )
     config["model"] = model.config() if hasattr(model, "config") else model_config
     config["model"].update(
         {
@@ -1186,7 +1213,11 @@ def main() -> int:
                 encoding="utf-8",
             )
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
     scheduler = make_scheduler(
         args.scheduler,
         optimizer,
@@ -2743,7 +2774,13 @@ def save_checkpoint(
     )
 
 
-def load_initial_checkpoint(model: nn.Module, checkpoint_path: Path, device: torch.device) -> dict[str, int]:
+def load_initial_checkpoint(
+    model: nn.Module,
+    checkpoint_path: Path,
+    device: torch.device,
+    *,
+    require_full: bool = False,
+) -> dict[str, int | bool]:
     try:
         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     except TypeError:
@@ -2766,13 +2803,27 @@ def load_initial_checkpoint(model: nn.Module, checkpoint_path: Path, device: tor
         else:
             skipped += 1
     missing, unexpected = model.load_state_dict(mapped, strict=False)
-    return {
+    summary: dict[str, int | bool] = {
         "direct_tensors_loaded": direct_matches,
         "cnn_submodule_tensors_loaded": cnn_matches,
         "source_tensors_skipped": skipped,
         "missing_after_partial_load": len(missing),
         "unexpected_after_partial_load": len(unexpected),
+        "full_match_required": require_full,
+        "full_match": (
+            direct_matches == len(target_state)
+            and cnn_matches == 0
+            and skipped == 0
+            and not missing
+            and not unexpected
+        ),
     }
+    if require_full and not summary["full_match"]:
+        raise ValueError(
+            "initial checkpoint does not exactly match the requested model: "
+            f"{summary}"
+        )
+    return summary
 
 
 def train_log_columns() -> list[str]:

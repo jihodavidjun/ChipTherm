@@ -9,6 +9,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import torch
 import yaml
 
 
@@ -59,10 +60,18 @@ def main() -> int:
             "generation path is unchanged when omitted."
         ),
     )
+    parser.add_argument(
+        "--init-checkpoint",
+        type=Path,
+        default=None,
+        help="Initialize model weights only; training state is always fresh.",
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--smoke-test", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    if args.resume and args.init_checkpoint is not None:
+        raise SystemExit("--resume and --init-checkpoint are mutually exclusive")
     if args.data_root is None:
         raise SystemExit("--data-root or CHIPTHERM_V2_DATA_ROOT is required")
     preflight = json.loads(args.preflight_report.read_text(encoding="utf-8"))
@@ -128,6 +137,32 @@ def main() -> int:
             json.dumps(config, sort_keys=True).encode("utf-8")
         ).hexdigest(),
     }
+    if args.init_checkpoint is not None:
+        init_checkpoint = args.init_checkpoint.expanduser().resolve()
+        if not init_checkpoint.is_file():
+            raise SystemExit(f"initial checkpoint is missing: {init_checkpoint}")
+        try:
+            parent = torch.load(
+                init_checkpoint,
+                map_location="cpu",
+                weights_only=False,
+            )
+        except TypeError:
+            parent = torch.load(init_checkpoint, map_location="cpu")
+        lineage["parent_checkpoint"] = {
+            "path": str(init_checkpoint),
+            "sha256": sha256_file(init_checkpoint),
+            "epoch": int(parent.get("epoch", -1)),
+            "weights": "model_state_dict",
+        }
+        lineage["initialization"] = {
+            "mode": "weights_only",
+            "optimizer_state_restored": False,
+            "scheduler_state_restored": False,
+            "epoch_restored": False,
+            "ema_state_restored": False,
+            "new_training_lineage": True,
+        }
     write_json(lineage_path, lineage)
     epochs = 2 if args.smoke_test else int(config["epochs"])
     command = [
@@ -139,6 +174,7 @@ def main() -> int:
         "--epochs", str(epochs),
         "--batch-size", str(config["batch_size"]),
         "--lr", str(config["lr"]),
+        "--weight-decay", str(config.get("weight_decay", 1.0e-2)),
         "--base-channels", str(config["base_channels"]),
         "--model-architecture", str(config["model_architecture"]),
         "--metadata-conditioning",
@@ -170,6 +206,14 @@ def main() -> int:
         command.extend(["--ema", "--ema-decay", str(config.get("ema_decay", 0.999))])
     if coarse_config["enabled"]:
         command.append("--coarse-spatial-loss-enabled")
+    if args.init_checkpoint is not None:
+        command.extend(
+            [
+                "--init-checkpoint",
+                str(args.init_checkpoint.expanduser().resolve()),
+                "--require-full-init-checkpoint",
+            ]
+        )
     if args.resume:
         command.append("--resume")
     print(" ".join(command))
