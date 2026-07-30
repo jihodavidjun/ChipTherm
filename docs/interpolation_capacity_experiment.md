@@ -2,14 +2,16 @@
 
 ## Scope
 
-This study has exactly three entries:
+This study has exactly six predetermined CNN entries:
 
-1. `canonical_cnn`: reuse
-   `feature_fusion_train40_source_v1_seed1`.
-2. `cnn_cosine_ema`: canonical 2,188,803-parameter architecture with only a
-   bounded cosine schedule, EMA, and longer training budget.
-3. `cnn_param_matched`: the same architecture family widened uniformly to
-   3,919,642 parameters and trained with the same cosine+EMA recipe.
+1. `canonical_small_constant`: existing 2,188,803-parameter epoch-100 run.
+2. `small_cosine_ema_epoch100`: existing explicit `epoch_0100.pt`.
+3. `small_cosine_ema_epoch150`: existing explicit `epoch_0150.pt`.
+4. `wide_constant_epoch100`: new 3,919,642-parameter constant-LR run.
+5. `wide_cosine_ema_epoch100`: explicit epoch-100 checkpoint from one new
+   wide cosine+EMA run.
+6. `wide_cosine_ema_epoch150`: explicit epoch-150 checkpoint from that same
+   run.
 
 No data, split, input, metadata, source-superposition, target decomposition,
 loss, optimizer family, batch size, reconstruction sign, or checkpoint metric
@@ -66,35 +68,41 @@ parameter_count        = 3,919,642
 This is 1,730,839 parameters above the canonical CNN, 105,992 below U-FNO, and
 109,160 below SAU-FNO.
 
-## Decision Gate
+## Two-Factor Contract
 
-The wider run is considered only after cosine+EMA known-family and held-out
-validation results exist.
+At epoch 100, the four cells isolate width and recipe:
 
-Primary success:
+| Width | Constant LR | Cosine+EMA |
+|---|---|---|
+| 2.19M | canonical | explicit epoch 100 |
+| 3.92M | new wide constant | explicit epoch 100 |
 
-- known-family MAE improves by at least 15%;
-- held-out validation worsens by at most `0.05 K`.
+Epoch 150 is a predefined bounded-budget sensitivity point for both
+cosine+EMA widths. It is not selected using primary-test performance.
 
-Strong success:
-
-- known-family MAE is at most `0.12 K`;
-- held-out validation worsens by at most `0.03 K`.
-
-Near-complete closure:
-
-- known-family MAE is at most `0.10 K`;
-- held-out validation worsens by at most `0.05 K`.
-
-If strong success is reached, parameter-matched training is not immediately
-recommended. Otherwise exactly one wider CNN is permitted. Primary-test
-metrics are never read by this decision.
+The analyzer first produces a validation-only interpretation from
+`known_family_sample_test` and `primary_validation_families`. The
+`--freeze-validation` action records metric hashes and the interpretation.
+`--include-primary-test` is rejected until that artifact is frozen, and it is
+also rejected if the validation artifacts subsequently change.
 
 ## Runtime Estimate
 
 The canonical 100-epoch log totals approximately 983 seconds. Linear
-epoch-count scaling gives roughly 1,474 seconds, or 24.6 minutes, for the
-canonical-width 150-epoch run before EMA overhead. Scaling that estimate by the
-parameter ratio gives approximately 44 minutes for the width-43 run. Both are
-planning estimates; actual early stopping and GPU kernels determine measured
-duration.
+epoch-count scaling gives roughly 1,474 seconds for the small epoch-150 run.
+Parameter-ratio scaling gives a rough 29-minute estimate for wide constant
+epoch 100 and 44 minutes for wide cosine+EMA epoch 150. These are planning
+estimates only. The final report reads actual epoch runtimes and optimizer
+steps when artifacts are available, and never calls equal epochs equal
+compute.
+
+## Checkpoint Finding
+
+The current trainer saves `best.pt` only on a strict internal-validation
+improvement, writes `last.pt` after every completed epoch, and writes periodic
+checkpoints independently. Therefore an epoch-4 `best.pt` can be intentional.
+An epoch-4 `last.pt` alongside a valid epoch-150 periodic checkpoint cannot
+come from one uninterrupted invocation of the current save loop; it indicates
+stale, overwritten, or incompletely synchronized artifact state. The completed
+small run is evaluated only through explicit epoch checkpoints, and no trainer
+patch is justified by that artifact observation alone.

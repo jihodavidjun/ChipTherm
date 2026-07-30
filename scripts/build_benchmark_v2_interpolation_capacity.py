@@ -24,7 +24,7 @@ from chiptherm.benchmark_v2_interpolation_capacity import (  # noqa: E402
     deterministic_width_search,
     read_yaml,
     stable_hash,
-    validate_variant_config,
+    validate_two_factor_configs,
 )
 from chiptherm.ml.models import build_model, count_parameters  # noqa: E402
 
@@ -68,21 +68,27 @@ def main() -> int:
     canonical_model_config = canonical_run_config["model"]
     canonical_parameters = count_parameters(build_model(canonical_model_config))
     cosine_config = read_yaml(args.config_dir.resolve() / "cnn_cosine_ema.yaml")
-    param_config = read_yaml(args.config_dir.resolve() / "cnn_param_matched.yaml")
-    invariance = {
-        "cosine_ema": validate_variant_config(
-            canonical_config, cosine_config, "cosine_ema"
-        ),
-        "param_matched": validate_variant_config(
-            canonical_config, param_config, "param_matched"
-        ),
-    }
+    wide_constant_config = read_yaml(
+        args.config_dir.resolve() / "cnn_param_matched_constant.yaml"
+    )
+    wide_cosine_config = read_yaml(
+        args.config_dir.resolve() / "cnn_param_matched_cosine_ema.yaml"
+    )
+    invariance = validate_two_factor_configs(
+        canonical_config,
+        cosine_config,
+        wide_constant_config,
+        wide_cosine_config,
+    )
     width_search = deterministic_width_search(canonical_model_config)
     selected_width = int(width_search["selected_width"])
     configured_widths = {
-        int(param_config["base_channels"]),
-        int(param_config["refine_channels"]),
-        int(param_config["global_hidden_channels"]),
+        int(wide_constant_config["base_channels"]),
+        int(wide_constant_config["refine_channels"]),
+        int(wide_constant_config["global_hidden_channels"]),
+        int(wide_cosine_config["base_channels"]),
+        int(wide_cosine_config["refine_channels"]),
+        int(wide_cosine_config["global_hidden_channels"]),
     }
     if configured_widths != {selected_width}:
         raise SystemExit(
@@ -111,14 +117,26 @@ def main() -> int:
             "model_config_sha256": stable_hash(canonical_model_config),
         },
         "parameter_matched": {
-            "run_id": RUN_IDS["param_matched"],
+            "run_ids": {
+                "constant": RUN_IDS["param_matched_constant"],
+                "cosine_ema": RUN_IDS["param_matched_cosine_ema"],
+            },
             "base_channels": selected_width,
             "refine_channels": selected_width,
             "global_hidden_channels": selected_width,
-            "metadata_hidden_dim": int(param_config["metadata_hidden_dim"]),
-            "metadata_embedding_dim": int(param_config["metadata_embedding_dim"]),
+            "metadata_hidden_dim": int(
+                wide_constant_config["metadata_hidden_dim"]
+            ),
+            "metadata_embedding_dim": int(
+                wide_constant_config["metadata_embedding_dim"]
+            ),
             "parameter_count": parameter_count,
             "difference_vs_canonical": parameter_count - canonical_parameters,
+            "percentage_increase_vs_canonical": (
+                100.0
+                * (parameter_count - canonical_parameters)
+                / canonical_parameters
+            ),
             "difference_vs_ufno": parameter_count - U_FNO_PARAMETER_COUNT,
             "difference_vs_sau_fno": parameter_count - SAU_FNO_PARAMETER_COUNT,
         },
@@ -141,23 +159,62 @@ def main() -> int:
                 "source_version": SOURCE_VERSION,
             },
             {
-                "entry": "cnn_cosine_ema",
-                "run_id": RUN_IDS["cosine_ema"],
-                "run_type": "new_if_explicitly_launched",
+                "entry": "small_cosine_ema_epoch100",
+                "run_id": RUN_IDS["small_cosine_ema"],
+                "run_type": "completed_explicit_checkpoint",
                 "config": str(args.config_dir / "cnn_cosine_ema.yaml"),
-                "epochs": cosine_config["epochs"],
+                "epochs": 100,
                 "scheduler": cosine_config["scheduler"],
                 "ema": True,
                 "parameter_count": canonical_parameters,
                 "source_version": SOURCE_VERSION,
             },
             {
-                "entry": "cnn_param_matched",
-                "run_id": RUN_IDS["param_matched"],
-                "run_type": "conditional_new_run",
-                "config": str(args.config_dir / "cnn_param_matched.yaml"),
-                "epochs": param_config["epochs"],
-                "scheduler": param_config["scheduler"],
+                "entry": "small_cosine_ema_epoch150",
+                "run_id": RUN_IDS["small_cosine_ema"],
+                "run_type": "completed_explicit_checkpoint",
+                "config": str(args.config_dir / "cnn_cosine_ema.yaml"),
+                "epochs": 150,
+                "scheduler": cosine_config["scheduler"],
+                "ema": True,
+                "parameter_count": canonical_parameters,
+                "source_version": SOURCE_VERSION,
+            },
+            {
+                "entry": "wide_constant_epoch100",
+                "run_id": RUN_IDS["param_matched_constant"],
+                "run_type": "new_manual_run",
+                "config": str(
+                    args.config_dir / "cnn_param_matched_constant.yaml"
+                ),
+                "epochs": wide_constant_config["epochs"],
+                "scheduler": wide_constant_config["scheduler"],
+                "ema": False,
+                "parameter_count": parameter_count,
+                "source_version": SOURCE_VERSION,
+            },
+            {
+                "entry": "wide_cosine_ema_epoch100",
+                "run_id": RUN_IDS["param_matched_cosine_ema"],
+                "run_type": "new_manual_run_explicit_checkpoint",
+                "config": str(
+                    args.config_dir / "cnn_param_matched_cosine_ema.yaml"
+                ),
+                "epochs": 100,
+                "scheduler": wide_cosine_config["scheduler"],
+                "ema": True,
+                "parameter_count": parameter_count,
+                "source_version": SOURCE_VERSION,
+            },
+            {
+                "entry": "wide_cosine_ema_epoch150",
+                "run_id": RUN_IDS["param_matched_cosine_ema"],
+                "run_type": "new_manual_run_explicit_checkpoint",
+                "config": str(
+                    args.config_dir / "cnn_param_matched_cosine_ema.yaml"
+                ),
+                "epochs": 150,
+                "scheduler": wide_cosine_config["scheduler"],
                 "ema": True,
                 "parameter_count": parameter_count,
                 "source_version": SOURCE_VERSION,

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 import io
 import json
 import sys
@@ -20,15 +19,23 @@ from chiptherm.benchmark_v2_interpolation_capacity import (  # noqa: E402
     PARAMETER_TARGET_RANGE,
     aggregate_sample_rows,
     deterministic_width_search,
-    interpolation_decision_gate,
     read_yaml,
-    validate_variant_config,
+    validate_two_factor_configs,
 )
 from chiptherm.ml.ema import ExponentialMovingAverage  # noqa: E402
 from chiptherm.ml.models import build_model, count_parameters  # noqa: E402
 from chiptherm.ml.normalization import NormalizationStats  # noqa: E402
-from scripts.analyze_benchmark_v2_interpolation_capacity import build_gate  # noqa: E402
+from scripts.analyze_benchmark_v2_interpolation_capacity import (  # noqa: E402
+    CNN_MATRIX_NAMES,
+    build_final_comparison,
+    build_primary_gate,
+    build_validation_gate,
+    compute_two_factor_effects,
+)
 from scripts.evaluate_residual_cnn import select_checkpoint_state_dict  # noqa: E402
+from scripts.inspect_benchmark_v2_interpolation_checkpoints import (  # noqa: E402
+    inspect_run,
+)
 from scripts.run_benchmark_v2_interpolation_capacity import (  # noqa: E402
     build_training_command,
 )
@@ -43,7 +50,10 @@ def main() -> None:
     test_canonical_config_invariance()
     test_deterministic_parameter_match()
     test_dry_run_command_is_one_variant_only()
-    test_decision_gate_and_primary_test_exclusion()
+    test_checkpoint_inspection_distinguishes_best_and_stale_last()
+    test_validation_freeze_inputs_and_primary_test_exclusion()
+    test_two_factor_aggregation()
+    test_final_comparison_aggregation()
     test_analysis_macro_micro_aggregation()
     print("benchmark v2 interpolation-capacity tests passed")
 
@@ -167,7 +177,7 @@ def test_ema_training_checkpoint_contract() -> None:
     assert restored.num_updates == 1
 
 
-def config_paths() -> tuple[Path, Path, Path]:
+def config_paths() -> tuple[Path, Path, Path, Path]:
     canonical = (
         REPO_ROOT
         / "configs/benchmark_v2_50family/training/"
@@ -177,25 +187,40 @@ def config_paths() -> tuple[Path, Path, Path]:
         REPO_ROOT
         / "configs/benchmark_v2_50family/interpolation_capacity"
     )
-    return canonical, variants / "cnn_cosine_ema.yaml", variants / "cnn_param_matched.yaml"
+    return (
+        canonical,
+        variants / "cnn_cosine_ema.yaml",
+        variants / "cnn_param_matched_constant.yaml",
+        variants / "cnn_param_matched_cosine_ema.yaml",
+    )
 
 
 def test_canonical_config_invariance() -> None:
-    canonical_path, cosine_path, parameter_path = config_paths()
+    canonical_path, cosine_path, constant_path, wide_cosine_path = config_paths()
     canonical = read_yaml(canonical_path)
     cosine = read_yaml(cosine_path)
-    parameter = read_yaml(parameter_path)
-    cosine_result = validate_variant_config(canonical, cosine, "cosine_ema")
-    parameter_result = validate_variant_config(
-        canonical, parameter, "param_matched"
+    wide_constant = read_yaml(constant_path)
+    wide_cosine = read_yaml(wide_cosine_path)
+    result = validate_two_factor_configs(
+        canonical,
+        cosine,
+        wide_constant,
+        wide_cosine,
     )
-    assert cosine_result["canonical_invariants_preserved"]
-    assert parameter_result["canonical_invariants_preserved"]
-    assert {
+    assert result["two_factor_contract_preserved"]
+    assert result["wide_constant"]["changed_keys"] == [
         "base_channels",
-        "refine_channels",
         "global_hidden_channels",
-    }.isdisjoint(cosine_result["changed_keys"])
+        "refine_channels",
+    ]
+    assert result["wide_cosine_vs_wide_constant_changed_keys"] == [
+        "cosine_eta_min",
+        "early_stopping_patience",
+        "ema_decay",
+        "ema_enabled",
+        "epochs",
+        "scheduler",
+    ]
 
 
 def test_deterministic_parameter_match() -> None:
@@ -222,53 +247,193 @@ def test_deterministic_parameter_match() -> None:
 
 
 def test_dry_run_command_is_one_variant_only() -> None:
-    command = build_training_command(
-        python="/venv/bin/python3",
-        variant="cosine_ema",
-        data_root=Path("/data"),
-        output_root=Path("/outputs"),
-        config_dir=Path("/configs"),
-        preflight_report=Path("/preflight.json"),
-        device="cuda",
-        workers=4,
-        resume=False,
-    )
-    joined = " ".join(command)
-    assert "cnn_cosine_ema.yaml" in joined
-    assert "cnn_param_matched.yaml" not in joined
-    assert "--resume" not in command
-    assert "--execute" not in command
+    for variant, expected, forbidden in (
+        (
+            "param_matched_constant",
+            "cnn_param_matched_constant.yaml",
+            "cnn_param_matched_cosine_ema.yaml",
+        ),
+        (
+            "param_matched_cosine_ema",
+            "cnn_param_matched_cosine_ema.yaml",
+            "cnn_param_matched_constant.yaml",
+        ),
+    ):
+        command = build_training_command(
+            python="/venv/bin/python3",
+            variant=variant,
+            data_root=Path("/data"),
+            output_root=Path("/outputs"),
+            config_dir=Path("/configs"),
+            preflight_report=Path("/preflight.json"),
+            device="cuda",
+            workers=4,
+            resume=False,
+        )
+        joined = " ".join(command)
+        assert expected in joined
+        assert forbidden not in joined
+        assert "--resume" not in command
+        assert "--execute" not in command
+        assert "evaluate" not in joined
+        assert "primary_test" not in joined
 
 
 def metric_row(model: str, protocol: str, mae: float) -> dict[str, object]:
-    return {"model": model, "protocol": protocol, "micro_mae_K": mae}
+    return {
+        "model": model,
+        "protocol": protocol,
+        "micro_mae_K": mae,
+        "parameter_count": (
+            3_919_642 if model.startswith("wide_") else 2_188_803
+        ),
+        "runtime_per_sample_s": 0.001,
+        "fraction_worse_than_source": 0.1,
+        "centered_field_mae_K": mae * 0.8,
+        "mean_correction_mae_K": mae * 0.2,
+        "hotspot_top1pct_mae_K": mae * 1.2,
+        "metrics_sha256": f"{model}-{protocol}-metrics",
+        "sample_metrics_sha256": f"{model}-{protocol}-samples",
+    }
 
 
-def test_decision_gate_and_primary_test_exclusion() -> None:
+def test_checkpoint_inspection_distinguishes_best_and_stale_last() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        checkpoints = root / "checkpoints"
+        checkpoints.mkdir()
+        base = {
+            "model_state_dict": {"weight": torch.tensor([1.0])},
+            "ema_model_state_dict": {"weight": torch.tensor([1.1])},
+            "ema_state_dict": {"decay": 0.999, "num_updates": 5},
+            "optimizer_state_dict": {"state": {}, "param_groups": []},
+            "scheduler_state_dict": {"T_max": 150},
+            "global_optimizer_step": 40,
+            "best_val_mae_K": 0.9,
+            "epochs_without_improvement": 0,
+            "evaluation_default_weights": "ema",
+        }
+        torch.save({**base, "epoch": 4, "best": True}, checkpoints / "best.pt")
+        torch.save({**base, "epoch": 4, "best": False}, checkpoints / "last.pt")
+        torch.save(
+            {**base, "epoch": 100, "best": False},
+            checkpoints / "epoch_0100.pt",
+        )
+        torch.save(
+            {**base, "epoch": 150, "best": False},
+            checkpoints / "epoch_0150.pt",
+        )
+        (root / "train_log.csv").write_text(
+            "epoch,val_final_mae_K,epoch_runtime_s\n"
+            "4,0.8,1.0\n"
+            "100,0.9,1.0\n"
+            "150,0.95,1.0\n",
+            encoding="utf-8",
+        )
+        report = inspect_run(root)
+    findings = {
+        row["artifact"]: row["classification"] for row in report["findings"]
+    }
+    assert findings["best.pt"] == "consistent_best_internal_validation_epoch"
+    assert findings["last.pt"] == "stale_or_overwritten_after_training"
+    assert findings["periodic_checkpoints"] == "consistent"
+    assert report["checkpoints"]["epoch_0100.pt"]["epoch"] == 100
+    assert report["checkpoints"]["epoch_0150.pt"]["epoch"] == 150
+    assert report["checkpoints"]["epoch_0150.pt"]["raw_state_present"]
+    assert report["checkpoints"]["epoch_0150.pt"]["ema_state_present"]
+    assert report["trainer_patch_required"] is False
+
+
+def test_validation_freeze_inputs_and_primary_test_exclusion() -> None:
+    rows = []
+    for index, model in enumerate(CNN_MATRIX_NAMES):
+        rows.append(
+            metric_row(model, "known_family_sample_test", 0.1 + index * 0.01)
+        )
+        rows.append(
+            metric_row(
+                model,
+                "primary_validation_families",
+                0.9 + index * 0.01,
+            )
+        )
+    gate = build_validation_gate(rows)
+    assert gate["status"] == "ready_to_freeze"
+    assert gate["primary_test_used"] is False
+    original_fingerprint = gate["input_fingerprint"]
+    rows.extend(
+        metric_row(model, "primary_test_families", 100.0)
+        for model in CNN_MATRIX_NAMES
+    )
+    assert build_validation_gate(rows)["input_fingerprint"] == original_fingerprint
+    gate["status"] = "frozen"
+    primary = build_primary_gate(
+        include_primary_test=True,
+        validation_gate=gate,
+        metric_rows=rows,
+    )
+    assert primary["status"] == "included"
+    assert primary["primary_test_used_for_selection"] is False
+    pending = build_validation_gate(rows[:2])
+    assert pending["status"] == "pending"
+    assert pending["missing_entries"]
+
+
+def test_two_factor_aggregation() -> None:
+    values = {
+        "canonical_small_constant": 0.15,
+        "small_cosine_ema_epoch100": 0.12,
+        "wide_constant_epoch100": 0.13,
+        "wide_cosine_ema_epoch100": 0.10,
+        "small_cosine_ema_epoch150": 0.11,
+        "wide_cosine_ema_epoch150": 0.09,
+    }
     rows = [
-        metric_row("canonical_cnn", "known_family_sample_test", 0.150),
-        metric_row("canonical_cnn", "primary_validation_families", 0.913),
-        metric_row("cnn_cosine_ema", "known_family_sample_test", 0.120),
-        metric_row("cnn_cosine_ema", "primary_validation_families", 0.930),
+        metric_row(model, "known_family_sample_test", mae)
+        for model, mae in values.items()
     ]
-    gate = build_gate(rows)
-    assert gate["strong_success"]
-    assert not gate["recommend_param_matched_training"]
-    altered = copy.deepcopy(rows)
-    altered.extend(
-        [
-            metric_row("canonical_cnn", "primary_test_families", 1.0),
-            metric_row("cnn_cosine_ema", "primary_test_families", 100.0),
-        ]
+    effects = compute_two_factor_effects(rows)
+    epoch100 = effects["epoch100"]["known_family_sample_test"]
+    assert abs(epoch100["width_effect_constant_K"] + 0.02) < 1.0e-12
+    assert abs(epoch100["recipe_effect_small_K"] + 0.03) < 1.0e-12
+    assert abs(epoch100["width_recipe_interaction_K"]) < 1.0e-12
+    assert (
+        abs(
+            effects["bounded_epoch150"]["known_family_sample_test"][
+                "width_effect_cosine_ema_K"
+            ]
+            + 0.02
+        )
+        < 1.0e-12
     )
-    assert build_gate(altered) == gate
-    failed = interpolation_decision_gate(
-        canonical_known_mae_K=0.150,
-        canonical_validation_mae_K=0.913,
-        candidate_known_mae_K=0.140,
-        candidate_validation_mae_K=0.920,
-    )
-    assert failed["recommend_param_matched_training"]
+
+
+def test_final_comparison_aggregation() -> None:
+    rows = [
+        metric_row("canonical_small_constant", protocol, mae)
+        for protocol, mae in (
+            ("known_family_sample_test", 0.15),
+            ("primary_validation_families", 0.91),
+            ("primary_test_families", 1.33),
+        )
+    ]
+    specs = [
+        {
+            "model": "canonical_small_constant",
+            "root": Path("/does/not/exist"),
+            "epoch": 100,
+            "checkpoint": "best.pt",
+            "training_recipe": "constant",
+            "scheduler": "none",
+            "weights": "raw",
+            "architecture_family": "cnn",
+        }
+    ]
+    comparison = build_final_comparison(rows, specs)
+    assert len(comparison) == 1
+    assert comparison[0]["known_family_mae_K"] == 0.15
+    assert comparison[0]["heldout_validation_mae_K"] == 0.91
+    assert comparison[0]["heldout_primary_test_mae_K"] == 1.33
 
 
 def sample(family: str, uid: str, mae: float) -> dict[str, str]:

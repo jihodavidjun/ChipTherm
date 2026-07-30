@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import subprocess
 import sys
@@ -33,8 +32,8 @@ def build_training_command(
     resume: bool,
 ) -> list[str]:
     config_names = {
-        "cosine_ema": "cnn_cosine_ema.yaml",
-        "param_matched": "cnn_param_matched.yaml",
+        "param_matched_constant": "cnn_param_matched_constant.yaml",
+        "param_matched_cosine_ema": "cnn_param_matched_cosine_ema.yaml",
     }
     command = [
         python,
@@ -72,7 +71,7 @@ def main() -> int:
     parser.add_argument(
         "--variant",
         required=True,
-        choices=["cosine_ema", "param_matched"],
+        choices=["param_matched_constant", "param_matched_cosine_ema"],
     )
     parser.add_argument(
         "--data-root",
@@ -99,12 +98,6 @@ def main() -> int:
         default=REPO_ROOT
         / "outputs/benchmark_v2_50family/preflight/full_50x200/preflight_report.json",
     )
-    parser.add_argument(
-        "--summary-dir",
-        type=Path,
-        default=REPO_ROOT
-        / "outputs/benchmark_v2_50family/interpolation_capacity_summary",
-    )
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--workers", default=4, type=int)
@@ -114,18 +107,6 @@ def main() -> int:
     args = parser.parse_args()
     if args.data_root is None:
         raise SystemExit("--data-root or CHIPTHERM_V2_DATA_ROOT is required")
-    if args.variant == "param_matched":
-        gate_path = args.summary_dir.resolve() / "decision_gate.json"
-        if not gate_path.is_file():
-            raise SystemExit(
-                "parameter-matched run is gated until decision_gate.json exists"
-            )
-        gate = json.loads(gate_path.read_text(encoding="utf-8"))
-        if gate.get("recommend_param_matched_training") is not True:
-            raise SystemExit(
-                "decision gate does not recommend parameter-matched training"
-            )
-
     output_root = args.output_root.expanduser().resolve()
     run_root = output_root / RUN_IDS[args.variant]
     completed = run_root / "completed_run_manifest.json"

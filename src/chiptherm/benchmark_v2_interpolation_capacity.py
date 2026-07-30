@@ -13,17 +13,20 @@ import yaml
 from .ml.models import build_model, count_parameters
 
 
-VARIANTS = ("cosine_ema", "param_matched")
+VARIANTS = ("param_matched_constant", "param_matched_cosine_ema")
 RUN_IDS = {
-    "cosine_ema": "feature_fusion_train40_cosine_ema_seed1",
-    "param_matched": "feature_fusion_train40_param_matched_cosine_ema_seed1",
+    "small_cosine_ema": "feature_fusion_train40_cosine_ema_seed1",
+    "param_matched_constant": "feature_fusion_train40_param_matched_constant_seed1",
+    "param_matched_cosine_ema": (
+        "feature_fusion_train40_param_matched_cosine_ema_seed1"
+    ),
 }
 CANONICAL_RUN_ID = "feature_fusion_train40_source_v1_seed1"
 SOURCE_VERSION = "source_superposition_final_train40_source_v1"
 PARAMETER_TARGET_RANGE = (3_800_000, 4_200_000)
 U_FNO_PARAMETER_COUNT = 4_025_634
 SAU_FNO_PARAMETER_COUNT = 4_028_802
-RECIPE_CHANGE_KEYS = {
+COSINE_RECIPE_CHANGE_KEYS = {
     "epochs",
     "scheduler",
     "early_stopping_patience",
@@ -59,20 +62,28 @@ def validate_variant_config(
         for key in set(canonical) | set(candidate)
         if canonical.get(key) != candidate.get(key)
     }
-    allowed = set(RECIPE_CHANGE_KEYS)
-    if variant == "param_matched":
-        allowed |= WIDTH_CHANGE_KEYS
+    allowed = set(WIDTH_CHANGE_KEYS)
+    if variant == "param_matched_cosine_ema":
+        allowed |= COSINE_RECIPE_CHANGE_KEYS
     unexpected = sorted(changed - allowed)
     if unexpected:
         raise ValueError(f"{variant} changes forbidden canonical fields: {unexpected}")
-    required = {
-        "epochs": 150,
-        "scheduler": "cosine",
-        "early_stopping_patience": 30,
-        "cosine_eta_min": 1.0e-5,
-        "ema_enabled": True,
-        "ema_decay": 0.999,
-    }
+    required = (
+        {
+            "epochs": 150,
+            "scheduler": "cosine",
+            "early_stopping_patience": 30,
+            "cosine_eta_min": 1.0e-5,
+            "ema_enabled": True,
+            "ema_decay": 0.999,
+        }
+        if variant == "param_matched_cosine_ema"
+        else {
+            "epochs": canonical["epochs"],
+            "scheduler": canonical["scheduler"],
+            "early_stopping_patience": canonical["early_stopping_patience"],
+        }
+    )
     mismatches = {
         key: {"expected": value, "actual": candidate.get(key)}
         for key, value in required.items()
@@ -86,6 +97,53 @@ def validate_variant_config(
         "allowed_changed_keys": sorted(allowed),
         "canonical_invariants_preserved": not unexpected and not mismatches,
         "config_sha256": stable_hash(candidate),
+    }
+
+
+def validate_two_factor_configs(
+    canonical: Mapping[str, Any],
+    small_cosine: Mapping[str, Any],
+    wide_constant: Mapping[str, Any],
+    wide_cosine: Mapping[str, Any],
+) -> dict[str, Any]:
+    small_changed = {
+        key
+        for key in set(canonical) | set(small_cosine)
+        if canonical.get(key) != small_cosine.get(key)
+    }
+    if small_changed != COSINE_RECIPE_CHANGE_KEYS:
+        raise ValueError(
+            "small cosine config differs from canonical outside the exact recipe "
+            f"factor: {sorted(small_changed)}"
+        )
+    constant_result = validate_variant_config(
+        canonical,
+        wide_constant,
+        "param_matched_constant",
+    )
+    cosine_result = validate_variant_config(
+        canonical,
+        wide_cosine,
+        "param_matched_cosine_ema",
+    )
+    wide_recipe_changed = {
+        key
+        for key in set(wide_constant) | set(wide_cosine)
+        if wide_constant.get(key) != wide_cosine.get(key)
+    }
+    if wide_recipe_changed != COSINE_RECIPE_CHANGE_KEYS:
+        raise ValueError(
+            "wide cosine config differs from wide constant outside the exact "
+            f"recipe factor: {sorted(wide_recipe_changed)}"
+        )
+    return {
+        "small_cosine_vs_canonical_changed_keys": sorted(small_changed),
+        "wide_constant": constant_result,
+        "wide_cosine": cosine_result,
+        "wide_cosine_vs_wide_constant_changed_keys": sorted(
+            wide_recipe_changed
+        ),
+        "two_factor_contract_preserved": True,
     }
 
 
