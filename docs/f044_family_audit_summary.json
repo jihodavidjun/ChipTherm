@@ -1,0 +1,158 @@
+{
+  "schema_version": 1,
+  "family_id": "f044",
+  "verdict": "KEEP WITH STRATIFIED REPORTING",
+  "corruption_found": false,
+  "benchmark_rule_violation_found": false,
+  "frozen_split_change_scientifically_defensible": false,
+  "audit_scope": {
+    "repository_root": "ChipTherm repository",
+    "external_benchmark_root_available": false,
+    "models_retrained": false,
+    "datasets_regenerated": false,
+    "split_modified": false
+  },
+  "validation_check_counts": {
+    "PASS": 22,
+    "WARNING": 0,
+    "FAIL": 0,
+    "NOT VERIFIABLE": 4
+  },
+  "validation_checks": [
+    {"check": "frozen family identity and hash", "status": "PASS"},
+    {"check": "pre-model split assignment", "status": "PASS"},
+    {"check": "package dimensions and 64x64 grid", "status": "PASS"},
+    {"check": "chiplet count and functional composition", "status": "PASS"},
+    {"check": "finite positive legal chiplet rectangles", "status": "PASS"},
+    {"check": "package-boundary containment", "status": "PASS"},
+    {"check": "no chiplet overlap", "status": "PASS"},
+    {"check": "minimum spacing", "status": "PASS"},
+    {"check": "occupancy and whitespace", "status": "PASS"},
+    {"check": "material stack cooling ambient and HotSpot settings", "status": "PASS"},
+    {"check": "intended family-design envelope", "status": "PASS"},
+    {"check": "deterministic workload count and uniqueness", "status": "PASS"},
+    {"check": "power finiteness positivity density and idle policy", "status": "PASS"},
+    {"check": "workload chiplet names match layout", "status": "PASS"},
+    {"check": "active workload is nominal", "status": "PASS"},
+    {"check": "persisted workload files equal regenerated hashes", "status": "NOT VERIFIABLE", "reason": "external benchmark root unavailable"},
+    {"check": "200 result rows and unique sample UIDs", "status": "PASS"},
+    {"check": "source enumeration and chiplet identity", "status": "PASS"},
+    {"check": "source input coordinate convention", "status": "PASS"},
+    {"check": "raster containment and overlap checks", "status": "PASS"},
+    {"check": "target and feature orientation in executable paths", "status": "PASS"},
+    {"check": "source base target prediction UID alignment in available outputs", "status": "PASS"},
+    {"check": "stored arrays exist are finite and have canonical shapes", "status": "NOT VERIFIABLE", "reason": "external benchmark root unavailable"},
+    {"check": "duplicate target hashes and retained failed HotSpot workdirs", "status": "NOT VERIFIABLE", "reason": "external labels and workdirs unavailable"},
+    {"check": "full 13 17 33 channel and graph schema", "status": "NOT VERIFIABLE", "reason": "completed strict-validation report unavailable locally"},
+    {"check": "objective corruption or benchmark-rule violation in verifiable evidence", "status": "PASS"}
+  ],
+  "frozen_family": {
+    "package_width_mm": 68.0,
+    "package_height_mm": 36.0,
+    "package_area_mm2": 2448.0,
+    "package_aspect_ratio": 1.8888888888888888,
+    "grid_rows": 64,
+    "grid_cols": 64,
+    "chiplet_count": 20,
+    "occupied_area_fraction": 0.4600000000033883,
+    "whitespace_fraction": 0.5399999999966116,
+    "minimum_gap_mm": 0.906650398850928,
+    "minimum_edge_clearance_mm": 0.261530012658123,
+    "composition": {"CPU": 3, "GPU": 4, "NPU": 3, "HBM": 4, "DRAM": 3, "IO": 3},
+    "topology": "long_axis_clusters",
+    "ood_category": "compound_ood"
+  },
+  "structural_findings": {
+    "package_aspect_ratio_train_percentile": 97.5,
+    "package_aspect_ratio_train_z_score": 5.8187747149340066,
+    "package_aspect_ratio_outside_train_range": false,
+    "normalized_mean_center_distance_train_percentile": 97.5,
+    "normalized_mean_center_distance_outside_train_range": false,
+    "source_boundary_minus_interior_mean_K": 1.814,
+    "source_boundary_minus_interior_outside_train_range": true,
+    "interpretation": "Geometric scalars have close training neighbors, but long-axis clustered placement creates a directional boundary-response regime not covered by learned source responses."
+  },
+  "workload_audit": {
+    "count": 200,
+    "unique_uids": 200,
+    "unique_content_hashes": 200,
+    "validation_failures": 0,
+    "total_power_W": {"min": 61.84458, "mean": 552.603257376, "max": 1661.102986},
+    "source_power_W": {"min": 0.68641422, "max": 181.71221603},
+    "active_source_count": {"min": 2, "mean": 9.25, "max": 20},
+    "high_load_source_count_mean": 2.12,
+    "dominant_source_power_share": {"mean": 0.253624, "max": 0.655261},
+    "outside_training_family_range": false,
+    "persistent_server_files_byte_verified": false
+  },
+  "alignment_findings": {
+    "sample_uid_count": 200,
+    "sample_uid_unique": true,
+    "source_indices": "0..19",
+    "source_names_match_layout_order": true,
+    "row_axis": "physical y",
+    "column_axis": "physical x",
+    "matched_analysis_metric_crosscheck_max_abs_K": 0.0,
+    "f044_specific_preprocessing_branch_found": false
+  },
+  "error_decomposition": {
+    "source_baseline": {
+      "mae_K": 3.624509,
+      "rmse_K": 4.282,
+      "mean_signed_prediction_error_K": -2.522442,
+      "centered_field_mae_K": 2.710382,
+      "hotspot_temperature_error_K": 2.1601,
+      "hotspot_location_error_cells": 20.145,
+      "low_frequency_error_energy_fraction": 0.679221
+    },
+    "source_oracle_package": {
+      "learned_reconstruction_mae_K": 3.665891,
+      "ground_truth_isolated_source_sum_mae_K": 0.03874,
+      "learned_package_signed_error_K": -2.793905,
+      "summed_source_mean_error_K": -2.75517
+    },
+    "final_cnn": {
+      "mae_K": 2.966781,
+      "mean_correction_mae_K": 2.2908,
+      "centered_spatial_mae_K": 2.1003,
+      "true_mean_residual_mean_K": 2.522442,
+      "predicted_scalar_correction_mean_K": 0.232,
+      "samples_improved_over_source_baseline": 199,
+      "sample_count": 200
+    },
+    "oracle_removable_mae_K": {
+      "mean_only": 0.8665,
+      "low_frequency_only": 0.561,
+      "high_frequency_only": 0.3192,
+      "mean_plus_low_frequency": 2.2426
+    },
+    "primary_failure": "learned source-response extrapolation with coherent package-wide cold bias",
+    "secondary_failure": "low-frequency centered spatial and directional boundary mismatch",
+    "not_primary": ["invalid HotSpot superposition", "package aspect ratio alone", "isolated pathological workloads", "fine hotspot detail alone"]
+  },
+  "heldout_final_mae_K": {
+    "f008": 0.779,
+    "f016": 1.016,
+    "f027": 0.966,
+    "f033": 0.926,
+    "f044": 2.966781
+  },
+  "f044_cross_model_mae_K": {
+    "source_superposition": 3.624509,
+    "direct_cnn": 2.225975,
+    "direct_fno": 2.533154,
+    "direct_ufno": 2.690706,
+    "direct_sau_fno": 2.369772
+  },
+  "recommendation": {
+    "action": "KEEP WITH STRATIFIED REPORTING",
+    "reporting": [
+      "five-family aggregate",
+      "per-held-out-family metrics",
+      "f044 compound-OOD stratum",
+      "non-f044 four-family descriptive aggregate",
+      "f044 source-baseline and final-model decomposition"
+    ],
+    "split_change_condition": "Only a model-independent, reproducible server-side validity violation applied consistently to every family would justify exclusion and refreezing."
+  }
+}
