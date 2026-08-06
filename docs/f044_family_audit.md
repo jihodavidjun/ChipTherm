@@ -27,7 +27,8 @@ The external Benchmark v2 data root was not mounted in this local checkout. Froz
 | No chiplet overlap | PASS | The frozen definition passes `validate_layout`; overlap/spacing is enforced at `src/chiptherm/validate.py:46-79`. |
 | Minimum spacing | PASS | Frozen minimum gap is `0.906650 mm`, above the declared `0.5 mm` requirement (`families/f044.yaml:239-251`). |
 | Occupancy and whitespace | PASS | Occupied fraction `0.460000`; whitespace `0.540000`, exactly the frozen target and within the design proposal. |
-| Material stack, cooling, ambient, and HotSpot settings | PASS | Fixed stack and solver configuration are declared at `families/f044.yaml:202-238` and checked for all families at `src/chiptherm/benchmark_v2.py:654-725`. |
+| Frozen material stack, cooling, ambient, and HotSpot specifications | PASS | All 50 family YAMLs have one identical thermal-stack hash and one identical HotSpot-settings hash. Equality is enforced at `src/chiptherm/benchmark_v2.py:694-698` and `src/chiptherm/benchmark_v2.py:748-755`. |
+| Persisted per-sample `package.yaml` and `hotspot.yaml` match the frozen specifications | NOT VERIFIABLE | The producer writes the frozen structures directly (`src/chiptherm/benchmark_v2_pipeline.py:760-795`) and resume validates their hashes (`src/chiptherm/benchmark_v2_pipeline.py:912-940`), but this checkout contains none of the realized Benchmark v2 source files. |
 | Intended family-design envelope | PASS | `configs/benchmark_v2_50family/design_proposal.yaml:123-134` specifies f044 as `compound_ood`, long-axis clusters, 12-28 dies, long package, and 0.46-0.70 whitespace. |
 | Deterministic workload count and uniqueness | PASS | Regeneration with the frozen seed produced 200 UIDs and 200 unique content hashes; all passed `validate_workload_record`. |
 | Power finiteness, positivity, density identity, and idle policy | PASS | Enforced by `src/chiptherm/benchmark_v2_workloads.py:423-476`; all 200 regenerated records passed. |
@@ -45,7 +46,7 @@ The external Benchmark v2 data root was not mounted in this local checkout. Froz
 | Full 13/17/33-channel tensor schema and graph schema | NOT VERIFIABLE | The strict pipeline implements shape, finiteness, channel-order, metadata, and graph checks at `benchmark_v2_pipeline.py:3344-3401`; the completed report was not present locally. |
 | Objective data corruption or benchmark-rule violation | PASS | None found in the verifiable definition, generation, ordering, and result-alignment evidence. |
 
-There are **0 FAIL** findings. The NOT VERIFIABLE entries are evidence-access limits, not suspected defects.
+There are **0 FAIL** findings. The NOT VERIFIABLE entries are evidence-access limits, not suspected defects. In particular, “fixed material stack and cooling” is verified for the benchmark definitions and producer contract, but not independently byte-audited across the external persisted dataset in this checkout.
 
 ## 3. Structural-distribution comparison
 
@@ -189,6 +190,8 @@ Exclusion would become defensible only if server-side reopening demonstrates a r
 - `src/chiptherm/benchmark_v2_workloads.py:423-476`
 - `src/chiptherm/benchmark_v2_workloads.py:544-640`
 - `src/chiptherm/benchmark_v2_pipeline.py:3319-3509`
+- `src/chiptherm/benchmark_v2_pipeline.py:760-795`
+- `src/chiptherm/benchmark_v2_pipeline.py:912-940`
 
 ### Raster, source, and reconstruction semantics
 

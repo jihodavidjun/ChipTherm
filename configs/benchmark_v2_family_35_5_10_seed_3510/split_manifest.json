@@ -1,0 +1,26 @@
+{
+  "benchmark_id": "benchmark_v2_50family",
+  "creation_timestamp_utc": "2026-08-06T04:06:56+00:00",
+  "dataset_version": "benchmark_v2_50family/full_50x200",
+  "generator": "scripts/build_benchmark_v2_secondary_protocol.py",
+  "generator_method": "random.Random(3510).shuffle(f001..f050); first 35 train, next 5 validation, final 10 test; sort each output list",
+  "git_commit_at_manifest_creation": "061dd48b91cecb809b5374cb6dd78342046a17a8",
+  "manifest_hashes": {
+    "family_manifest_sha256": "18f8a646ce75b076ec690720034adc6590f6d753f3faa1b55bc608bb99cc609e",
+    "primary_family_split_sha256": "21a4ef91283b7a3be227edd23608518375d0bee5bb6330fc62c526d7ddfebe49",
+    "sample_split_proposal_sha256": "da319379ca7c0490c1d9c4afe52080cebbcecafd05bf3a17176e3e2ba87b048c"
+  },
+  "protocol_name": "benchmark_v2_family_35_5_10_seed_3510",
+  "random_seed": 3510,
+  "sample_counts": {
+    "familiar_internal_validation": 700,
+    "familiar_test": 700,
+    "familiar_training": 5600,
+    "heldout_final_test": 2000,
+    "heldout_validation": 1000
+  },
+  "schema_version": "benchmark_v2_secondary_family_split/1",
+  "test_families": ["f001", "f015", "f016", "f017", "f019", "f031", "f033", "f035", "f043", "f044"],
+  "train_families": ["f003", "f004", "f005", "f006", "f007", "f009", "f010", "f011", "f012", "f013", "f014", "f020", "f021", "f022", "f023", "f024", "f026", "f027", "f028", "f029", "f030", "f032", "f034", "f036", "f037", "f039", "f040", "f041", "f042", "f045", "f046", "f047", "f048", "f049", "f050"],
+  "validation_families": ["f002", "f008", "f018", "f025", "f038"]
+}

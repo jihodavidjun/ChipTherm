@@ -1,0 +1,31 @@
+schema_version: benchmark_v2_secondary_evaluation_config/1
+protocol_name: benchmark_v2_family_35_5_10_seed_3510
+model_names: [CNN, FNO, ChipTherm]
+protocols:
+  familiar_family_sample_test:
+    index: sample_split/test_index.csv
+    expected_families: 35
+    expected_samples: 700
+  heldout_validation_families:
+    index: family_split/val_index.csv
+    expected_families: 5
+    expected_samples: 1000
+    checkpoint_selection_allowed: false
+    post_training_model_selection_allowed: true
+  heldout_final_test_families:
+    index: family_split/test_index.csv
+    expected_families: 10
+    expected_samples: 2000
+    checkpoint_selection_allowed: false
+    post_training_model_selection_allowed: false
+metrics:
+  - mae_K
+  - rmse_K
+  - mean_signed_error_K
+  - family_weighted_mae_K
+  - family_mae_std_K
+  - family_mae_median_K
+  - family_mae_min_K
+  - family_mae_max_K
+  - hotspot_metrics_when_available
+sample_order: family_uid_then_workload_ordinal_then_sample_uid

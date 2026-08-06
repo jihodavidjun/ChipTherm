@@ -40,6 +40,7 @@ MAP_DTYPE = "float32"
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Generate full canonical source-superposition base maps.")
+    parser.add_argument("--data-root", default=None, type=Path, help="Explicit root for portable root-relative Benchmark v2 paths.")
     parser.add_argument("--index", default=None, type=Path, help="Combined index with a split column; split-specific indexes are derived from it.")
     parser.add_argument("--train-index", default=None, type=Path)
     parser.add_argument("--val-index", default=None, type=Path)
@@ -74,7 +75,8 @@ def main() -> int:
         if args.index is not None
         else args.train_index.expanduser().resolve().parent
     )
-    audit = audit_canonical_inputs(split_indices, checkpoint)
+    data_root = args.data_root.expanduser().resolve() if args.data_root is not None else None
+    audit = audit_canonical_inputs(split_indices, checkpoint, data_root=data_root)
     print_audit(audit)
     if args.max_storage_gb is not None:
         estimated_gb = float(audit["estimated_map_storage_bytes"]) / (1024.0**3)
@@ -144,6 +146,7 @@ def main() -> int:
             device=device,
             resume=args.resume,
             overwrite=args.overwrite,
+            data_root=data_root,
         )
         write_index(out_root / f"{split}_index.csv", rows, generated)
         manifest["splits"][split] = split_summary
@@ -167,7 +170,9 @@ def main() -> int:
     return 0
 
 
-def audit_canonical_inputs(split_indices: dict[str, Path], checkpoint: Path) -> dict[str, Any]:
+def audit_canonical_inputs(
+    split_indices: dict[str, Path], checkpoint: Path, *, data_root: Path | None = None
+) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "schema_version": 1,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -191,7 +196,7 @@ def audit_canonical_inputs(split_indices: dict[str, Path], checkpoint: Path) -> 
                 duplicates.append(uid)
             seen.add(uid)
             case_counts[row["case_id"]] += 1
-            paths = canonical_source_paths(row)
+            paths = canonical_source_paths(row, data_root=data_root, index_root=path.parent)
             for name, item in paths.items():
                 if not item.exists():
                     missing_files.append({"row_index": str(index), "sample_uid": uid, "missing": name, "path": str(item)})
@@ -326,6 +331,7 @@ def generate_split(
     device: torch.device,
     resume: bool,
     overwrite: bool,
+    data_root: Path | None,
 ) -> tuple[list[dict[str, str]], dict[str, Any]]:
     start = time.perf_counter()
     generated: list[dict[str, str]] = []
@@ -341,13 +347,13 @@ def generate_split(
             residual_path = residual_path_for_row(out_root, split, row)
             status = "reused"
             if resume and not overwrite and valid_existing_map(map_path, sidecar_path(map_path), row, checkpoint_identity):
-                ensure_residual(row, map_path, residual_path)
+                ensure_residual(row, map_path, residual_path, data_root=data_root, index_root=source_index_path.parent)
                 reused += 1
             else:
                 status = "generated"
                 pending_rows.append(row)
-                pending_packages.append(load_package_inputs(row, source_index_path))
-            generated.append(output_row(row, map_path, residual_path, checkpoint_identity, status))
+                pending_packages.append(load_package_inputs(row, source_index_path, data_root=data_root))
+            generated.append(output_row(row, map_path, residual_path, checkpoint_identity, status, data_root=data_root))
         if pending_rows:
             maps = infer_package_maps(pending_packages, model, stats, source_batch_size, device)
             for row, package, base_map in zip(pending_rows, pending_packages, maps, strict=True):
@@ -360,6 +366,8 @@ def generate_split(
                     residual_path=residual_path,
                     base_map=base_map,
                     checkpoint_identity=checkpoint_identity,
+                    data_root=data_root,
+                    index_root=source_index_path.parent,
                 )
                 processed_sources += int(package["num_sources"])
                 regenerated += 1
@@ -383,9 +391,11 @@ def generate_split(
     }
 
 
-def load_package_inputs(row: dict[str, str], index_path: Path) -> dict[str, Any]:
-    paths = canonical_source_paths(row)
-    x = np.load(resolve_path(row["x_path"], index_path.parent)).astype(np.float32, copy=False)
+def load_package_inputs(
+    row: dict[str, str], index_path: Path, *, data_root: Path | None = None
+) -> dict[str, Any]:
+    paths = canonical_source_paths(row, data_root=data_root, index_root=index_path.parent)
+    x = np.load(resolve_path(row["x_path"], index_path.parent, data_root=data_root)).astype(np.float32, copy=False)
     layout = load_json(paths["layout"])
     power = load_yaml(paths["power"])
     package = load_yaml(paths["package"])
@@ -464,11 +474,13 @@ def save_map_and_sidecar(
     residual_path: Path,
     base_map: np.ndarray,
     checkpoint_identity: dict[str, Any],
+    data_root: Path | None = None,
+    index_root: Path | None = None,
 ) -> None:
     map_path.parent.mkdir(parents=True, exist_ok=True)
     residual_path.parent.mkdir(parents=True, exist_ok=True)
     atomic_save_npy(map_path, base_map.astype(np.float32, copy=False))
-    target = np.load(resolve_path(row["y_path"])).astype(np.float32, copy=False)
+    target = np.load(resolve_path(row["y_path"], index_root, data_root=data_root)).astype(np.float32, copy=False)
     atomic_save_npy(residual_path, (target - base_map).astype(np.float32, copy=False))
     metadata = {
         "schema_version": 1,
@@ -485,10 +497,10 @@ def save_map_and_sidecar(
         "map_units": "absolute_temperature_K",
         "map_shape": list(base_map.shape),
         "map_dtype": str(base_map.dtype),
-        "layout_path": repo_relative(package["layout_path"]),
-        "power_path": repo_relative(package["power_path"]),
-        "package_path": repo_relative(package["package_path"]),
-        "hotspot_path": repo_relative(package["hotspot_path"]),
+        "layout_path": portable_relative(package["layout_path"], data_root),
+        "power_path": portable_relative(package["power_path"], data_root),
+        "package_path": portable_relative(package["package_path"], data_root),
+        "hotspot_path": portable_relative(package["hotspot_path"], data_root),
     }
     sidecar_path(map_path).write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
@@ -517,7 +529,14 @@ def valid_existing_map(
     )
 
 
-def ensure_residual(row: dict[str, str], map_path: Path, residual_path: Path) -> None:
+def ensure_residual(
+    row: dict[str, str],
+    map_path: Path,
+    residual_path: Path,
+    *,
+    data_root: Path | None = None,
+    index_root: Path | None = None,
+) -> None:
     if residual_path.exists():
         try:
             residual = np.load(residual_path, mmap_mode="r")
@@ -525,7 +544,7 @@ def ensure_residual(row: dict[str, str], map_path: Path, residual_path: Path) ->
                 return
         except Exception:
             pass
-    target = np.load(resolve_path(row["y_path"])).astype(np.float32, copy=False)
+    target = np.load(resolve_path(row["y_path"], index_root, data_root=data_root)).astype(np.float32, copy=False)
     base = np.load(map_path).astype(np.float32, copy=False)
     residual_path.parent.mkdir(parents=True, exist_ok=True)
     atomic_save_npy(residual_path, (target - base).astype(np.float32, copy=False))
@@ -543,12 +562,13 @@ def output_row(
     residual_path: Path,
     checkpoint_identity: dict[str, Any],
     status: str,
+    data_root: Path | None = None,
 ) -> dict[str, str]:
     result = dict(row)
     result.setdefault("prediction_path", "")
     result.setdefault("residual_path", "")
-    result["source_superposition_base_path"] = repo_relative(map_path)
-    result["source_superposition_residual_path"] = repo_relative(residual_path)
+    result["source_superposition_base_path"] = portable_relative(map_path, data_root)
+    result["source_superposition_residual_path"] = portable_relative(residual_path, data_root)
     result["source_checkpoint"] = checkpoint_identity["path"]
     result["source_checkpoint_sha256"] = checkpoint_identity["sha256"]
     result["source_checkpoint_config_sha256"] = str(
@@ -561,11 +581,11 @@ def output_row(
     result["source_base_dtype"] = MAP_DTYPE
     result["source_base_mode"] = "source_superposition_v1"
     result["generation_status"] = status
-    paths = canonical_source_paths(row)
-    result["source_layout_path"] = repo_relative(paths["layout"])
-    result["source_power_path"] = repo_relative(paths["power"])
-    result["source_package_path"] = repo_relative(paths["package"])
-    result["source_hotspot_path"] = repo_relative(paths["hotspot"])
+    paths = canonical_source_paths(row, data_root=data_root)
+    result["source_layout_path"] = portable_relative(paths["layout"], data_root)
+    result["source_power_path"] = portable_relative(paths["power"], data_root)
+    result["source_package_path"] = portable_relative(paths["package"], data_root)
+    result["source_hotspot_path"] = portable_relative(paths["hotspot"], data_root)
     return result
 
 
@@ -629,23 +649,27 @@ def copy_support_files(source_root: Path, out_root: Path) -> None:
             shutil.copy2(source, out_root / name)
 
 
-def canonical_source_paths(row: dict[str, str]) -> dict[str, Path]:
-    source_dir = source_dir_for_row(row)
+def canonical_source_paths(
+    row: dict[str, str], *, data_root: Path | None = None, index_root: Path | None = None
+) -> dict[str, Path]:
+    source_dir = source_dir_for_row(row, data_root=data_root, index_root=index_root)
     return {
         "source_dir": source_dir,
-        "layout": resolve_path(row.get("layout_path", ""), source_dir) if row.get("layout_path") else source_dir / "layout.json",
-        "power": resolve_path(row.get("power_path", ""), source_dir) if row.get("power_path") else source_dir / "power.yaml",
-        "package": resolve_path(row.get("package_path", ""), source_dir) if row.get("package_path") else source_dir / "package.yaml",
-        "hotspot": resolve_path(row.get("hotspot_path", ""), source_dir) if row.get("hotspot_path") else source_dir / "hotspot.yaml",
-        "x": resolve_path(row["x_path"]),
-        "y": resolve_path(row["y_path"]),
-        "graph": resolve_path(row["graph_path"]) if row.get("graph_path") else source_dir,
+        "layout": resolve_path(row.get("layout_path", ""), source_dir, data_root=data_root) if row.get("layout_path") else source_dir / "layout.json",
+        "power": resolve_path(row.get("power_path", ""), source_dir, data_root=data_root) if row.get("power_path") else source_dir / "power.yaml",
+        "package": resolve_path(row.get("package_path", ""), source_dir, data_root=data_root) if row.get("package_path") else source_dir / "package.yaml",
+        "hotspot": resolve_path(row.get("hotspot_path", ""), source_dir, data_root=data_root) if row.get("hotspot_path") else source_dir / "hotspot.yaml",
+        "x": resolve_path(row["x_path"], index_root, data_root=data_root),
+        "y": resolve_path(row["y_path"], index_root, data_root=data_root),
+        "graph": resolve_path(row["graph_path"], index_root, data_root=data_root) if row.get("graph_path") else source_dir,
     }
 
 
-def source_dir_for_row(row: dict[str, str]) -> Path:
+def source_dir_for_row(
+    row: dict[str, str], *, data_root: Path | None = None, index_root: Path | None = None
+) -> Path:
     if row.get("source_dir"):
-        return resolve_path(row["source_dir"])
+        return resolve_path(row["source_dir"], index_root, data_root=data_root)
     case_id = row["case_id"]
     original = row.get("original_sample_uid") or row["sample_uid"]
     sample_name = original
@@ -699,11 +723,16 @@ def write_csv(path: Path, rows: list[dict[str, str]], fieldnames: list[str]) -> 
             writer.writerow({name: row.get(name, "") for name in fieldnames})
 
 
-def resolve_path(path_value: str, base: Path | None = None) -> Path:
+def resolve_path(
+    path_value: str, base: Path | None = None, *, data_root: Path | None = None
+) -> Path:
     path = Path(path_value).expanduser()
     if path.is_absolute():
         return path
-    candidates = [Path.cwd() / path, REPO_ROOT / path]
+    candidates = []
+    if data_root is not None:
+        candidates.append(data_root / path)
+    candidates.extend([Path.cwd() / path, REPO_ROOT / path])
     if base is not None:
         candidates.append(base / path)
     for candidate in candidates:
@@ -745,6 +774,16 @@ def repo_relative(path: Path) -> str:
     resolved = path.resolve()
     try:
         return str(resolved.relative_to(REPO_ROOT))
+    except ValueError:
+        return str(resolved)
+
+
+def portable_relative(path: Path, data_root: Path | None) -> str:
+    if data_root is None:
+        return repo_relative(path)
+    resolved = path.resolve()
+    try:
+        return str(resolved.relative_to(data_root.resolve()))
     except ValueError:
         return str(resolved)
 

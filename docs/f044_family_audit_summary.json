@@ -16,7 +16,7 @@
     "PASS": 22,
     "WARNING": 0,
     "FAIL": 0,
-    "NOT VERIFIABLE": 4
+    "NOT VERIFIABLE": 5
   },
   "validation_checks": [
     {"check": "frozen family identity and hash", "status": "PASS"},
@@ -28,7 +28,8 @@
     {"check": "no chiplet overlap", "status": "PASS"},
     {"check": "minimum spacing", "status": "PASS"},
     {"check": "occupancy and whitespace", "status": "PASS"},
-    {"check": "material stack cooling ambient and HotSpot settings", "status": "PASS"},
+    {"check": "frozen material stack cooling ambient and HotSpot specifications", "status": "PASS"},
+    {"check": "persisted per-sample package and HotSpot files match frozen specifications", "status": "NOT VERIFIABLE", "reason": "external Benchmark v2 source files unavailable; producer and resume contracts are consistent"},
     {"check": "intended family-design envelope", "status": "PASS"},
     {"check": "deterministic workload count and uniqueness", "status": "PASS"},
     {"check": "power finiteness positivity density and idle policy", "status": "PASS"},
