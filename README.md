@@ -8,23 +8,26 @@ Learned thermal models can be accurate in the first setting yet degrade under pa
 
 ChipTherm uses a two-stage physics-guided decomposition.
 
-1. **Source-superposition baseline.** For each active chiplet, a shared source-response CNN processes a 17-channel, 64 x 64 full-package representation conditioned on that source. It predicts an effective unit-power source-to-grid response, which is multiplied by the chiplet power. The power-scaled responses are summed with ambient temperature:
+## Pipeline
 
-   $$
-   T_{\mathrm{base}}(x) = T_{\mathrm{amb}} + \sum_s P_s Z_s(x).
-   $$
+ChipTherm uses a two-stage physics-guided decomposition.
 
-   This preserves source-wise power scaling and additive thermal contributions instead of requiring one network to infer the complete field directly.
+1. **Source-superposition baseline.** For each active chiplet, a shared source-response CNN processes a 17-channel, 64 × 64 full-package representation conditioned on that source. It predicts an effective unit-power source-to-grid response, which is multiplied by the chiplet power. The power-scaled responses are summed with ambient temperature:
+
+$$
+T_{\mathrm{base}}(x) = T_{\mathrm{amb}} + \sum_s P_s Z_s(x).
+$$
+
+This preserves source-wise power scaling and additive thermal contributions instead of requiring one network to infer the complete field directly.
 
 2. **Package residual correction.** A global/local multiscale residual CNN combines the source-superposition field with package context and physical metadata. It predicts a scalar effective-resistance correction for the package-wide temperature shift and an explicitly zero-mean spatial residual for localized interactions:
 
-   $$
-   T(x) = T_{\mathrm{base}}(x) + P_{\mathrm{total}}\,\Delta R_{\mathrm{eff}} + S_0(x),
-   \qquad \operatorname{mean}(S_0)=0.
-   $$
+$$
+T(x) = T_{\mathrm{base}}(x) + P_{\mathrm{total}}\Delta R_{\mathrm{eff}} + S_0(x),
+\qquad \operatorname{mean}(S_0)=0.
+$$
 
-<!-- TODO: Add final ChipTherm pipeline figure -->
-![ChipTherm Pipeline](docs/figures/chiptherm_pipeline.pdf)
+![ChipTherm Pipeline](docs/figures/chiptherm_pipeline.png)
 
 ## Dataset and Evaluation
 
