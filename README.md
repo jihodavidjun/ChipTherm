@@ -1,1 +1,0 @@
-[Abstract](./ChipTherm_ICCAD_SRC_2026_Jiho_Jun.pdf)
