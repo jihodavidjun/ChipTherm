@@ -8,10 +8,6 @@ Learned thermal models can be accurate in the first setting yet degrade under pa
 
 ChipTherm uses a two-stage physics-guided decomposition.
 
-## Pipeline
-
-ChipTherm uses a two-stage physics-guided decomposition.
-
 1. **Source-superposition baseline.** For each active chiplet, a shared source-response CNN processes a 17-channel, 64 × 64 full-package representation conditioned on that source. It predicts an effective unit-power source-to-grid response, which is multiplied by the chiplet power. The power-scaled responses are summed with ambient temperature:
 
 $$
@@ -24,7 +20,7 @@ This preserves source-wise power scaling and additive thermal contributions inst
 
 $$
 T(x) = T_{\mathrm{base}}(x) + P_{\mathrm{total}}\Delta R_{\mathrm{eff}} + S_0(x),
-\qquad \operatorname{mean}(S_0)=0.
+\qquad \langle S_0 \rangle = 0.
 $$
 
 ![ChipTherm Pipeline](docs/figures/chiptherm_pipeline.png)
