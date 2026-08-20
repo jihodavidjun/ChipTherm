@@ -23,7 +23,7 @@ T(x) = T_{\mathrm{base}}(x) + P_{\mathrm{total}}\Delta R_{\mathrm{eff}} + S_0(x)
 \qquad \langle S_0 \rangle = 0.
 $$
 
-![ChipTherm Pipeline](docs/figures/chiptherm_pipeline.png)
+![ChipTherm Pipeline](./docs/figures/chiptherm_pipeline.png)
 
 ## Dataset and Evaluation
 
