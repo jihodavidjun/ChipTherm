@@ -16,7 +16,7 @@ $$
 T_{\mathrm{base}}(x) = T_{\mathrm{amb}} + \sum_s P_s Z_s(x).
 $$
 
-This preserves source-wise power scaling and additive thermal contributions instead of requiring one network to infer the complete field directly.
+    This preserves source-wise power scaling and additive thermal contributions instead of requiring one network to infer the complete field directly.
 
 2. **Package residual correction.** A global/local multiscale residual CNN combines the source-superposition field with package context and physical metadata. It predicts a scalar effective-resistance correction for the package-wide temperature shift and an explicitly zero-mean spatial residual for localized interactions:
 
