@@ -12,18 +12,18 @@ ChipTherm uses a two-stage physics-guided decomposition.
 
 1. **Source-superposition baseline.** For each active chiplet, a shared source-response CNN processes a 17-channel, 64 × 64 full-package representation conditioned on that source. It predicts an effective unit-power source-to-grid response, which is multiplied by the chiplet power. The power-scaled responses are summed with ambient temperature:
 
-$$
-T_{\mathrm{base}}(x) = T_{\mathrm{amb}} + \sum_s P_s Z_s(x).
-$$
+   $$
+   T_{\mathrm{base}}(x) = T_{\mathrm{amb}} + \sum_s P_s Z_s(x).
+   $$
 
-This preserves source-wise power scaling and additive thermal contributions instead of requiring one network to infer the complete field directly.
+   This preserves source-wise power scaling and additive thermal contributions instead of requiring one network to infer the complete field directly.
 
 2. **Package residual correction.** A global/local multiscale residual CNN combines the source-superposition field with package context and physical metadata. It predicts a scalar effective-resistance correction for the package-wide temperature shift and an explicitly zero-mean spatial residual for localized interactions:
 
-$$
-T(x) = T_{\mathrm{base}}(x) + P_{\mathrm{total}}\Delta R_{\mathrm{eff}} + S_0(x),
-\qquad \langle S_0 \rangle = 0.
-$$
+   $$
+   T(x) = T_{\mathrm{base}}(x) + P_{\mathrm{total}}\Delta R_{\mathrm{eff}} + S_0(x),
+   \qquad \langle S_0 \rangle = 0.
+   $$
 
 ## Dataset and Evaluation
 
