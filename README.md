@@ -20,10 +20,10 @@ ChipTherm uses a two-stage physics-guided decomposition.
 
 2. **Package residual correction.** A global/local multiscale residual CNN combines the source-superposition field with package context and physical metadata. It predicts a scalar effective-resistance correction for the package-wide temperature shift and an explicitly zero-mean spatial residual for localized interactions:
 
-   $$
-   T(x) = T_{\mathrm{base}}(x) + P_{\mathrm{total}}\Delta R_{\mathrm{eff}} + S_0(x),
-   \qquad \langle S_0 \rangle = 0.
-   $$
+$$
+T(x) = T_{\mathrm{base}}(x) + P_{\mathrm{total}}\Delta R_{\mathrm{eff}} + S_0(x),
+\qquad \langle S_0 \rangle = 0.
+$$
 
 ## Dataset and Evaluation
 
