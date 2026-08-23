@@ -27,7 +27,7 @@ $$
 
 ## Dataset and Evaluation
 
-The current **ChipTherm Benchmark** contains **10,000 HotSpot-generated temperature maps** from **50 structurally distinct package families**, with **200 power workloads per family**. Packages contain 6-64 chiplets and span approximately 1088-4480 mm². Families vary in chiplet count, geometry, composition, occupancy, and placement. All use a common material stack and cooling boundary condition so the study isolates structural and workload variation rather than material or cooling generalization.
+ChipTherm introduces and is evaluated on the **[HotSpot Chiplet Floorplan Thermal Dataset](https://huggingface.co/datasets/clanoman/hotspot-chiplet-floorplan-thermal)**, a public synthetic benchmark created as part of the ChipTherm project. It contains **10,000 HotSpot-generated temperature maps** from **50 structurally distinct package families**, with **200 power workloads per family**. Packages contain 6–64 chiplets and span approximately 1088–4480 mm². Families vary in chiplet count, geometry, composition, occupancy, and placement. All use a common material stack and cooling boundary condition so the study isolates structural and workload variation rather than material or cooling generalization.
 
 The protocol assigns 40 families to training, 5 unseen families to validation and model selection, and 5 separate unseen families to final testing. A separate workload split within the 40 training families measures seen-family interpolation.
 
